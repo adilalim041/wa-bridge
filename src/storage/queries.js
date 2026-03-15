@@ -6,6 +6,7 @@ export async function saveMessage(data) {
     const { error } = await supabase.from('messages').upsert(
       {
         message_id: data.messageId,
+        session_id: data.sessionId,
         remote_jid: data.remoteJid,
         from_me: data.fromMe,
         body: data.body,
@@ -50,42 +51,96 @@ export async function saveContact(remoteJid, pushName) {
   }
 }
 
-export async function getMessages(remoteJid, limit = 50, offset = 0) {
+export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0) {
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from('messages')
       .select('*')
-      .eq('remote_jid', remoteJid)
+      .eq('session_id', sessionId);
+
+    if (remoteJid) {
+      query = query.eq('remote_jid', remoteJid);
+    }
+
+    const { data, error } = await query
       .order('timestamp', { ascending: false })
       .range(offset, offset + limit - 1);
 
     if (error) {
-      logger.error({ err: error, remoteJid }, 'Failed to fetch messages');
+      logger.error({ err: error, sessionId, remoteJid }, 'Failed to fetch messages');
       return [];
     }
 
     return data ?? [];
   } catch (error) {
-    logger.error({ err: error, remoteJid }, 'Unexpected error while fetching messages');
+    logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error while fetching messages');
     return [];
   }
 }
 
-export async function getContacts() {
+export async function getContacts(sessionId) {
   try {
     const { data, error } = await supabase
-      .from('contacts')
-      .select('*')
-      .order('updated_at', { ascending: false });
+      .from('messages')
+      .select('remote_jid, push_name, timestamp')
+      .eq('session_id', sessionId)
+      .order('timestamp', { ascending: false });
 
     if (error) {
-      logger.error({ err: error }, 'Failed to fetch contacts');
+      logger.error({ err: error, sessionId }, 'Failed to fetch contacts');
       return [];
     }
 
-    return data ?? [];
+    const contactMap = new Map();
+    for (const row of data ?? []) {
+      if (!contactMap.has(row.remote_jid)) {
+        contactMap.set(row.remote_jid, row.push_name);
+      }
+    }
+
+    return Array.from(contactMap.entries()).map(([phone, name]) => ({ phone, name }));
   } catch (error) {
-    logger.error({ err: error }, 'Unexpected error while fetching contacts');
+    logger.error({ err: error, sessionId }, 'Unexpected error while fetching contacts');
+    return [];
+  }
+}
+
+export async function getChats(sessionId) {
+  try {
+    const { data, error } = await supabase.rpc('get_chats', { p_session_id: sessionId });
+
+    if (!error && data) {
+      return data;
+    }
+
+    const { data: messages, error: fallbackError } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('session_id', sessionId)
+      .order('timestamp', { ascending: false });
+
+    if (fallbackError) {
+      logger.error({ err: fallbackError, sessionId }, 'Failed to fetch chats');
+      return [];
+    }
+
+    const chatMap = new Map();
+    for (const message of messages ?? []) {
+      if (!chatMap.has(message.remote_jid)) {
+        chatMap.set(message.remote_jid, {
+          remoteJid: message.remote_jid,
+          lastMessage: message.body,
+          lastMessageType: message.message_type,
+          lastTimestamp: message.timestamp,
+          pushName: message.push_name,
+          fromMe: message.from_me,
+        });
+      }
+    }
+
+    return Array.from(chatMap.values());
+  } catch (error) {
+    logger.error({ err: error, sessionId }, 'Unexpected error while fetching chats');
     return [];
   }
 }

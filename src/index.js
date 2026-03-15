@@ -1,42 +1,25 @@
 import { startServer } from './api/server.js';
-import { startConnection } from './baileys/connection.js';
-import { config, logger } from './config.js';
+import { sessionManager } from './baileys/sessionManager.js';
+import { logger } from './config.js';
+import { stopWebSocket } from './api/websocket.js';
 import { stopHealthMonitor } from './monitor.js';
-import { acquireLock, startHeartbeat, releaseLock } from './storage/sessionLock.js';
 import { stopVersionChecker } from './versionChecker.js';
 
-let currentSock;
 let server;
-let setSock = () => {};
 
 async function bootstrap() {
-  const lockAcquired = await acquireLock();
-  if (!lockAcquired) {
-    console.error('Another instance is already running for this session. Exiting.');
-    process.exit(1);
-  }
-
-  startHeartbeat();
-
-  const connection = await startConnection({
-    onSocket: (sock) => {
-      currentSock = sock;
-      setSock(sock);
-    },
-  });
-  currentSock = connection.sock;
-
-  const serverState = startServer(currentSock);
+  const serverState = startServer();
   server = serverState.server;
-  setSock = serverState.setSock;
-  logger.info(`WA Bridge started on port ${config.port}`);
+  await sessionManager.startAll();
+  logger.info('WA Bridge multi-session started');
 }
 
 async function shutdown(signal) {
-  logger.info(`Received ${signal}. Shutting down gracefully...`);
-  await releaseLock();
+  logger.info(`Received ${signal}. Shutting down...`);
+  await sessionManager.stopAll();
   stopHealthMonitor();
   stopVersionChecker();
+  stopWebSocket();
 
   const closeTasks = [];
 
@@ -44,14 +27,6 @@ async function shutdown(signal) {
     closeTasks.push(
       new Promise((resolve) => {
         server.close(() => resolve());
-      })
-    );
-  }
-
-  if (currentSock?.ws?.readyState === 1) {
-    closeTasks.push(
-      Promise.resolve(currentSock.end?.(undefined)).catch((error) => {
-        logger.warn({ err: error }, 'Failed to close WhatsApp session cleanly');
       })
     );
   }

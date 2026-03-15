@@ -3,9 +3,9 @@ import { config } from './config.js';
 const TELEGRAM_BOT_TOKEN = config.telegramBotToken;
 const TELEGRAM_CHAT_ID = config.telegramChatId;
 
-let healthInterval = null;
-let lastConnectedAt = null;
-let alertSent = false;
+const healthIntervals = new Map();
+const lastConnectedAt = new Map();
+const alertSent = new Map();
 
 export async function sendTelegramAlert(message) {
   console.log(`[ALERT] ${message}`);
@@ -34,43 +34,60 @@ export async function sendTelegramAlert(message) {
   }
 }
 
-export function updateConnectionStatus(connected) {
+export function updateConnectionStatus(sessionId, connected) {
   if (connected) {
-    lastConnectedAt = Date.now();
-    if (alertSent) {
-      alertSent = false;
-      sendTelegramAlert('Connection restored!').catch(() => {});
+    lastConnectedAt.set(sessionId, Date.now());
+    if (alertSent.get(sessionId)) {
+      alertSent.set(sessionId, false);
+      sendTelegramAlert(`WA Bridge [${sessionId}]: Connection restored!`).catch(() => {});
     }
   }
 }
 
-export function startHealthMonitor() {
+export function startHealthMonitor(sessionId) {
   const CHECK_INTERVAL = 5 * 60 * 1000;
 
-  if (healthInterval) {
+  if (healthIntervals.has(sessionId)) {
     return;
   }
 
-  lastConnectedAt = Date.now();
+  lastConnectedAt.set(sessionId, Date.now());
+  alertSent.set(sessionId, false);
 
-  healthInterval = setInterval(() => {
-    if (!lastConnectedAt) {
+  const timer = setInterval(() => {
+    const lastSeen = lastConnectedAt.get(sessionId);
+    if (!lastSeen) {
       return;
     }
 
-    const downtime = Date.now() - lastConnectedAt;
+    const downtime = Date.now() - lastSeen;
 
-    if (downtime > CHECK_INTERVAL && !alertSent) {
-      alertSent = true;
+    if (downtime > CHECK_INTERVAL && !alertSent.get(sessionId)) {
+      alertSent.set(sessionId, true);
       const minutes = Math.round(downtime / 60000);
-      sendTelegramAlert(`WA Bridge: Disconnected for ${minutes} minutes!`).catch(() => {});
+      sendTelegramAlert(`WA Bridge [${sessionId}]: Disconnected for ${minutes} minutes!`).catch(() => {});
     }
   }, CHECK_INTERVAL);
+
+  healthIntervals.set(sessionId, timer);
 }
 
-export function stopHealthMonitor() {
-  if (healthInterval) {
-    clearInterval(healthInterval);
-    healthInterval = null;
+export function stopHealthMonitor(sessionId) {
+  if (sessionId) {
+    const timer = healthIntervals.get(sessionId);
+    if (timer) {
+      clearInterval(timer);
+      healthIntervals.delete(sessionId);
+    }
+    lastConnectedAt.delete(sessionId);
+    alertSent.delete(sessionId);
+    return;
   }
+
+  for (const timer of healthIntervals.values()) {
+    clearInterval(timer);
+  }
+  healthIntervals.clear();
+  lastConnectedAt.clear();
+  alertSent.clear();
 }

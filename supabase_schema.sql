@@ -46,3 +46,38 @@ CREATE TABLE IF NOT EXISTS session_lock (
     locked_at TIMESTAMPTZ DEFAULT now(),
     heartbeat_at TIMESTAMPTZ DEFAULT now()
 );
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS session_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session_remote ON messages(session_id, remote_jid, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS session_config (
+    session_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    phone_number TEXT,
+    is_active BOOLEAN DEFAULT true,
+    auto_start BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS manager_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL,
+    session_id TEXT NOT NULL REFERENCES session_config(session_id),
+    role TEXT DEFAULT 'viewer',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(user_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_manager_sessions_user ON manager_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_manager_sessions_session ON manager_sessions(session_id);
+
+-- Migration example from single-session to multi-session:
+-- INSERT INTO session_config (session_id, display_name, phone_number, is_active, auto_start)
+-- VALUES ('omoikiri-main', 'Астана Основной', '77014135151', true, true)
+-- ON CONFLICT (session_id) DO NOTHING;
+--
+-- UPDATE messages
+-- SET session_id = 'omoikiri-main'
+-- WHERE session_id IS NULL;

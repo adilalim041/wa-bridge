@@ -1,22 +1,23 @@
 import express from 'express';
+import { createServer } from 'http';
 import { config, logger } from '../config.js';
 import { setupRoutes } from './routes.js';
+import { setupWebSocket } from './websocket.js';
 
-export function startServer(initialSock) {
+export function startServer() {
   const app = express();
-  let currentSock = initialSock;
+  const httpServer = createServer(app);
 
   app.use(express.json());
-  setupRoutes(app, () => currentSock);
+  setupRoutes(app);
+  setupWebSocket(httpServer);
 
-  const server = app.listen(config.port, () => {
+  httpServer.listen(config.port, () => {
     logger.info(`API server listening on port ${config.port}`);
   });
 
   return {
-    server,
-    setSock(sock) {
-      currentSock = sock;
-    },
+    server: httpServer,
+    app,
   };
 }

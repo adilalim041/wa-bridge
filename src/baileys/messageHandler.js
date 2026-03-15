@@ -119,7 +119,7 @@ function extractBody(msg) {
   return null;
 }
 
-export async function handleMessage(message, sock) {
+export async function handleMessage(message, sock, sessionId) {
   try {
     if (!message?.key?.remoteJid || message.key.remoteJid === 'status@broadcast') {
       return;
@@ -148,7 +148,7 @@ export async function handleMessage(message, sock) {
     const messageType = getMessageType(msg);
     const messageId = message.key.id;
 
-    await saveMessage({
+    const payload = {
       messageId,
       remoteJid,
       fromMe,
@@ -156,13 +156,18 @@ export async function handleMessage(message, sock) {
       messageType,
       timestamp,
       pushName,
-    });
+      sessionId,
+    };
+
+    await saveMessage(payload);
 
     await saveContact(remoteJid, pushName);
 
     const preview = body.length > 50 ? `${body.substring(0, 50)}...` : body;
-    logger.info(`[${fromMe ? 'OUT' : 'IN'}] ${remoteJid}: ${preview}`);
+    logger.info(`[${sessionId}] [${fromMe ? 'OUT' : 'IN'}] ${remoteJid}: ${preview}`);
+    return payload;
   } catch (error) {
-    logger.error({ err: error, messageId: message?.key?.id }, 'Failed to handle message');
+    logger.error({ err: error, sessionId, messageId: message?.key?.id }, 'Failed to handle message');
+    return null;
   }
 }

@@ -67,3 +67,13 @@ export class RateLimiter {
     this.global.push(now);
   }
 }
+
+const limiters = new Map();
+
+export function getRateLimiter(sessionId) {
+  if (!limiters.has(sessionId)) {
+    limiters.set(sessionId, new RateLimiter());
+  }
+
+  return limiters.get(sessionId);
+}
