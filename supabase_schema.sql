@@ -39,3 +39,10 @@ CREATE TABLE IF NOT EXISTS auth_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_state_session ON auth_state(session_id);
+
+CREATE TABLE IF NOT EXISTS session_lock (
+    session_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    locked_at TIMESTAMPTZ DEFAULT now(),
+    heartbeat_at TIMESTAMPTZ DEFAULT now()
+);

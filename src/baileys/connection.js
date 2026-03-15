@@ -1,9 +1,11 @@
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
-import { makeWASocket, DisconnectReason } from 'baileys';
+import { fetchLatestBaileysVersion, makeWASocket, DisconnectReason } from 'baileys';
 import { config, logger } from '../config.js';
+import { sendTelegramAlert, updateConnectionStatus, startHealthMonitor } from '../monitor.js';
 import { supabase } from '../storage/supabase.js';
 import { useSupabaseAuthState } from '../storage/authState.js';
+import { setCurrentVersion, startVersionChecker } from '../versionChecker.js';
 import { handleMessage } from './messageHandler.js';
 
 const connectionState = {
@@ -13,6 +15,27 @@ const connectionState = {
   lastError: null,
 };
 
+let reconnectAttempt = 0;
+let healthMonitorStarted = false;
+
+function getReconnectDelay() {
+  reconnectAttempt += 1;
+
+  if (reconnectAttempt <= 5) {
+    return 5000;
+  }
+
+  if (reconnectAttempt <= 8) {
+    return 5 * 60 * 1000;
+  }
+
+  return 30 * 60 * 1000;
+}
+
+function resetReconnectAttempts() {
+  reconnectAttempt = 0;
+}
+
 export function getConnectionState() {
   return { ...connectionState };
 }
@@ -20,12 +43,22 @@ export function getConnectionState() {
 export async function startConnection(options = {}) {
   const { onSocket } = options;
   const { state, saveCreds } = await useSupabaseAuthState(config.sessionId);
+  let waVersion;
+
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    waVersion = version;
+    console.log(`WhatsApp version: ${version.join('.')}`);
+  } catch {
+    waVersion = [2, 3000, 1035194821];
+    console.log(`Failed to fetch WA version, using fallback: ${waVersion.join('.')}`);
+  }
 
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
     browser: ['WA Bridge', 'Chrome', '120.0.0'],
-    version: [2, 3000, 1035194821],
+    version: waVersion,
   });
 
   if (typeof onSocket === 'function') {
@@ -50,6 +83,19 @@ export async function startConnection(options = {}) {
       connectionState.connected = true;
       connectionState.user = sock.user?.name || sock.user?.id || null;
       connectionState.lastError = null;
+      resetReconnectAttempts();
+      updateConnectionStatus(true);
+      setCurrentVersion(waVersion);
+
+      if (!healthMonitorStarted) {
+        startHealthMonitor();
+        healthMonitorStarted = true;
+      }
+
+      startVersionChecker(() => {
+        sock.end(undefined);
+      });
+
       console.log(`Connected to WhatsApp as ${connectionState.user || 'unknown user'}`);
     }
 
@@ -60,10 +106,12 @@ export async function startConnection(options = {}) {
       connectionState.qr = null;
       connectionState.user = null;
       connectionState.lastError = `Status ${statusCode || 'unknown'}: ${reason}`;
+      updateConnectionStatus(false);
 
       console.log(`Connection closed. Status: ${statusCode}, Reason: ${reason}`);
 
       if (statusCode === DisconnectReason.loggedOut) {
+        resetReconnectAttempts();
         const { error } = await supabase
           .from('auth_state')
           .delete()
@@ -73,6 +121,7 @@ export async function startConnection(options = {}) {
           logger.error({ err: error }, 'Failed to clear auth state from Supabase');
         }
 
+        sendTelegramAlert('WA Bridge: Session logged out! Need new QR scan.').catch(() => {});
         console.log('Session expired. Auth state cleared. Restarting for new QR...');
         setTimeout(() => {
           startConnection(options).catch((error) => {
@@ -80,11 +129,19 @@ export async function startConnection(options = {}) {
           });
         }, 3000);
       } else {
-        const delay = 5000;
-        console.log(`Reconnecting in ${delay / 1000}s...`);
+        const delay = getReconnectDelay();
+        const delayStr = delay >= 60000 ? `${delay / 60000} min` : `${delay / 1000}s`;
+        console.log(`Reconnecting in ${delayStr}... (attempt ${reconnectAttempt})`);
+
+        if (reconnectAttempt === 9) {
+          sendTelegramAlert(
+            'WA Bridge: 9 failed reconnect attempts. Switching to 30min interval.'
+          ).catch(() => {});
+        }
+
         setTimeout(() => {
           startConnection(options).catch((error) => {
-            logger.error({ err: error }, 'Failed to reconnect to WhatsApp');
+            console.error('Failed to reconnect:', error.message);
           });
         }, delay);
       }
