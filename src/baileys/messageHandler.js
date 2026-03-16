@@ -8,7 +8,17 @@ const SKIP_TYPES = [
   'reactionMessage',
 ];
 
-function normalizeRemoteJid(remoteJid = '') {
+function normalizeRemoteJid(remoteJid = '', sock = null) {
+  if (remoteJid.endsWith('@lid') && sock) {
+    try {
+      const lidMap = sock.authState?.creds?.lidTagMap || {};
+      for (const [realJid, lid] of Object.entries(lidMap)) {
+        if (remoteJid.includes(lid)) {
+          return realJid.replace('@s.whatsapp.net', '');
+        }
+      }
+    } catch (e) {}
+  }
   return remoteJid
     .replace('@s.whatsapp.net', '')
     .replace('@lid', '')
@@ -140,7 +150,7 @@ export async function handleMessage(message, sock, sessionId) {
       return;
     }
 
-    const remoteJid = normalizeRemoteJid(message.key.remoteJid);
+    const remoteJid = normalizeRemoteJid(message.key.remoteJid, sock);
     const fromMe = Boolean(message.key.fromMe);
     const timestampValue = Number(message.messageTimestamp ?? Math.floor(Date.now() / 1000));
     const timestamp = new Date(timestampValue * 1000).toISOString();
