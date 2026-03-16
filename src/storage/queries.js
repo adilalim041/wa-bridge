@@ -12,6 +12,11 @@ export async function saveMessage(data) {
         body: data.body,
         message_type: data.messageType,
         push_name: data.pushName ?? null,
+        sender: data.sender ?? null,
+        chat_type: data.chatType ?? 'personal',
+        media_url: data.mediaUrl ?? null,
+        media_type: data.mediaType ?? null,
+        file_name: data.fileName ?? null,
         timestamp: data.timestamp,
       },
       {
@@ -25,6 +30,84 @@ export async function saveMessage(data) {
     }
   } catch (error) {
     logger.error({ err: error, messageId: data.messageId }, 'Unexpected error while saving message');
+  }
+}
+
+export async function upsertChat({
+  remoteJid,
+  sessionId,
+  chatType,
+  displayName,
+  participantCount,
+  phoneNumber,
+}) {
+  try {
+    let existingChat = null;
+    const needsExistingChat =
+      chatType === 'group'
+        ? !displayName || participantCount == null
+        : !displayName || !phoneNumber;
+
+    if (needsExistingChat) {
+      const { data, error: fetchError } = await supabase
+        .from('chats')
+        .select('display_name, participant_count, phone_number')
+        .eq('remote_jid', remoteJid)
+        .eq('session_id', sessionId)
+        .maybeSingle();
+
+      if (fetchError) {
+        logger.error({ err: fetchError, remoteJid, sessionId }, 'Failed to load existing chat metadata');
+      } else {
+        existingChat = data;
+      }
+    }
+
+    const { error } = await supabase.from('chats').upsert(
+      {
+        remote_jid: remoteJid,
+        session_id: sessionId,
+        chat_type: chatType || 'personal',
+        display_name: displayName || existingChat?.display_name || null,
+        participant_count: participantCount ?? existingChat?.participant_count ?? null,
+        phone_number: phoneNumber || existingChat?.phone_number || null,
+        last_message_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        onConflict: 'remote_jid,session_id',
+      }
+    );
+
+    if (error) {
+      logger.error({ err: error, remoteJid, sessionId }, 'Failed to upsert chat');
+    }
+  } catch (error) {
+    logger.error({ err: error, remoteJid, sessionId }, 'Unexpected error while upserting chat');
+  }
+}
+
+export async function getContactName(remoteJid) {
+  try {
+    if (!remoteJid) {
+      return null;
+    }
+
+    const { data, error } = await supabase
+      .from('contacts')
+      .select('name')
+      .eq('phone', remoteJid)
+      .maybeSingle();
+
+    if (error) {
+      logger.error({ err: error, remoteJid }, 'Failed to fetch contact name');
+      return null;
+    }
+
+    return data?.name || null;
+  } catch (error) {
+    logger.error({ err: error, remoteJid }, 'Unexpected error while fetching contact name');
+    return null;
   }
 }
 
@@ -105,40 +188,58 @@ export async function getContacts(sessionId) {
   }
 }
 
-export async function getChats(sessionId) {
+export async function getChatsWithLastMessage(sessionId) {
   try {
-    const { data, error } = await supabase.rpc('get_chats', { p_session_id: sessionId });
-
-    if (!error && data) {
-      return data;
-    }
-
-    const { data: messages, error: fallbackError } = await supabase
-      .from('messages')
+    const { data: chatList, error: chatError } = await supabase
+      .from('chats')
       .select('*')
       .eq('session_id', sessionId)
-      .order('timestamp', { ascending: false });
+      .order('last_message_at', { ascending: false });
 
-    if (fallbackError) {
-      logger.error({ err: fallbackError, sessionId }, 'Failed to fetch chats');
+    if (chatError) {
+      logger.error({ err: chatError, sessionId }, 'Failed to fetch chats');
       return [];
     }
 
-    const chatMap = new Map();
-    for (const message of messages ?? []) {
-      if (!chatMap.has(message.remote_jid)) {
-        chatMap.set(message.remote_jid, {
-          remoteJid: message.remote_jid,
-          lastMessage: message.body,
-          lastMessageType: message.message_type,
-          lastTimestamp: message.timestamp,
-          pushName: message.push_name,
-          fromMe: message.from_me,
-        });
-      }
-    }
+    const result = await Promise.all(
+      (chatList ?? []).map(async (chat) => {
+        const { data: messages, error } = await supabase
+          .from('messages')
+          .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
+          .eq('session_id', sessionId)
+          .eq('remote_jid', chat.remote_jid)
+          .order('timestamp', { ascending: false })
+          .limit(1);
 
-    return Array.from(chatMap.values());
+        if (error) {
+          logger.error(
+            { err: error, sessionId, remoteJid: chat.remote_jid },
+            'Failed to fetch last message for chat'
+          );
+        }
+
+        const lastMessage = messages?.[0] || null;
+
+        return {
+          remoteJid: chat.remote_jid,
+          chatType: chat.chat_type,
+          displayName: chat.display_name,
+          participantCount: chat.participant_count,
+          phoneNumber: chat.phone_number || chat.remote_jid,
+          lastMessage: lastMessage?.body || null,
+          lastMessageType: lastMessage?.message_type || 'text',
+          lastTimestamp: lastMessage?.timestamp || chat.last_message_at,
+          fromMe: lastMessage?.from_me || false,
+          pushName: lastMessage?.push_name || null,
+          sender: lastMessage?.sender || null,
+          mediaUrl: lastMessage?.media_url || null,
+          mediaType: lastMessage?.media_type || null,
+          fileName: lastMessage?.file_name || null,
+        };
+      })
+    );
+
+    return result;
   } catch (error) {
     logger.error({ err: error, sessionId }, 'Unexpected error while fetching chats');
     return [];

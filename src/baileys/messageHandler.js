@@ -1,5 +1,6 @@
 import { logger } from '../config.js';
-import { saveContact, saveMessage } from '../storage/queries.js';
+import { getContactName, saveContact, saveMessage, upsertChat } from '../storage/queries.js';
+import { processMedia } from './mediaHandler.js';
 
 const SKIP_TYPES = [
   'protocolMessage',
@@ -8,21 +9,55 @@ const SKIP_TYPES = [
   'reactionMessage',
 ];
 
-function normalizeRemoteJid(remoteJid = '', sock = null) {
-  if (remoteJid.endsWith('@lid') && sock) {
+async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
+  if (remoteJid.endsWith('@lid')) {
+    const lid = remoteJid.replace('@lid', '');
     try {
-      const lidMap = sock.authState?.creds?.lidTagMap || {};
-      for (const [realJid, lid] of Object.entries(lidMap)) {
-        if (remoteJid.includes(lid)) {
-          return realJid.replace('@s.whatsapp.net', '');
-        }
+      const { supabase } = await import('../storage/supabase.js');
+      const key = `${sessionId}:lid-mapping:${lid}_reverse`;
+      const { data } = await supabase
+        .from('auth_state')
+        .select('value')
+        .eq('key', key)
+        .single();
+      if (data?.value) {
+        return JSON.parse(data.value);
       }
     } catch (e) {}
+    return lid;
   }
   return remoteJid
     .replace('@s.whatsapp.net', '')
-    .replace('@lid', '')
     .replace('@g.us', '');
+}
+
+async function normalizeParticipant(participant = '', sock = null, sessionId = '') {
+  return normalizeRemoteJid(participant, sock, sessionId);
+}
+
+function resolveContactName(sock, remoteJid) {
+  if (!sock || !remoteJid) {
+    return null;
+  }
+
+  const candidates = [
+    remoteJid,
+    `${remoteJid}@s.whatsapp.net`,
+    `${remoteJid}@lid`,
+  ];
+
+  for (const candidate of candidates) {
+    const contact =
+      sock?.store?.contacts?.[candidate] ||
+      sock?.contacts?.[candidate];
+
+    const name = contact?.name || contact?.notify || contact?.verifiedName || null;
+    if (name) {
+      return name;
+    }
+  }
+
+  return null;
 }
 
 function getMessageType(msg) {
@@ -150,13 +185,56 @@ export async function handleMessage(message, sock, sessionId) {
       return;
     }
 
-    const remoteJid = normalizeRemoteJid(message.key.remoteJid, sock);
+    const rawRemoteJid = message.key.remoteJid;
+    const remoteJid = await normalizeRemoteJid(rawRemoteJid, sock, sessionId);
     const fromMe = Boolean(message.key.fromMe);
     const timestampValue = Number(message.messageTimestamp ?? Math.floor(Date.now() / 1000));
     const timestamp = new Date(timestampValue * 1000).toISOString();
-    const pushName = message.pushName ?? sock?.contacts?.[message.key.remoteJid]?.name;
     const messageType = getMessageType(msg);
     const messageId = message.key.id;
+    const isGroup = rawRemoteJid.endsWith('@g.us');
+    const sender = isGroup ? await normalizeParticipant(message.key.participant || '', sock, sessionId) : null;
+    let pushName = message.pushName ?? resolveContactName(sock, isGroup ? sender : remoteJid);
+
+    if (!pushName) {
+      pushName = await getContactName(isGroup ? sender : remoteJid);
+    }
+
+    let chatType = 'personal';
+    let chatDisplayName = null;
+    let participantCount = null;
+    let phoneNumber = null;
+
+    if (isGroup) {
+      chatType = 'group';
+
+      try {
+        const groupMeta = await sock.groupMetadata(rawRemoteJid);
+        chatDisplayName = groupMeta?.subject || null;
+        participantCount = groupMeta?.participants?.length || null;
+      } catch (error) {
+        logger.warn({ err: error, sessionId, remoteJid: rawRemoteJid }, 'Failed to fetch group metadata');
+      }
+    } else {
+      chatType = 'personal';
+      chatDisplayName =
+        (fromMe ? resolveContactName(sock, remoteJid) : pushName) ||
+        resolveContactName(sock, remoteJid) ||
+        (await getContactName(remoteJid));
+      phoneNumber = remoteJid;
+    }
+
+    let mediaUrl = null;
+    let mediaFileType = null;
+    let mediaFileName = null;
+    if (['image', 'video', 'audio', 'document', 'sticker'].includes(messageType)) {
+      const media = await processMedia(message, sessionId);
+      if (media) {
+        mediaUrl = media.url;
+        mediaFileType = media.mediaType;
+        mediaFileName = media.fileName;
+      }
+    }
 
     const payload = {
       messageId,
@@ -167,11 +245,33 @@ export async function handleMessage(message, sock, sessionId) {
       timestamp,
       pushName,
       sessionId,
+      sender,
+      chatType,
+      mediaUrl,
+      mediaType: mediaFileType || messageType,
+      fileName: mediaFileName,
+      displayName: chatDisplayName,
+      participantCount,
+      phoneNumber,
     };
 
     await saveMessage(payload);
+    await upsertChat({
+      remoteJid,
+      sessionId,
+      chatType,
+      displayName: chatDisplayName,
+      participantCount,
+      phoneNumber,
+    });
 
-    await saveContact(remoteJid, pushName);
+    if (isGroup) {
+      if (sender && pushName) {
+        await saveContact(sender, pushName);
+      }
+    } else {
+      await saveContact(remoteJid, chatDisplayName || pushName);
+    }
 
     const preview = body.length > 50 ? `${body.substring(0, 50)}...` : body;
     logger.info(`[${sessionId}] [${fromMe ? 'OUT' : 'IN'}] ${remoteJid}: ${preview}`);

@@ -73,6 +73,27 @@ CREATE TABLE IF NOT EXISTS manager_sessions (
 CREATE INDEX IF NOT EXISTS idx_manager_sessions_user ON manager_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_manager_sessions_session ON manager_sessions(session_id);
 
+CREATE TABLE IF NOT EXISTS chats (
+    remote_jid TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    chat_type TEXT NOT NULL DEFAULT 'personal',
+    display_name TEXT,
+    participant_count INTEGER,
+    phone_number TEXT,
+    last_message_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (remote_jid, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chats_session ON chats(session_id, last_message_at DESC);
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_type TEXT DEFAULT 'personal';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT;
+
 -- Migration example from single-session to multi-session:
 -- INSERT INTO session_config (session_id, display_name, phone_number, is_active, auto_start)
 -- VALUES ('omoikiri-main', 'Астана Основной', '77014135151', true, true)

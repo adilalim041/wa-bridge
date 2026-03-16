@@ -4,10 +4,26 @@ import { getRateLimiter, sendWithDelay } from '../antiban/rateLimiter.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChats, getContacts, getMessages } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages } from '../storage/queries.js';
 
-function normalizePhone(phone = '') {
-  return phone.replace(/\D/g, '');
+function normalizeChatId(value = '') {
+  const raw = decodeURIComponent(value).trim();
+  if (!raw) {
+    return '';
+  }
+
+  if (raw.endsWith('@g.us') || raw.endsWith('@s.whatsapp.net') || raw.endsWith('@lid')) {
+    return raw
+      .replace('@s.whatsapp.net', '')
+      .replace('@g.us', '')
+      .replace('@lid', '');
+  }
+
+  if (raw.includes('-')) {
+    return raw.replace(/[^0-9-]/g, '');
+  }
+
+  return raw.replace(/\D/g, '');
 }
 
 function escapeHtml(value = '') {
@@ -260,7 +276,7 @@ export function setupRoutes(app) {
   router.get('/sessions/:sessionId/chats', async (req, res) => {
     const { sessionId } = req.params;
     try {
-      const chats = await getChats(sessionId);
+      const chats = await getChatsWithLastMessage(sessionId);
       return res.json(chats);
     } catch (error) {
       logger.error({ err: error, sessionId }, 'Failed to fetch chats');
@@ -270,7 +286,7 @@ export function setupRoutes(app) {
 
   router.get('/sessions/:sessionId/messages/:phone', async (req, res) => {
     const { sessionId } = req.params;
-    const phone = normalizePhone(req.params.phone);
+    const phone = normalizeChatId(req.params.phone);
     const limit = Number.parseInt(req.query.limit, 10) || 50;
     const offset = Number.parseInt(req.query.offset, 10) || 0;
 
@@ -296,7 +312,7 @@ export function setupRoutes(app) {
 
   router.post('/sessions/:sessionId/send', async (req, res) => {
     const { sessionId } = req.params;
-    const phone = normalizePhone(req.body?.phone);
+    const phone = normalizeChatId(req.body?.phone);
     const message = req.body?.message?.toString().trim();
 
     if (!phone || !message) {
@@ -310,7 +326,7 @@ export function setupRoutes(app) {
     }
 
     const limiter = getRateLimiter(sessionId);
-    const jid = `${phone}@s.whatsapp.net`;
+    const jid = phone.includes('-') ? `${phone}@g.us` : `${phone}@s.whatsapp.net`;
 
     if (!limiter.canSend(jid) || !limiter.canSendGlobal()) {
       return res.status(429).json({ error: 'Rate limit exceeded' });
