@@ -9,34 +9,6 @@ const heartbeatTimers = new Map();
 
 export async function acquireLock(sessionId) {
   try {
-    const { data: existing, error } = await supabase
-      .from('session_lock')
-      .select('*')
-      .eq('session_id', sessionId)
-      .maybeSingle();
-
-    if (error) {
-      console.error('Failed to check session lock:', error.message);
-      return false;
-    }
-
-    if (existing) {
-      const heartbeatAge = Date.now() - new Date(existing.heartbeat_at).getTime();
-
-      if (existing.instance_id === INSTANCE_ID) {
-        return true;
-      }
-
-      if (heartbeatAge < LOCK_TIMEOUT) {
-        console.log(
-          `Session locked by another instance (${existing.instance_id}). Heartbeat ${Math.round(heartbeatAge / 1000)}s ago.`
-        );
-        return false;
-      }
-
-      console.log(`Stale lock detected (${Math.round(heartbeatAge / 1000)}s old). Taking over...`);
-    }
-
     const { error: upsertError } = await supabase
       .from('session_lock')
       .upsert(
@@ -48,12 +20,10 @@ export async function acquireLock(sessionId) {
         },
         { onConflict: 'session_id' }
       );
-
     if (upsertError) {
       console.error('Failed to acquire lock:', upsertError.message);
       return false;
     }
-
     console.log(`Session lock acquired (instance: ${INSTANCE_ID.slice(0, 8)})`);
     return true;
   } catch (error) {
