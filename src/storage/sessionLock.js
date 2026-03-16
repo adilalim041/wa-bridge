@@ -3,7 +3,7 @@ import { supabase } from './supabase.js';
 
 const INSTANCE_ID = crypto.randomUUID();
 const HEARTBEAT_INTERVAL = 60 * 1000;
-const LOCK_TIMEOUT = 3 * 60 * 1000;
+const LOCK_TIMEOUT = 60 * 1000;
 
 const heartbeatTimers = new Map();
 
