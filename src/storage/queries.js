@@ -203,18 +203,34 @@ export async function getChatsWithLastMessage(sessionId) {
 
     const result = await Promise.all(
       (chatList ?? []).map(async (chat) => {
-        const { data: messages, error } = await supabase
-          .from('messages')
-          .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
-          .eq('session_id', sessionId)
-          .eq('remote_jid', chat.remote_jid)
-          .order('timestamp', { ascending: false })
-          .limit(1);
+        const [{ data: messages, error }, { count, error: unreadError }] = await Promise.all([
+          supabase
+            .from('messages')
+            .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
+            .eq('session_id', sessionId)
+            .eq('remote_jid', chat.remote_jid)
+            .order('timestamp', { ascending: false })
+            .limit(1),
+          supabase
+            .from('messages')
+            .select('*', { count: 'exact', head: true })
+            .eq('session_id', sessionId)
+            .eq('remote_jid', chat.remote_jid)
+            .eq('from_me', false)
+            .is('read_at', null),
+        ]);
 
         if (error) {
           logger.error(
             { err: error, sessionId, remoteJid: chat.remote_jid },
             'Failed to fetch last message for chat'
+          );
+        }
+
+        if (unreadError) {
+          logger.error(
+            { err: unreadError, sessionId, remoteJid: chat.remote_jid },
+            'Failed to count unread messages'
           );
         }
 
@@ -235,6 +251,7 @@ export async function getChatsWithLastMessage(sessionId) {
           mediaUrl: lastMessage?.media_url || null,
           mediaType: lastMessage?.media_type || null,
           fileName: lastMessage?.file_name || null,
+          unreadCount: count || 0,
         };
       })
     );

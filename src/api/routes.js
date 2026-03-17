@@ -26,6 +26,10 @@ function normalizeChatId(value = '') {
   return raw.replace(/\D/g, '');
 }
 
+function buildWhatsAppJid(remoteJid) {
+  return remoteJid.includes('-') ? `${remoteJid}@g.us` : `${remoteJid}@s.whatsapp.net`;
+}
+
 function escapeHtml(value = '') {
   return value
     .replace(/&/g, '&amp;')
@@ -299,6 +303,78 @@ export function setupRoutes(app) {
     }
   });
 
+  router.post('/sessions/:sessionId/messages/read', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.body?.remoteJid);
+    const messageIds = Array.isArray(req.body?.messageIds)
+      ? req.body.messageIds.map((value) => value?.toString().trim()).filter(Boolean)
+      : [];
+
+    if (!remoteJid || messageIds.length === 0) {
+      return res.status(400).json({ error: 'remoteJid and messageIds are required' });
+    }
+
+    try {
+      const { data: rows, error: fetchError } = await supabase
+        .from('messages')
+        .select('message_id, sender, chat_type')
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid)
+        .eq('from_me', false)
+        .in('message_id', messageIds);
+
+      if (fetchError) {
+        logger.error({ err: fetchError, sessionId, remoteJid }, 'Failed to load messages for read receipt');
+        return res.status(500).json({ error: 'Failed to mark messages as read' });
+      }
+
+      const readAt = new Date().toISOString();
+      const { error: updateError } = await supabase
+        .from('messages')
+        .update({ read_at: readAt })
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid)
+        .eq('from_me', false)
+        .in('message_id', messageIds);
+
+      if (updateError) {
+        logger.error({ err: updateError, sessionId, remoteJid }, 'Failed to update read timestamps');
+        return res.status(500).json({ error: 'Failed to mark messages as read' });
+      }
+
+      const sock = sessionManager.getSession(sessionId)?.sock;
+      let receiptSent = false;
+
+      if (sock?.user && rows?.length) {
+        const keys = rows.map((row) => ({
+          remoteJid: buildWhatsAppJid(remoteJid),
+          id: row.message_id,
+          participant: row.chat_type === 'group' && row.sender ? `${row.sender}@s.whatsapp.net` : undefined,
+        }));
+
+        try {
+          await sock.readMessages(keys);
+          receiptSent = true;
+        } catch (receiptError) {
+          logger.error(
+            { err: receiptError, sessionId, remoteJid, messageIds },
+            'Failed to send WhatsApp read receipt'
+          );
+        }
+      }
+
+      return res.json({
+        success: true,
+        readAt,
+        receiptSent,
+        updated: rows?.length || 0,
+      });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error while marking messages as read');
+      return res.status(500).json({ error: 'Failed to mark messages as read' });
+    }
+  });
+
   router.get('/sessions/:sessionId/contacts', async (req, res) => {
     const { sessionId } = req.params;
     try {
@@ -326,7 +402,7 @@ export function setupRoutes(app) {
     }
 
     const limiter = getRateLimiter(sessionId);
-    const jid = phone.includes('-') ? `${phone}@g.us` : `${phone}@s.whatsapp.net`;
+    const jid = buildWhatsAppJid(phone);
 
     if (!limiter.canSend(jid) || !limiter.canSendGlobal()) {
       return res.status(429).json({ error: 'Rate limit exceeded' });
