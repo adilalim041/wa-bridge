@@ -288,6 +288,57 @@ export function setupRoutes(app) {
     }
   });
 
+  router.post('/sessions/:sessionId/chats/:phone/mute', async (req, res) => {
+    const { sessionId } = req.params;
+    const phone = normalizeChatId(req.params.phone);
+    const mute = Boolean(req.body?.mute);
+    const duration = Number.isFinite(Number(req.body?.duration)) ? Number(req.body.duration) : null;
+
+    const session = sessionManager.getSession(sessionId);
+    const sock = session?.sock;
+    if (!sock?.user) {
+      return res.status(503).json({ error: 'WhatsApp session is not connected' });
+    }
+
+    const jid = buildWhatsAppJid(phone);
+
+    try {
+      if (mute) {
+        const expiration = duration && duration > 0 ? Math.floor(Date.now() / 1000) + duration : -1;
+        await sock.chatModify({ mute: expiration }, jid);
+      } else {
+        await sock.chatModify({ mute: null }, jid);
+      }
+
+      const mutedUntil = mute && duration && duration > 0
+        ? new Date(Date.now() + duration * 1000).toISOString()
+        : null;
+
+      const { error: persistError } = await supabase
+        .from('chats')
+        .upsert(
+          {
+            session_id: sessionId,
+            remote_jid: phone,
+            is_muted: mute,
+            muted_until: mutedUntil,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'session_id,remote_jid' }
+        );
+
+      if (persistError) {
+        logger.error({ err: persistError, sessionId, jid }, 'Failed to persist mute state');
+        return res.status(500).json({ error: 'Failed to persist mute state' });
+      }
+
+      return res.json({ success: true, muted: mute, mutedUntil });
+    } catch (error) {
+      logger.error({ err: error, sessionId, jid }, 'Failed to mute/unmute chat');
+      return res.status(500).json({ error: 'Failed to mute/unmute chat' });
+    }
+  });
+
   router.get('/sessions/:sessionId/messages/:phone', async (req, res) => {
     const { sessionId } = req.params;
     const phone = normalizeChatId(req.params.phone);

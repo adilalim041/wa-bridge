@@ -242,6 +242,8 @@ export async function getChatsWithLastMessage(sessionId) {
           displayName: chat.display_name,
           participantCount: chat.participant_count,
           phoneNumber: chat.phone_number || chat.remote_jid,
+          isMuted: Boolean(chat.is_muted),
+          mutedUntil: chat.muted_until || null,
           lastMessage: lastMessage?.body || null,
           lastMessageType: lastMessage?.message_type || 'text',
           lastTimestamp: lastMessage?.timestamp || chat.last_message_at,

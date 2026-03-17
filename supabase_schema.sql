@@ -94,6 +94,8 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS is_muted BOOLEAN DEFAULT false;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
 
 -- Migration example from single-session to multi-session:
 -- INSERT INTO session_config (session_id, display_name, phone_number, is_active, auto_start)
