@@ -1,4 +1,7 @@
 import { logger } from '../config.js';
+import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
+import { trackResponseTime } from '../ai/responseTracker.js';
+import { enqueueForAI } from '../ai/queueManager.js';
 import { getContactName, saveContact, saveMessage, upsertChat } from '../storage/queries.js';
 import { supabase } from '../storage/supabase.js';
 import { processMedia } from './mediaHandler.js';
@@ -299,6 +302,46 @@ export async function handleMessage(message, sock, sessionId) {
     };
 
     await saveMessage(payload);
+
+    try {
+      const dialogSessionId = await getOrCreateDialogSession(
+        sessionId,
+        remoteJid,
+        payload.timestamp
+      );
+
+      if (dialogSessionId) {
+        const { error: linkError } = await supabase
+          .from('messages')
+          .update({ dialog_session_id: dialogSessionId })
+          .eq('message_id', payload.messageId)
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid);
+
+        if (linkError) {
+          logger.error(
+            { err: linkError, sessionId, remoteJid, messageId: payload.messageId, dialogSessionId },
+            'Failed to link message to dialog session'
+          );
+        }
+
+        await trackResponseTime(
+          sessionId,
+          remoteJid,
+          dialogSessionId,
+          payload.fromMe,
+          payload.timestamp
+        );
+
+        await enqueueForAI(sessionId, remoteJid, payload.messageId, dialogSessionId);
+      }
+    } catch (error) {
+      logger.error(
+        { err: error, sessionId, remoteJid, messageId: payload.messageId },
+        'AI pipeline failed after message save'
+      );
+    }
+
     await upsertChat({
       remoteJid,
       sessionId,

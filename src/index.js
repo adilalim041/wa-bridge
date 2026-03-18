@@ -4,6 +4,7 @@ import { logger } from './config.js';
 import { stopWebSocket } from './api/websocket.js';
 import { stopHealthMonitor } from './monitor.js';
 import { stopVersionChecker } from './versionChecker.js';
+import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
 
 let server;
 
@@ -11,11 +12,13 @@ async function bootstrap() {
   const serverState = startServer();
   server = serverState.server;
   await sessionManager.startAll();
+  startAIWorker();
   logger.info('WA Bridge multi-session started');
 }
 
 async function shutdown(signal) {
   logger.info(`Received ${signal}. Shutting down...`);
+  stopAIWorker();
   await sessionManager.stopAll();
   stopHealthMonitor();
   stopVersionChecker();
