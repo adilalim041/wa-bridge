@@ -1,11 +1,24 @@
 import express from 'express';
+import multer from 'multer';
 import QRCode from 'qrcode';
+import { v2 as cloudinary } from 'cloudinary';
 import { getRateLimiter, sendWithDelay } from '../antiban/rateLimiter.js';
 import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { getChatsWithLastMessage, getContacts, getMessages } from '../storage/queries.js';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'do0zl6hbd',
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 function normalizeChatId(value = '') {
   const raw = decodeURIComponent(value).trim();
@@ -670,6 +683,67 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error saving contact');
       return res.status(500).json({ error: 'Failed to save contact' });
+    }
+  });
+
+  router.post('/sessions/:sessionId/contacts/:phone/avatar', upload.single('avatar'), async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          {
+            folder: 'omoikiri_crm/avatars',
+            public_id: `${sessionId}_${remoteJid}`,
+            overwrite: true,
+            transformation: [
+              { width: 200, height: 200, crop: 'fill', gravity: 'face' },
+              { quality: 'auto', fetch_format: 'auto' },
+            ],
+          },
+          (error, uploadResult) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve(uploadResult);
+          }
+        );
+
+        uploadStream.end(req.file.buffer);
+      });
+
+      const avatarUrl = result?.secure_url || null;
+
+      if (!avatarUrl) {
+        return res.status(500).json({ error: 'Failed to upload avatar' });
+      }
+
+      const { error } = await supabase
+        .from('contacts_crm')
+        .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid);
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to update avatar URL');
+        return res.status(500).json({ error: 'Failed to save avatar' });
+      }
+
+      return res.json({ success: true, avatarUrl });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Failed to upload avatar');
+      return res.status(500).json({ error: 'Failed to upload avatar' });
     }
   });
 

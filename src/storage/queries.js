@@ -204,7 +204,11 @@ export async function getChatsWithLastMessage(sessionId) {
 
     const result = await Promise.all(
       (chatList ?? []).map(async (chat) => {
-        const [{ data: messages, error }, { count, error: unreadError }] = await Promise.all([
+        const [
+          { data: messages, error },
+          { count, error: unreadError },
+          { data: crmContact, error: crmError },
+        ] = await Promise.all([
           supabase
             .from('messages')
             .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
@@ -219,6 +223,12 @@ export async function getChatsWithLastMessage(sessionId) {
             .eq('remote_jid', chat.remote_jid)
             .eq('from_me', false)
             .is('read_at', null),
+          supabase
+            .from('contacts_crm')
+            .select('first_name, last_name, role, avatar_url')
+            .eq('session_id', sessionId)
+            .eq('remote_jid', chat.remote_jid)
+            .maybeSingle(),
         ]);
 
         if (error) {
@@ -235,7 +245,17 @@ export async function getChatsWithLastMessage(sessionId) {
           );
         }
 
+        if (crmError) {
+          logger.error(
+            { err: crmError, sessionId, remoteJid: chat.remote_jid },
+            'Failed to fetch CRM contact for chat'
+          );
+        }
+
         const lastMessage = messages?.[0] || null;
+        const crmName = crmContact
+          ? `${crmContact.first_name}${crmContact.last_name ? ` ${crmContact.last_name}` : ''}`
+          : null;
 
         return {
           remoteJid: chat.remote_jid,
@@ -256,6 +276,10 @@ export async function getChatsWithLastMessage(sessionId) {
           mediaType: lastMessage?.media_type || null,
           fileName: lastMessage?.file_name || null,
           unreadCount: count || 0,
+          hasCrmContact: Boolean(crmContact),
+          crmName,
+          crmRole: crmContact?.role || null,
+          crmAvatarUrl: crmContact?.avatar_url || null,
         };
       })
     );
