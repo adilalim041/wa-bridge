@@ -426,6 +426,79 @@ export function setupRoutes(app) {
     }
   });
 
+  router.post('/sessions/:sessionId/chats/:phone/read-all', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    try {
+      const [{ count, error: countError }, { data: recentUnread, error: recentError }] = await Promise.all([
+        supabase
+          .from('messages')
+          .select('*', { count: 'exact', head: true })
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid)
+          .eq('from_me', false)
+          .is('read_at', null),
+        supabase
+          .from('messages')
+          .select('message_id, sender, chat_type')
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid)
+          .eq('from_me', false)
+          .is('read_at', null)
+          .order('timestamp', { ascending: false })
+          .limit(20),
+      ]);
+
+      if (countError || recentError) {
+        logger.error(
+          { err: countError || recentError, sessionId, remoteJid },
+          'Failed to load unread messages for bulk read'
+        );
+        return res.status(500).json({ error: 'Failed to mark all messages as read' });
+      }
+
+      const readAt = new Date().toISOString();
+      const { error: updateError } = await supabase
+        .from('messages')
+        .update({ read_at: readAt })
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid)
+        .eq('from_me', false)
+        .is('read_at', null);
+
+      if (updateError) {
+        logger.error({ err: updateError, sessionId, remoteJid }, 'Failed to mark all as read');
+        return res.status(500).json({ error: 'Failed to mark all messages as read' });
+      }
+
+      const sock = sessionManager.getSession(sessionId)?.sock;
+      if (sock?.user && recentUnread?.length) {
+        try {
+          const jid = buildWhatsAppJid(remoteJid);
+          const keys = recentUnread.map((row) => ({
+            remoteJid: jid,
+            id: row.message_id,
+            participant: row.chat_type === 'group' && row.sender ? `${row.sender}@s.whatsapp.net` : undefined,
+          }));
+
+          await sock.readMessages(keys);
+        } catch (receiptError) {
+          logger.error({ err: receiptError, sessionId, remoteJid }, 'Failed to send bulk read receipt');
+        }
+      }
+
+      return res.json({ success: true, readAt, updated: count || 0 });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error marking all as read');
+      return res.status(500).json({ error: 'Failed to mark all messages as read' });
+    }
+  });
+
   router.get('/sessions/:sessionId/contacts', async (req, res) => {
     const { sessionId } = req.params;
     try {

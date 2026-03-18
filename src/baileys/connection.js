@@ -95,7 +95,7 @@ export async function startConnection({ sessionId, onSocket }) {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['WA Bridge', 'Chrome', '120.0.0'],
+    browser: ['Omoikiri CRM', 'Desktop', '1.0'],
     version: waVersion,
   });
 
