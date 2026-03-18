@@ -1,6 +1,7 @@
 import express from 'express';
 import QRCode from 'qrcode';
 import { getRateLimiter, sendWithDelay } from '../antiban/rateLimiter.js';
+import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
@@ -336,6 +337,94 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, sessionId, jid }, 'Failed to mute/unmute chat');
       return res.status(500).json({ error: 'Failed to mute/unmute chat' });
+    }
+  });
+
+  router.post('/sessions/:sessionId/chats/:phone/hide', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+    const hidden = Boolean(req.body?.hidden);
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    try {
+      const { error } = await supabase
+        .from('chats')
+        .upsert(
+          {
+            session_id: sessionId,
+            remote_jid: remoteJid,
+            is_hidden: hidden,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'session_id,remote_jid' }
+        );
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to hide/unhide chat');
+        return res.status(500).json({ error: 'Failed to update chat visibility' });
+      }
+
+      invalidateHiddenCache(sessionId, remoteJid);
+
+      if (hidden) {
+        const { error: deleteError } = await supabase
+          .from('messages')
+          .delete()
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid);
+
+        if (deleteError) {
+          logger.error({ err: deleteError, sessionId, remoteJid }, 'Failed to delete hidden chat messages');
+        }
+      }
+
+      return res.json({ success: true, hidden });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error hiding chat');
+      return res.status(500).json({ error: 'Failed to update chat visibility' });
+    }
+  });
+
+  router.post('/sessions/:sessionId/chats/:phone/tags', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+    const inputTags = req.body?.tags;
+
+    if (!remoteJid || !Array.isArray(inputTags)) {
+      return res.status(400).json({ error: 'phone and tags array are required' });
+    }
+
+    const cleanTags = [...new Set(
+      inputTags
+        .map((tag) => tag?.toString().trim().toLowerCase())
+        .filter(Boolean)
+    )].slice(0, 10);
+
+    try {
+      const { error } = await supabase
+        .from('chats')
+        .upsert(
+          {
+            session_id: sessionId,
+            remote_jid: remoteJid,
+            tags: cleanTags,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'session_id,remote_jid' }
+        );
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to update tags');
+        return res.status(500).json({ error: 'Failed to update tags' });
+      }
+
+      return res.json({ success: true, tags: cleanTags });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error updating tags');
+      return res.status(500).json({ error: 'Failed to update tags' });
     }
   });
 

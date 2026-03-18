@@ -1,5 +1,6 @@
 import { logger } from '../config.js';
 import { getContactName, saveContact, saveMessage, upsertChat } from '../storage/queries.js';
+import { supabase } from '../storage/supabase.js';
 import { processMedia } from './mediaHandler.js';
 
 const SKIP_TYPES = [
@@ -8,6 +9,42 @@ const SKIP_TYPES = [
   'messageContextInfo',
   'reactionMessage',
 ];
+
+const hiddenChatsCache = new Map();
+const hiddenCacheTimestamps = new Map();
+const HIDDEN_CACHE_TTL = 5 * 60 * 1000;
+
+async function isChatHidden(sessionId, remoteJid) {
+  const cacheKey = `${sessionId}:${remoteJid}`;
+  const cachedAt = hiddenCacheTimestamps.get(cacheKey);
+
+  if (cachedAt && Date.now() - cachedAt < HIDDEN_CACHE_TTL) {
+    return hiddenChatsCache.get(cacheKey) || false;
+  }
+
+  try {
+    const { data } = await supabase
+      .from('chats')
+      .select('is_hidden')
+      .eq('session_id', sessionId)
+      .eq('remote_jid', remoteJid)
+      .maybeSingle();
+
+    const isHidden = data?.is_hidden || false;
+    hiddenChatsCache.set(cacheKey, isHidden);
+    hiddenCacheTimestamps.set(cacheKey, Date.now());
+    return isHidden;
+  } catch (error) {
+    logger.error({ err: error, sessionId, remoteJid }, 'Failed to resolve hidden chat state');
+    return false;
+  }
+}
+
+export function invalidateHiddenCache(sessionId, remoteJid) {
+  const cacheKey = `${sessionId}:${remoteJid}`;
+  hiddenChatsCache.delete(cacheKey);
+  hiddenCacheTimestamps.delete(cacheKey);
+}
 
 async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
   if (remoteJid.endsWith('@lid')) {
@@ -194,6 +231,12 @@ export async function handleMessage(message, sock, sessionId) {
     const messageId = message.key.id;
     const isGroup = rawRemoteJid.endsWith('@g.us');
     const sender = isGroup ? await normalizeParticipant(message.key.participant || '', sock, sessionId) : null;
+
+    if (await isChatHidden(sessionId, remoteJid)) {
+      logger.debug({ sessionId, remoteJid, messageId }, 'Skipping hidden chat message');
+      return null;
+    }
+
     let pushName = message.pushName ?? resolveContactName(sock, isGroup ? sender : remoteJid);
 
     if (!pushName) {
