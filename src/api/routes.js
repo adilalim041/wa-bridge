@@ -2,6 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
+import { handleAIChat } from '../ai/chatEndpoint.js';
 import { getRateLimiter, sendWithDelay } from '../antiban/rateLimiter.js';
 import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
@@ -150,6 +151,38 @@ async function renderQrPage(sessionId, displayName, state) {
 
 export function setupRoutes(app) {
   const router = express.Router();
+
+  router.post('/ai/chat', async (req, res) => {
+    const inputMessages = Array.isArray(req.body?.messages) ? req.body.messages : null;
+
+    if (!inputMessages || inputMessages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    const cleanMessages = inputMessages.map((message) => ({
+      role: message?.role === 'assistant' ? 'assistant' : 'user',
+      content:
+        typeof message?.content === 'string'
+          ? message.content
+          : JSON.stringify(message?.content ?? ''),
+    }));
+
+    try {
+      const result = await handleAIChat(cleanMessages);
+
+      if (result.error) {
+        return res.status(500).json({ error: result.error });
+      }
+
+      return res.json({
+        response: result.response,
+        usage: result.usage || null,
+      });
+    } catch (error) {
+      logger.error({ err: error }, 'AI chat endpoint error');
+      return res.status(500).json({ error: 'AI chat failed' });
+    }
+  });
 
   router.get('/health', async (_req, res) => {
     const { data: configs } = await supabase
