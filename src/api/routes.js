@@ -588,6 +588,140 @@ export function setupRoutes(app) {
     }
   });
 
+  router.get('/sessions/:sessionId/contacts/:phone', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('contacts_crm')
+        .select('*')
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid)
+        .maybeSingle();
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to fetch contact');
+        return res.status(500).json({ error: 'Failed to fetch contact' });
+      }
+
+      return res.json(data || null);
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error fetching contact');
+      return res.status(500).json({ error: 'Failed to fetch contact' });
+    }
+  });
+
+  router.post('/sessions/:sessionId/contacts/:phone', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+    const {
+      firstName,
+      lastName,
+      role,
+      company,
+      city,
+      responsibleManager,
+      avatarUrl,
+      notes,
+      phone: phoneNumber,
+    } = req.body ?? {};
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    if (!firstName || !firstName.trim()) {
+      return res.status(400).json({ error: 'firstName is required' });
+    }
+
+    try {
+      const payload = {
+        session_id: sessionId,
+        remote_jid: remoteJid,
+        phone: phoneNumber || remoteJid,
+        first_name: firstName.trim(),
+        last_name: lastName?.trim() || null,
+        role: role?.trim() || 'клиент',
+        company: company?.trim() || null,
+        city: city?.trim() || null,
+        responsible_manager: responsibleManager?.trim() || null,
+        avatar_url: avatarUrl || null,
+        notes: notes?.trim() || null,
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data, error } = await supabase
+        .from('contacts_crm')
+        .upsert(payload, { onConflict: 'session_id,remote_jid' })
+        .select()
+        .single();
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to save contact');
+        return res.status(500).json({ error: 'Failed to save contact' });
+      }
+
+      return res.json(data);
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error saving contact');
+      return res.status(500).json({ error: 'Failed to save contact' });
+    }
+  });
+
+  router.delete('/sessions/:sessionId/contacts/:phone', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    try {
+      const { error } = await supabase
+        .from('contacts_crm')
+        .delete()
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid);
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to delete contact');
+        return res.status(500).json({ error: 'Failed to delete contact' });
+      }
+
+      return res.json({ success: true });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error deleting contact');
+      return res.status(500).json({ error: 'Failed to delete contact' });
+    }
+  });
+
+  router.get('/sessions/:sessionId/contacts-crm', async (req, res) => {
+    const { sessionId } = req.params;
+
+    try {
+      const { data, error } = await supabase
+        .from('contacts_crm')
+        .select('*')
+        .eq('session_id', sessionId)
+        .order('updated_at', { ascending: false });
+
+      if (error) {
+        logger.error({ err: error, sessionId }, 'Failed to fetch contacts list');
+        return res.status(500).json({ error: 'Failed to fetch contacts' });
+      }
+
+      return res.json(data || []);
+    } catch (error) {
+      logger.error({ err: error, sessionId }, 'Unexpected error fetching contacts');
+      return res.status(500).json({ error: 'Failed to fetch contacts' });
+    }
+  });
+
   router.get('/sessions/:sessionId/contacts', async (req, res) => {
     const { sessionId } = req.params;
     try {
