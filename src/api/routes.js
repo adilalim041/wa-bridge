@@ -10,6 +10,24 @@ import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { getChatsWithLastMessage, getContacts, getMessages } from '../storage/queries.js';
 
+const CYRILLIC_MAP = {
+  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
+  з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o',
+  п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts',
+  ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+};
+
+function slugify(text) {
+  return text
+    .toLowerCase()
+    .split('')
+    .map((c) => CYRILLIC_MAP[c] || c)
+    .join('')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40);
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -236,27 +254,49 @@ export function setupRoutes(app) {
   });
 
   router.post('/sessions', async (req, res) => {
-    const sessionId = req.body?.sessionId?.toString().trim();
     const displayName = req.body?.displayName?.toString().trim();
+    const city = req.body?.city?.toString().trim() || '';
+    let sessionId = req.body?.sessionId?.toString().trim() || '';
 
-    if (!sessionId || !displayName) {
-      return res.status(400).json({ error: 'sessionId and displayName required' });
+    if (!displayName) {
+      return res.status(400).json({ error: 'displayName required' });
+    }
+
+    if (!sessionId) {
+      sessionId = slugify(city ? `${city} ${displayName}` : displayName);
     }
 
     if (!/^[a-z0-9-]+$/.test(sessionId)) {
       return res.status(400).json({ error: 'sessionId must be lowercase alphanumeric with hyphens' });
     }
 
+    const finalDisplayName = city ? `${city} — ${displayName}` : displayName;
+
     const { error } = await supabase.from('session_config').insert({
       session_id: sessionId,
-      display_name: displayName,
+      display_name: finalDisplayName,
       is_active: true,
       auto_start: true,
     });
 
     if (error) {
-      logger.error({ err: error, sessionId }, 'Failed to create session');
-      return res.status(409).json({ error: 'Session already exists' });
+      if (error.code === '23505') {
+        sessionId = `${sessionId}-${Date.now().toString(36).slice(-4)}`;
+        const { error: retryError } = await supabase.from('session_config').insert({
+          session_id: sessionId,
+          display_name: finalDisplayName,
+          is_active: true,
+          auto_start: true,
+        });
+
+        if (retryError) {
+          logger.error({ err: retryError, sessionId }, 'Failed to create session (retry)');
+          return res.status(409).json({ error: 'Session already exists' });
+        }
+      } else {
+        logger.error({ err: error, sessionId }, 'Failed to create session');
+        return res.status(500).json({ error: error.message });
+      }
     }
 
     try {
@@ -268,6 +308,7 @@ export function setupRoutes(app) {
       return res.json({
         success: true,
         sessionId,
+        displayName: finalDisplayName,
         message: `Scan QR at /qr/${sessionId}`,
       });
     } catch (startError) {

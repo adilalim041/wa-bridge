@@ -1,5 +1,6 @@
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
+import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -36,7 +37,10 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
 - dead = отказался, не отвечает давно
 - lead_source определяй по контексту первых сообщений (если упоминают Instagram/рекламу/шоурум)
 - risk_flags = пустой массив если всё нормально
-- Отвечай ТОЛЬКО JSON, ничего больше`;
+- Используй справочную информацию ниже для точного определения моделей продукции и оценки соответствия стандартам продаж
+- Отвечай ТОЛЬКО JSON, ничего больше
+
+${KNOWLEDGE_BASE}`;
 
 async function callClaude(messages) {
   if (!ANTHROPIC_API_KEY) {

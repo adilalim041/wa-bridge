@@ -1,5 +1,6 @@
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
+import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -20,7 +21,10 @@ const SYSTEM_PROMPT = `Ты — Omoikiri.AI, интеллектуальный а
 - Если данных нет, честно скажи
 - Используй инструменты чтобы получить актуальные данные, не придумывай
 - Форматируй ответ красиво: используй **жирный** для важного, списки где уместно
-- Будь проактивным: если видишь проблему, сообщи даже если не спрашивали`;
+- Будь проактивным: если видишь проблему, сообщи даже если не спрашивали
+- При оценке работы менеджеров сверяй с нашими стандартами продаж из базы знаний ниже
+
+${KNOWLEDGE_BASE}`;
 
 const TOOLS = [
   {
