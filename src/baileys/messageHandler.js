@@ -210,18 +210,49 @@ export async function handleMessage(message, sock, sessionId) {
       return;
     }
 
-    const msg = message.message;
+    let msg = message.message;
     if (!msg) {
+      console.log(`[${sessionId}] SKIP: no message body, key=${message.key?.id}`);
       return;
+    }
+
+    // Unwrap deviceSentMessage — outgoing messages synced from the phone
+    if (msg.deviceSentMessage?.message) {
+      console.log(`[${sessionId}] Unwrapping deviceSentMessage: ${message.key?.id}`);
+      msg = msg.deviceSentMessage.message;
+    }
+
+    // Unwrap ephemeralMessage
+    if (msg.ephemeralMessage?.message) {
+      console.log(`[${sessionId}] Unwrapping ephemeralMessage: ${message.key?.id}`);
+      msg = msg.ephemeralMessage.message;
+    }
+
+    // Unwrap viewOnceMessage
+    if (msg.viewOnceMessage?.message) {
+      console.log(`[${sessionId}] Unwrapping viewOnceMessage: ${message.key?.id}`);
+      msg = msg.viewOnceMessage.message;
+    }
+
+    // Unwrap viewOnceMessageV2
+    if (msg.viewOnceMessageV2?.message) {
+      msg = msg.viewOnceMessageV2.message;
+    }
+
+    // Unwrap documentWithCaptionMessage
+    if (msg.documentWithCaptionMessage?.message) {
+      msg = msg.documentWithCaptionMessage.message;
     }
 
     const msgType = Object.keys(msg)[0];
     if (SKIP_TYPES.includes(msgType)) {
+      console.log(`[${sessionId}] SKIP type: ${msgType}, key=${message.key?.id}, jid=${message.key?.remoteJid}`);
       return;
     }
 
     const body = extractBody(msg);
     if (body === null) {
+      console.log(`[${sessionId}] SKIP: null body, type=${msgType}, key=${message.key?.id}, jid=${message.key?.remoteJid}`);
       return;
     }
 
