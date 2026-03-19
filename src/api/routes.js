@@ -205,6 +205,118 @@ export function setupRoutes(app) {
     }
   });
 
+  router.get('/analytics/summary', async (req, res) => {
+    const sessionId = req.query.session_id || null;
+    const days = Math.min(Number(req.query.days) || 7, 90);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+    try {
+      // Build session filter
+      const sessionFilter = (query) => sessionId ? query.eq('session_id', sessionId) : query;
+
+      // 1. KPI: response times
+      const { data: responseTimes } = await sessionFilter(
+        supabase
+          .from('manager_analytics')
+          .select('response_time_seconds')
+          .gte('created_at', since)
+          .not('response_time_seconds', 'is', null)
+      );
+
+      const rtValues = (responseTimes ?? []).map((r) => r.response_time_seconds).filter((v) => v > 0);
+      const avgResponseTime = rtValues.length > 0
+        ? Math.round(rtValues.reduce((a, b) => a + b, 0) / rtValues.length)
+        : 0;
+
+      // 2. AI analysis breakdown
+      const { data: aiData } = await sessionFilter(
+        supabase
+          .from('chat_ai')
+          .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required')
+          .gte('analyzed_at', since)
+      );
+
+      const ai = aiData ?? [];
+
+      // Lead temperature
+      const leads = { hot: 0, warm: 0, cold: 0, dead: 0 };
+      for (const row of ai) {
+        if (leads[row.lead_temperature] !== undefined) leads[row.lead_temperature]++;
+      }
+
+      // Deal stages
+      const stages = {};
+      for (const row of ai) {
+        stages[row.deal_stage] = (stages[row.deal_stage] || 0) + 1;
+      }
+
+      // Sentiment
+      const sentiment = { positive: 0, neutral: 0, negative: 0, aggressive: 0 };
+      for (const row of ai) {
+        if (sentiment[row.sentiment] !== undefined) sentiment[row.sentiment]++;
+      }
+
+      // Risk flags
+      const riskCounts = {};
+      for (const row of ai) {
+        for (const flag of row.risk_flags ?? []) {
+          riskCounts[flag] = (riskCounts[flag] || 0) + 1;
+        }
+      }
+      const topRisks = Object.entries(riskCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([flag, count]) => ({ flag, count }));
+
+      // Action required count
+      const actionRequired = ai.filter((r) => r.action_required).length;
+
+      // 3. Dialog sessions count
+      const { count: totalDialogs } = await sessionFilter(
+        supabase
+          .from('dialog_sessions')
+          .select('*', { count: 'exact', head: true })
+          .gte('started_at', since)
+      );
+
+      // 4. Daily message trend
+      const { data: dailyMessages } = await sessionFilter(
+        supabase
+          .from('messages')
+          .select('timestamp')
+          .gte('timestamp', since)
+          .order('timestamp', { ascending: true })
+      );
+
+      const dailyMap = {};
+      for (const msg of dailyMessages ?? []) {
+        const day = msg.timestamp.substring(0, 10);
+        dailyMap[day] = (dailyMap[day] || 0) + 1;
+      }
+      const dailyStats = Object.entries(dailyMap)
+        .map(([date, messages]) => ({ date, messages }))
+        .sort((a, b) => a.date.localeCompare(b.date));
+
+      return res.json({
+        period: { days, since },
+        kpi: {
+          avgResponseTime,
+          hotLeads: leads.hot,
+          totalDialogs: totalDialogs || 0,
+          actionRequired,
+        },
+        leads,
+        stages,
+        sentiment,
+        topRisks,
+        dailyStats,
+      });
+    } catch (error) {
+      logger.error({ err: error }, 'Analytics summary failed');
+      return res.status(500).json({ error: 'Failed to fetch analytics' });
+    }
+  });
+
   router.get('/health', async (_req, res) => {
     const { data: configs } = await supabase
       .from('session_config')
