@@ -911,8 +911,11 @@ export function setupRoutes(app) {
       const messageId = result?.key?.id ?? `sent-${Date.now()}`;
 
       // Save sent message directly to Supabase — don't rely on messages.upsert event
+      const now = new Date().toISOString();
       try {
         const { saveMessage, upsertChat } = await import('../storage/queries.js');
+        const { getPhoneToSession } = await import('../baileys/messageHandler.js');
+
         await saveMessage({
           messageId,
           sessionId,
@@ -926,7 +929,7 @@ export function setupRoutes(app) {
           mediaUrl: null,
           mediaType: null,
           fileName: null,
-          timestamp: new Date().toISOString(),
+          timestamp: now,
         });
 
         await upsertChat({
@@ -937,6 +940,40 @@ export function setupRoutes(app) {
           participantCount: null,
           phoneNumber: phone.includes('-') ? null : phone,
         });
+
+        // Cross-session mirror: save as incoming for the other session
+        const phoneMap = getPhoneToSession();
+        const mirrorSessionId = phoneMap.get(phone);
+        const myPhone = [...phoneMap.entries()].find(([, sid]) => sid === sessionId)?.[0];
+
+        if (mirrorSessionId && mirrorSessionId !== sessionId && myPhone) {
+          await saveMessage({
+            messageId: `${messageId}_mirror`,
+            sessionId: mirrorSessionId,
+            remoteJid: myPhone,
+            fromMe: false,
+            body: message,
+            messageType: 'text',
+            pushName: sock.user?.name || null,
+            sender: null,
+            chatType: 'personal',
+            mediaUrl: null,
+            mediaType: null,
+            fileName: null,
+            timestamp: now,
+          });
+
+          await upsertChat({
+            remoteJid: myPhone,
+            sessionId: mirrorSessionId,
+            chatType: 'personal',
+            displayName: null,
+            participantCount: null,
+            phoneNumber: myPhone,
+          });
+
+          logger.info(`[/send] Mirrored to ${mirrorSessionId}: ${phone} → ${myPhone}`);
+        }
       } catch (saveErr) {
         logger.error({ err: saveErr, sessionId, messageId }, 'Failed to save sent message to DB');
       }

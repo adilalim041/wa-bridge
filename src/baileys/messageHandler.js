@@ -17,6 +17,42 @@ const hiddenChatsCache = new Map();
 const hiddenCacheTimestamps = new Map();
 const HIDDEN_CACHE_TTL = 5 * 60 * 1000;
 
+// Cross-session mirroring: maps phone numbers to session IDs
+// e.g. { "77014135151": "omoikiri-main", "77786137600": "almaty-alim" }
+const phoneToSession = new Map();
+let phoneRegistryLoaded = false;
+
+export async function loadPhoneRegistry() {
+  try {
+    const { data } = await supabase
+      .from('session_config')
+      .select('session_id, phone_number')
+      .not('phone_number', 'is', null);
+
+    phoneToSession.clear();
+    for (const row of data ?? []) {
+      if (row.phone_number) {
+        phoneToSession.set(row.phone_number, row.session_id);
+        console.log(`[mirror] Registered: ${row.phone_number} → ${row.session_id}`);
+      }
+    }
+    phoneRegistryLoaded = true;
+  } catch (err) {
+    logger.error({ err }, 'Failed to load phone registry for cross-session mirroring');
+  }
+}
+
+export function registerSessionPhone(sessionId, phoneNumber) {
+  if (phoneNumber) {
+    phoneToSession.set(phoneNumber, sessionId);
+    console.log(`[mirror] Registered: ${phoneNumber} → ${sessionId}`);
+  }
+}
+
+export function getPhoneToSession() {
+  return phoneToSession;
+}
+
 async function isChatHidden(sessionId, remoteJid) {
   const cacheKey = `${sessionId}:${remoteJid}`;
   const cachedAt = hiddenCacheTimestamps.get(cacheKey);
@@ -392,6 +428,50 @@ export async function handleMessage(message, sock, sessionId) {
 
     const preview = body.length > 50 ? `${body.substring(0, 50)}...` : body;
     logger.info(`[${sessionId}] [${fromMe ? 'OUT' : 'IN'}] ${remoteJid}: ${preview}`);
+
+    // Cross-session mirroring: if remoteJid is also one of our sessions,
+    // save a mirrored copy for that session (with flipped from_me)
+    if (!isGroup && phoneToSession.size > 0) {
+      const mirrorSessionId = phoneToSession.get(remoteJid);
+      const myPhone = [...phoneToSession.entries()].find(([, sid]) => sid === sessionId)?.[0];
+
+      if (mirrorSessionId && mirrorSessionId !== sessionId && myPhone) {
+        try {
+          const mirrorPayload = {
+            messageId: `${messageId}_mirror`,
+            sessionId: mirrorSessionId,
+            remoteJid: myPhone,
+            fromMe: !fromMe,
+            body,
+            messageType,
+            pushName: fromMe ? (pushName || null) : pushName,
+            sender: null,
+            chatType: 'personal',
+            mediaUrl: mediaUrl,
+            mediaType: mediaFileType || messageType,
+            fileName: mediaFileName,
+            timestamp,
+          };
+
+          await saveMessage(mirrorPayload);
+          await upsertChat({
+            remoteJid: myPhone,
+            sessionId: mirrorSessionId,
+            chatType: 'personal',
+            displayName: chatDisplayName || pushName,
+            participantCount: null,
+            phoneNumber: myPhone,
+          });
+
+          logger.info(
+            `[${sessionId}] [MIRROR → ${mirrorSessionId}] ${myPhone}: ${preview}`
+          );
+        } catch (mirrorErr) {
+          logger.error({ err: mirrorErr, sessionId, mirrorSessionId }, 'Cross-session mirror failed');
+        }
+      }
+    }
+
     return payload;
   } catch (error) {
     logger.error({ err: error, sessionId, messageId: message?.key?.id }, 'Failed to handle message');

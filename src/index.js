@@ -5,6 +5,7 @@ import { stopWebSocket } from './api/websocket.js';
 import { stopHealthMonitor } from './monitor.js';
 import { stopVersionChecker } from './versionChecker.js';
 import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
+import { loadPhoneRegistry } from './baileys/messageHandler.js';
 
 let server;
 let keepAliveTimer;
@@ -30,6 +31,7 @@ function startKeepAlive() {
 async function bootstrap() {
   const serverState = startServer();
   server = serverState.server;
+  await loadPhoneRegistry();
   await sessionManager.startAll();
   startAIWorker();
   startKeepAlive();

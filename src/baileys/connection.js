@@ -7,7 +7,7 @@ import { supabase } from '../storage/supabase.js';
 import { useSupabaseAuthState } from '../storage/authState.js';
 import { emitNewMessage, emitSessionStatus } from '../api/websocket.js';
 import { setCurrentVersion, startVersionChecker } from '../versionChecker.js';
-import { handleMessage } from './messageHandler.js';
+import { handleMessage, registerSessionPhone, loadPhoneRegistry } from './messageHandler.js';
 
 const DEFAULT_STATE = {
   qr: null,
@@ -165,6 +165,22 @@ export async function startConnection({ sessionId, onSocket }) {
           sock.end(undefined);
         }
       });
+
+      // Register phone number for cross-session mirroring
+      const userJid = sock.user?.id || '';
+      const userPhone = userJid.split(':')[0].replace('@s.whatsapp.net', '');
+      if (userPhone) {
+        registerSessionPhone(sessionId, userPhone);
+
+        // Save phone to session_config for persistence
+        supabase
+          .from('session_config')
+          .update({ phone_number: userPhone })
+          .eq('session_id', sessionId)
+          .then(({ error }) => {
+            if (error) logger.error({ err: error, sessionId }, 'Failed to save phone to session_config');
+          });
+      }
 
       console.log(`[${sessionId}] Connected to WhatsApp as ${sock.user?.name || sock.user?.id || 'unknown user'}`);
     }
