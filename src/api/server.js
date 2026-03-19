@@ -8,11 +8,19 @@ export function startServer() {
     const app = express();
     const httpServer = createServer(app);
 
-    app.use(express.json());
-    
+    app.use(express.json({ limit: '1mb' }));
+
+    const ALLOWED_ORIGINS = [
+        'https://wa-dashboard-blond.vercel.app',
+        'http://localhost:5173',
+        'http://localhost:3000',
+    ];
+
     app.use((req, res, next) => {
         const origin = req.headers.origin;
-        res.header('Access-Control-Allow-Origin', origin || '*');
+        if (origin && ALLOWED_ORIGINS.includes(origin)) {
+            res.header('Access-Control-Allow-Origin', origin);
+        }
         res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
         res.header('Access-Control-Allow-Credentials', 'true');

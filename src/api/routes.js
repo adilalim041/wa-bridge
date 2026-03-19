@@ -894,6 +894,10 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone and message are required' });
     }
 
+    if (message.length > 4096) {
+      return res.status(400).json({ error: 'Message too long (max 4096 chars)' });
+    }
+
     const session = sessionManager.getSession(sessionId);
     const sock = session?.sock;
     if (!sock?.user) {
