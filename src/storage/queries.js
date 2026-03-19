@@ -2,35 +2,55 @@ import { logger } from '../config.js';
 import { supabase } from './supabase.js';
 
 export async function saveMessage(data) {
-  try {
-    const { error } = await supabase.from('messages').upsert(
-      {
-        message_id: data.messageId,
-        session_id: data.sessionId,
-        remote_jid: data.remoteJid,
-        from_me: data.fromMe,
-        body: data.body,
-        message_type: data.messageType,
-        push_name: data.pushName ?? null,
-        sender: data.sender ?? null,
-        chat_type: data.chatType ?? 'personal',
-        media_url: data.mediaUrl ?? null,
-        media_type: data.mediaType ?? null,
-        file_name: data.fileName ?? null,
-        timestamp: data.timestamp,
-      },
-      {
+  const MAX_RETRIES = 3;
+  const row = {
+    message_id: data.messageId,
+    session_id: data.sessionId,
+    remote_jid: data.remoteJid,
+    from_me: data.fromMe,
+    body: data.body,
+    message_type: data.messageType,
+    push_name: data.pushName ?? null,
+    sender: data.sender ?? null,
+    chat_type: data.chatType ?? 'personal',
+    media_url: data.mediaUrl ?? null,
+    media_type: data.mediaType ?? null,
+    file_name: data.fileName ?? null,
+    timestamp: data.timestamp,
+  };
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const { error } = await supabase.from('messages').upsert(row, {
         onConflict: 'message_id',
         ignoreDuplicates: true,
-      }
-    );
+      });
 
-    if (error) {
-      logger.error({ err: error, messageId: data.messageId }, 'Failed to save message');
+      if (!error) {
+        return;
+      }
+
+      logger.error(
+        { err: error, messageId: data.messageId, attempt },
+        `Failed to save message (attempt ${attempt}/${MAX_RETRIES})`
+      );
+
+      if (attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    } catch (error) {
+      logger.error(
+        { err: error, messageId: data.messageId, attempt },
+        `Unexpected error saving message (attempt ${attempt}/${MAX_RETRIES})`
+      );
+
+      if (attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
     }
-  } catch (error) {
-    logger.error({ err: error, messageId: data.messageId }, 'Unexpected error while saving message');
   }
+
+  logger.error({ messageId: data.messageId }, 'CRITICAL: Message lost after all retry attempts');
 }
 
 export async function upsertChat({

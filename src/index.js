@@ -7,17 +7,38 @@ import { stopVersionChecker } from './versionChecker.js';
 import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
 
 let server;
+let keepAliveTimer;
+
+function startKeepAlive() {
+  const INTERVAL = 4 * 60 * 1000; // every 4 minutes
+  const selfUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
+    : `http://localhost:${process.env.PORT || 3000}/health`;
+
+  keepAliveTimer = setInterval(async () => {
+    try {
+      const res = await fetch(selfUrl);
+      logger.debug(`Keep-alive ping: ${res.status}`);
+    } catch (err) {
+      logger.debug({ err: err.message }, 'Keep-alive ping failed (non-critical)');
+    }
+  }, INTERVAL);
+
+  logger.info(`Keep-alive started: pinging ${selfUrl} every 4 min`);
+}
 
 async function bootstrap() {
   const serverState = startServer();
   server = serverState.server;
   await sessionManager.startAll();
   startAIWorker();
+  startKeepAlive();
   logger.info('WA Bridge multi-session started');
 }
 
 async function shutdown(signal) {
   logger.info(`Received ${signal}. Shutting down...`);
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
   stopAIWorker();
   await sessionManager.stopAll();
   stopHealthMonitor();

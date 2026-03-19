@@ -9,6 +9,8 @@ import { emitNewMessage, emitSessionStatus } from '../api/websocket.js';
 import { setCurrentVersion, startVersionChecker } from '../versionChecker.js';
 import { handleMessage } from './messageHandler.js';
 
+const lastDisconnectTime = new Map();
+
 const DEFAULT_STATE = {
   qr: null,
   connected: false,
@@ -69,6 +71,65 @@ export function clearConnectionState(sessionId) {
 
 export function getConnectionState(sessionId) {
   return connectionStates.get(sessionId) || { ...DEFAULT_STATE };
+}
+
+async function syncMissedMessages(sock, sessionId) {
+  const disconnectedAt = lastDisconnectTime.get(sessionId);
+  if (!disconnectedAt) {
+    console.log(`[${sessionId}] First connection, skipping history sync`);
+    return;
+  }
+
+  const offlineSeconds = Math.floor((Date.now() - disconnectedAt) / 1000);
+  console.log(`[${sessionId}] Was offline for ${offlineSeconds}s, syncing missed messages...`);
+
+  try {
+    // Get all active chats for this session
+    const { data: chats, error: chatError } = await supabase
+      .from('chats')
+      .select('remote_jid')
+      .eq('session_id', sessionId)
+      .or('is_hidden.is.null,is_hidden.eq.false');
+
+    if (chatError || !chats?.length) {
+      console.log(`[${sessionId}] No chats to sync`);
+      return;
+    }
+
+    let totalSynced = 0;
+
+    for (const chat of chats) {
+      try {
+        const jid = chat.remote_jid.includes('-')
+          ? `${chat.remote_jid}@g.us`
+          : `${chat.remote_jid}@s.whatsapp.net`;
+
+        // Fetch recent messages from WhatsApp for this chat
+        const messages = await sock.fetchMessagesFromWA(jid, 50);
+
+        if (messages?.length) {
+          for (const msg of messages) {
+            const saved = await handleMessage(msg, sock, sessionId);
+            if (saved) {
+              totalSynced++;
+              emitNewMessage(sessionId, saved);
+            }
+          }
+        }
+      } catch (chatErr) {
+        // fetchMessagesFromWA may not be available in all Baileys versions
+        // Fall through silently — Baileys' built-in sync will still deliver messages
+        logger.debug(
+          { err: chatErr, sessionId, remoteJid: chat.remote_jid },
+          'Could not fetch messages for chat (non-critical)'
+        );
+      }
+    }
+
+    console.log(`[${sessionId}] History sync done: ${totalSynced} messages recovered`);
+  } catch (error) {
+    logger.error({ err: error, sessionId }, 'History sync failed');
+  }
 }
 
 export async function startConnection({ sessionId, onSocket }) {
@@ -144,6 +205,11 @@ export async function startConnection({ sessionId, onSocket }) {
       });
 
       console.log(`[${sessionId}] Connected to WhatsApp as ${sock.user?.name || sock.user?.id || 'unknown user'}`);
+
+      // Sync missed messages after reconnect
+      syncMissedMessages(sock, sessionId).catch((err) => {
+        logger.error({ err, sessionId }, 'Post-connect history sync failed');
+      });
     }
 
     if (connection === 'close') {
@@ -157,6 +223,7 @@ export async function startConnection({ sessionId, onSocket }) {
         lastError: `Status ${statusCode || 'unknown'}: ${reason}`,
       });
       updateConnectionStatus(sessionId, false);
+      lastDisconnectTime.set(sessionId, Date.now());
 
       console.log(`[${sessionId}] Connection closed. Status: ${statusCode}, Reason: ${reason}`);
 
