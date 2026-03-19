@@ -97,6 +97,29 @@ export async function startConnection({ sessionId, onSocket }) {
     logger: pino({ level: 'silent' }),
     browser: ['Omoikiri CRM', 'Desktop', '1.0'],
     version: waVersion,
+    syncFullHistory: true,
+    fireInitQueries: true,
+    markOnlineOnConnect: true,
+    shouldSyncHistoryMessage: () => true,
+    getMessage: async (key) => {
+      // Baileys calls this for message retries — fetch from Supabase
+      try {
+        const { data } = await supabase
+          .from('messages')
+          .select('body, message_type')
+          .eq('message_id', key.id)
+          .eq('session_id', sessionId)
+          .maybeSingle();
+
+        if (data?.body) {
+          return { conversation: data.body };
+        }
+      } catch (err) {
+        logger.debug({ err, sessionId, messageId: key.id }, 'getMessage lookup failed');
+      }
+
+      return undefined;
+    },
   });
 
   if (typeof onSocket === 'function') {
