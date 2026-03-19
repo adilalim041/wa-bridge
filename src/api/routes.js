@@ -232,7 +232,7 @@ export function setupRoutes(app) {
       const { data: aiData } = await sessionFilter(
         supabase
           .from('chat_ai')
-          .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required')
+          .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion')
           .gte('analyzed_at', since)
       );
 
@@ -256,17 +256,37 @@ export function setupRoutes(app) {
         if (sentiment[row.sentiment] !== undefined) sentiment[row.sentiment]++;
       }
 
-      // Risk flags
-      const riskCounts = {};
+      // Risk flags with example chats
+      const riskMap = {};
       for (const row of ai) {
         for (const flag of row.risk_flags ?? []) {
-          riskCounts[flag] = (riskCounts[flag] || 0) + 1;
+          if (!riskMap[flag]) riskMap[flag] = { count: 0, chats: [] };
+          riskMap[flag].count++;
+          if (riskMap[flag].chats.length < 3) {
+            riskMap[flag].chats.push({
+              sessionId: row.session_id,
+              remoteJid: row.remote_jid,
+              summary: row.summary_ru,
+              action: row.action_suggestion,
+            });
+          }
         }
       }
-      const topRisks = Object.entries(riskCounts)
-        .sort((a, b) => b[1] - a[1])
+      const topRisks = Object.entries(riskMap)
+        .sort((a, b) => b[1].count - a[1].count)
         .slice(0, 5)
-        .map(([flag, count]) => ({ flag, count }));
+        .map(([flag, data]) => ({ flag, count: data.count, chats: data.chats }));
+
+      // Action required chats
+      const actionChats = ai
+        .filter((r) => r.action_required)
+        .slice(0, 5)
+        .map((r) => ({
+          sessionId: r.session_id,
+          remoteJid: r.remote_jid,
+          summary: r.summary_ru,
+          action: r.action_suggestion,
+        }));
 
       // Action required count
       const actionRequired = ai.filter((r) => r.action_required).length;
@@ -309,6 +329,7 @@ export function setupRoutes(app) {
         stages,
         sentiment,
         topRisks,
+        actionChats,
         dailyStats,
       });
     } catch (error) {
