@@ -9,8 +9,6 @@ import { emitNewMessage, emitSessionStatus } from '../api/websocket.js';
 import { setCurrentVersion, startVersionChecker } from '../versionChecker.js';
 import { handleMessage } from './messageHandler.js';
 
-const lastDisconnectTime = new Map();
-
 const DEFAULT_STATE = {
   qr: null,
   connected: false,
@@ -71,65 +69,6 @@ export function clearConnectionState(sessionId) {
 
 export function getConnectionState(sessionId) {
   return connectionStates.get(sessionId) || { ...DEFAULT_STATE };
-}
-
-async function syncMissedMessages(sock, sessionId) {
-  const disconnectedAt = lastDisconnectTime.get(sessionId);
-  if (!disconnectedAt) {
-    console.log(`[${sessionId}] First connection, skipping history sync`);
-    return;
-  }
-
-  const offlineSeconds = Math.floor((Date.now() - disconnectedAt) / 1000);
-  console.log(`[${sessionId}] Was offline for ${offlineSeconds}s, syncing missed messages...`);
-
-  try {
-    // Get all active chats for this session
-    const { data: chats, error: chatError } = await supabase
-      .from('chats')
-      .select('remote_jid')
-      .eq('session_id', sessionId)
-      .or('is_hidden.is.null,is_hidden.eq.false');
-
-    if (chatError || !chats?.length) {
-      console.log(`[${sessionId}] No chats to sync`);
-      return;
-    }
-
-    let totalSynced = 0;
-
-    for (const chat of chats) {
-      try {
-        const jid = chat.remote_jid.includes('-')
-          ? `${chat.remote_jid}@g.us`
-          : `${chat.remote_jid}@s.whatsapp.net`;
-
-        // Fetch recent messages from WhatsApp for this chat
-        const messages = await sock.fetchMessagesFromWA(jid, 50);
-
-        if (messages?.length) {
-          for (const msg of messages) {
-            const saved = await handleMessage(msg, sock, sessionId);
-            if (saved) {
-              totalSynced++;
-              emitNewMessage(sessionId, saved);
-            }
-          }
-        }
-      } catch (chatErr) {
-        // fetchMessagesFromWA may not be available in all Baileys versions
-        // Fall through silently — Baileys' built-in sync will still deliver messages
-        logger.debug(
-          { err: chatErr, sessionId, remoteJid: chat.remote_jid },
-          'Could not fetch messages for chat (non-critical)'
-        );
-      }
-    }
-
-    console.log(`[${sessionId}] History sync done: ${totalSynced} messages recovered`);
-  } catch (error) {
-    logger.error({ err: error, sessionId }, 'History sync failed');
-  }
 }
 
 export async function startConnection({ sessionId, onSocket }) {
@@ -205,11 +144,6 @@ export async function startConnection({ sessionId, onSocket }) {
       });
 
       console.log(`[${sessionId}] Connected to WhatsApp as ${sock.user?.name || sock.user?.id || 'unknown user'}`);
-
-      // Sync missed messages after reconnect
-      syncMissedMessages(sock, sessionId).catch((err) => {
-        logger.error({ err, sessionId }, 'Post-connect history sync failed');
-      });
     }
 
     if (connection === 'close') {
@@ -223,7 +157,6 @@ export async function startConnection({ sessionId, onSocket }) {
         lastError: `Status ${statusCode || 'unknown'}: ${reason}`,
       });
       updateConnectionStatus(sessionId, false);
-      lastDisconnectTime.set(sessionId, Date.now());
 
       console.log(`[${sessionId}] Connection closed. Status: ${statusCode}, Reason: ${reason}`);
 
@@ -290,11 +223,79 @@ export async function startConnection({ sessionId, onSocket }) {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log(`[${sessionId}] messages.upsert: ${messages?.length ?? 0} messages (type: ${type})`);
     for (const message of messages ?? []) {
       const savedMessage = await handleMessage(message, sock, sessionId);
       if (savedMessage) {
         emitNewMessage(sessionId, savedMessage);
+      }
+    }
+  });
+
+  // History sync — delivers offline/missed messages on reconnect
+  sock.ev.on('messaging-history.set', async ({ messages, chats, isLatest, progress, syncType }) => {
+    const msgCount = messages?.length ?? 0;
+    const chatCount = chats?.length ?? 0;
+    console.log(
+      `[${sessionId}] messaging-history.set: ${msgCount} messages, ${chatCount} chats ` +
+      `(syncType: ${syncType}, progress: ${progress ?? '?'}%, isLatest: ${isLatest})`
+    );
+
+    if (!messages?.length) {
+      return;
+    }
+
+    let saved = 0;
+    for (const message of messages) {
+      try {
+        const result = await handleMessage(message, sock, sessionId);
+        if (result) {
+          saved++;
+          emitNewMessage(sessionId, result);
+        }
+      } catch (err) {
+        logger.error({ err, sessionId, messageId: message?.key?.id }, 'Failed to process history sync message');
+      }
+    }
+
+    console.log(`[${sessionId}] History sync: saved ${saved}/${msgCount} messages`);
+  });
+
+  // Edited messages — update body in Supabase
+  sock.ev.on('messages.update', async (updates) => {
+    for (const { key, update } of updates ?? []) {
+      try {
+        if (!key?.id || !key?.remoteJid) {
+          continue;
+        }
+
+        // Handle edited messages
+        const editedMsg = update?.message?.editedMessage?.message;
+        if (editedMsg) {
+          const newBody =
+            editedMsg.conversation ||
+            editedMsg.extendedTextMessage?.text ||
+            editedMsg.imageMessage?.caption ||
+            editedMsg.videoMessage?.caption ||
+            null;
+
+          if (newBody) {
+            const { error } = await supabase
+              .from('messages')
+              .update({ body: newBody })
+              .eq('message_id', key.id)
+              .eq('session_id', sessionId);
+
+            if (error) {
+              logger.error({ err: error, sessionId, messageId: key.id }, 'Failed to update edited message');
+            } else {
+              console.log(`[${sessionId}] Message edited: ${key.id} → "${newBody.substring(0, 50)}"`);
+            }
+          }
+        }
+      } catch (err) {
+        logger.error({ err, sessionId, messageId: key?.id }, 'Failed to process message update');
       }
     }
   });
