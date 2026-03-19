@@ -22,7 +22,7 @@ export async function saveMessage(data) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const { error } = await supabase.from('messages').upsert(row, {
-        onConflict: 'message_id',
+        onConflict: 'message_id,session_id',
         ignoreDuplicates: true,
       });
 

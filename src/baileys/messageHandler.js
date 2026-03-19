@@ -438,7 +438,7 @@ export async function handleMessage(message, sock, sessionId) {
       if (mirrorSessionId && mirrorSessionId !== sessionId && myPhone) {
         try {
           const mirrorPayload = {
-            messageId: `${messageId}_mirror`,
+            messageId,
             sessionId: mirrorSessionId,
             remoteJid: myPhone,
             fromMe: !fromMe,

@@ -3,6 +3,9 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
+import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
+import { enqueueForAI } from '../ai/queueManager.js';
+import { trackResponseTime } from '../ai/responseTracker.js';
 import { getRateLimiter, sendWithDelay } from '../antiban/rateLimiter.js';
 import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
@@ -941,6 +944,23 @@ export function setupRoutes(app) {
           phoneNumber: phone.includes('-') ? null : phone,
         });
 
+        // Link to dialog session + AI pipeline
+        try {
+          const dialogSessionId = await getOrCreateDialogSession(sessionId, phone, now);
+          if (dialogSessionId) {
+            await supabase
+              .from('messages')
+              .update({ dialog_session_id: dialogSessionId })
+              .eq('message_id', messageId)
+              .eq('session_id', sessionId);
+
+            await trackResponseTime(sessionId, phone, dialogSessionId, true, now);
+            await enqueueForAI(sessionId, phone, messageId, dialogSessionId);
+          }
+        } catch (aiErr) {
+          logger.error({ err: aiErr, sessionId, messageId }, 'AI pipeline failed for /send');
+        }
+
         // Cross-session mirror: save as incoming for the other session
         const phoneMap = getPhoneToSession();
         const mirrorSessionId = phoneMap.get(phone);
@@ -948,7 +968,7 @@ export function setupRoutes(app) {
 
         if (mirrorSessionId && mirrorSessionId !== sessionId && myPhone) {
           await saveMessage({
-            messageId: `${messageId}_mirror`,
+            messageId,
             sessionId: mirrorSessionId,
             remoteJid: myPhone,
             fromMe: false,

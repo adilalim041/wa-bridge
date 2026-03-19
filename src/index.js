@@ -9,6 +9,7 @@ import { loadPhoneRegistry } from './baileys/messageHandler.js';
 
 let server;
 let keepAliveTimer;
+let phoneRefreshTimer;
 
 function startKeepAlive() {
   const INTERVAL = 4 * 60 * 1000; // every 4 minutes
@@ -35,12 +36,23 @@ async function bootstrap() {
   await sessionManager.startAll();
   startAIWorker();
   startKeepAlive();
+
+  // Refresh phone registry every 60s to pick up new sessions
+  phoneRefreshTimer = setInterval(async () => {
+    try {
+      await loadPhoneRegistry();
+    } catch (err) {
+      logger.debug({ err: err.message }, 'Phone registry refresh failed');
+    }
+  }, 60_000);
+
   logger.info('WA Bridge multi-session started');
 }
 
 async function shutdown(signal) {
   logger.info(`Received ${signal}. Shutting down...`);
   if (keepAliveTimer) clearInterval(keepAliveTimer);
+  if (phoneRefreshTimer) clearInterval(phoneRefreshTimer);
   stopAIWorker();
   await sessionManager.stopAll();
   stopHealthMonitor();
