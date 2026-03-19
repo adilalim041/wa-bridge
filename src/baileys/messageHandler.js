@@ -16,6 +16,7 @@ const SKIP_TYPES = [
 const hiddenChatsCache = new Map();
 const hiddenCacheTimestamps = new Map();
 const HIDDEN_CACHE_TTL = 5 * 60 * 1000;
+const HIDDEN_CACHE_MAX_SIZE = 500;
 
 // Cross-session mirroring: maps phone numbers to session IDs
 // e.g. { "77014135151": "omoikiri-main", "77786137600": "almaty-alim" }
@@ -23,23 +24,52 @@ const phoneToSession = new Map();
 let phoneRegistryLoaded = false;
 
 export async function loadPhoneRegistry() {
-  try {
-    const { data } = await supabase
-      .from('session_config')
-      .select('session_id, phone_number')
-      .not('phone_number', 'is', null);
+  const MAX_RETRIES = 3;
 
-    phoneToSession.clear();
-    for (const row of data ?? []) {
-      if (row.phone_number) {
-        phoneToSession.set(row.phone_number, row.session_id);
-        console.log(`[mirror] Registered: ${row.phone_number} → ${row.session_id}`);
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const { data, error } = await supabase
+        .from('session_config')
+        .select('session_id, phone_number')
+        .not('phone_number', 'is', null);
+
+      if (error) {
+        throw error;
+      }
+
+      const newMap = new Map();
+      for (const row of data ?? []) {
+        if (row.phone_number) {
+          newMap.set(row.phone_number, row.session_id);
+        }
+      }
+
+      // Only clear+replace if we got data (don't wipe registry on empty response)
+      if (newMap.size > 0 || !phoneRegistryLoaded) {
+        phoneToSession.clear();
+        for (const [phone, sid] of newMap) {
+          phoneToSession.set(phone, sid);
+        }
+      }
+
+      phoneRegistryLoaded = true;
+      if (newMap.size > 0) {
+        console.log(`[mirror] Phone registry loaded: ${newMap.size} sessions`);
+      }
+      return;
+    } catch (err) {
+      logger.error(
+        { err, attempt },
+        `Phone registry load failed (attempt ${attempt}/${MAX_RETRIES})`
+      );
+
+      if (attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
       }
     }
-    phoneRegistryLoaded = true;
-  } catch (err) {
-    logger.error({ err }, 'Failed to load phone registry for cross-session mirroring');
   }
+
+  logger.error('CRITICAL: Phone registry failed after all retries — mirroring disabled');
 }
 
 export function registerSessionPhone(sessionId, phoneNumber) {
@@ -70,6 +100,23 @@ async function isChatHidden(sessionId, remoteJid) {
       .maybeSingle();
 
     const isHidden = data?.is_hidden || false;
+
+    // Evict oldest entries if cache exceeds max size
+    if (hiddenChatsCache.size >= HIDDEN_CACHE_MAX_SIZE) {
+      let oldestKey = null;
+      let oldestTime = Infinity;
+      for (const [k, t] of hiddenCacheTimestamps) {
+        if (t < oldestTime) {
+          oldestTime = t;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey) {
+        hiddenChatsCache.delete(oldestKey);
+        hiddenCacheTimestamps.delete(oldestKey);
+      }
+    }
+
     hiddenChatsCache.set(cacheKey, isHidden);
     hiddenCacheTimestamps.set(cacheKey, Date.now());
     return isHidden;
@@ -436,38 +483,49 @@ export async function handleMessage(message, sock, sessionId) {
       const myPhone = [...phoneToSession.entries()].find(([, sid]) => sid === sessionId)?.[0];
 
       if (mirrorSessionId && mirrorSessionId !== sessionId && myPhone) {
-        try {
-          const mirrorPayload = {
-            messageId,
-            sessionId: mirrorSessionId,
-            remoteJid: myPhone,
-            fromMe: !fromMe,
-            body,
-            messageType,
-            pushName: fromMe ? (pushName || null) : pushName,
-            sender: null,
-            chatType: 'personal',
-            mediaUrl: mediaUrl,
-            mediaType: mediaFileType || messageType,
-            fileName: mediaFileName,
-            timestamp,
-          };
+        const mirrorPayload = {
+          messageId,
+          sessionId: mirrorSessionId,
+          remoteJid: myPhone,
+          fromMe: !fromMe,
+          body,
+          messageType,
+          pushName: fromMe ? (pushName || null) : pushName,
+          sender: null,
+          chatType: 'personal',
+          mediaUrl: mediaUrl,
+          mediaType: mediaFileType || messageType,
+          fileName: mediaFileName,
+          timestamp,
+        };
 
-          await saveMessage(mirrorPayload);
-          await upsertChat({
-            remoteJid: myPhone,
-            sessionId: mirrorSessionId,
-            chatType: 'personal',
-            displayName: chatDisplayName || pushName,
-            participantCount: null,
-            phoneNumber: myPhone,
-          });
+        // Retry mirror up to 2 times
+        for (let mirrorAttempt = 1; mirrorAttempt <= 2; mirrorAttempt++) {
+          try {
+            await saveMessage(mirrorPayload);
+            await upsertChat({
+              remoteJid: myPhone,
+              sessionId: mirrorSessionId,
+              chatType: 'personal',
+              displayName: chatDisplayName || pushName,
+              participantCount: null,
+              phoneNumber: myPhone,
+            });
 
-          logger.info(
-            `[${sessionId}] [MIRROR → ${mirrorSessionId}] ${myPhone}: ${preview}`
-          );
-        } catch (mirrorErr) {
-          logger.error({ err: mirrorErr, sessionId, mirrorSessionId }, 'Cross-session mirror failed');
+            logger.info(
+              `[${sessionId}] [MIRROR → ${mirrorSessionId}] ${myPhone}: ${preview}`
+            );
+            break;
+          } catch (mirrorErr) {
+            if (mirrorAttempt === 2) {
+              logger.error(
+                { err: mirrorErr, sessionId, mirrorSessionId, messageId },
+                'CRITICAL: Mirror failed after 2 attempts — message not mirrored'
+              );
+            } else {
+              await new Promise((r) => setTimeout(r, 1000));
+            }
+          }
         }
       }
     }

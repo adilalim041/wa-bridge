@@ -184,6 +184,19 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
 
 async function processQueue() {
   try {
+    // Unstick items stuck in 'processing' for more than 5 minutes
+    const stuckCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data: stuckItems } = await supabase
+      .from('ai_queue')
+      .update({ status: 'pending' })
+      .eq('status', 'processing')
+      .lt('created_at', stuckCutoff)
+      .select('dialog_session_id');
+
+    if (stuckItems?.length) {
+      logger.warn({ count: stuckItems.length }, 'Unstuck AI queue items back to pending');
+    }
+
     const { data: pending, error } = await supabase
       .from('ai_queue')
       .select('id, dialog_session_id, session_id, remote_jid, created_at')

@@ -65,6 +65,23 @@ export async function getOrCreateDialogSession(sessionId, remoteJid, messageTime
       .single();
 
     if (createError) {
+      // Race condition: another thread created a session between our check and insert
+      // Re-query to find the one that was just created
+      const { data: raceSession } = await supabase
+        .from('dialog_sessions')
+        .select('id')
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid)
+        .eq('status', 'open')
+        .order('last_message_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (raceSession?.id) {
+        logger.info({ sessionId, remoteJid, id: raceSession.id }, 'Used existing dialog session after race');
+        return raceSession.id;
+      }
+
       logger.error({ err: createError, sessionId, remoteJid }, 'Failed to create dialog session');
       return null;
     }
