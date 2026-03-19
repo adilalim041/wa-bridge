@@ -27,7 +27,21 @@ export function startServer() {
         if (req.method === 'OPTIONS') return res.sendStatus(204);
         next();
     });
-    
+
+    // API key auth — skip for health & public endpoints
+    const API_KEY = process.env.API_KEY || null;
+    if (API_KEY) {
+        app.use((req, res, next) => {
+            if (req.path === '/health' || req.path === '/ws') return next();
+            const key = req.headers['x-api-key'] || req.query.apiKey;
+            if (key !== API_KEY) {
+                return res.status(401).json({ error: 'Invalid or missing API key' });
+            }
+            next();
+        });
+        logger.info('API key authentication enabled');
+    }
+
     setupRoutes(app);
     setupWebSocket(httpServer);
 

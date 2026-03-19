@@ -73,6 +73,15 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error({ err: reason, promise }, 'Unhandled promise rejection — NOT crashing');
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error({ err: error }, 'Uncaught exception — shutting down');
+  process.exit(1);
+});
+
 process.on('SIGINT', () => {
   shutdown('SIGINT').catch((error) => {
     logger.error({ err: error }, 'Shutdown failed');
