@@ -360,6 +360,7 @@ export function setupRoutes(app) {
       connected: state.connected,
       user: state.user,
       hasQR: Boolean(state.qr),
+      qr: state.qr || null,
       lastError: state.lastError,
       uptime: process.uptime(),
     });
