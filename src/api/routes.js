@@ -908,9 +908,42 @@ export function setupRoutes(app) {
       const result = await sendWithDelay(sock, jid, { text: message });
       limiter.recordSend(jid);
 
+      const messageId = result?.key?.id ?? `sent-${Date.now()}`;
+
+      // Save sent message directly to Supabase — don't rely on messages.upsert event
+      try {
+        const { saveMessage, upsertChat } = await import('../storage/queries.js');
+        await saveMessage({
+          messageId,
+          sessionId,
+          remoteJid: phone,
+          fromMe: true,
+          body: message,
+          messageType: 'text',
+          pushName: sock.user?.name || null,
+          sender: null,
+          chatType: phone.includes('-') ? 'group' : 'personal',
+          mediaUrl: null,
+          mediaType: null,
+          fileName: null,
+          timestamp: new Date().toISOString(),
+        });
+
+        await upsertChat({
+          remoteJid: phone,
+          sessionId,
+          chatType: phone.includes('-') ? 'group' : 'personal',
+          displayName: null,
+          participantCount: null,
+          phoneNumber: phone.includes('-') ? null : phone,
+        });
+      } catch (saveErr) {
+        logger.error({ err: saveErr, sessionId, messageId }, 'Failed to save sent message to DB');
+      }
+
       return res.json({
         success: true,
-        messageId: result?.key?.id ?? null,
+        messageId,
       });
     } catch (error) {
       logger.error({ err: error, sessionId, jid }, 'Failed to send WhatsApp message');
