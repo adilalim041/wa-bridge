@@ -134,9 +134,25 @@ export function invalidateHiddenCache(sessionId, remoteJid) {
 
 async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
   if (remoteJid.endsWith('@lid')) {
+    // Tier 1: Use Baileys' built-in LIDMappingStore (in-memory cache + DB)
+    if (sock?.signalRepository?.lidMapping) {
+      try {
+        const pnJid = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
+        if (pnJid) {
+          // pnJid format: "77014135151:0@s.whatsapp.net" → extract phone
+          const phone = pnJid.split(':')[0].split('@')[0];
+          if (phone && phone.length >= 7) {
+            return phone;
+          }
+        }
+      } catch (e) {
+        logger.warn({ err: e, remoteJid, sessionId }, 'LID resolution via Baileys failed');
+      }
+    }
+
+    // Tier 2: Direct Supabase auth_state lookup (fallback)
     const lid = remoteJid.replace('@lid', '');
     try {
-      const { supabase } = await import('../storage/supabase.js');
       const key = `${sessionId}:lid-mapping:${lid}_reverse`;
       const { data } = await supabase
         .from('auth_state')
@@ -144,10 +160,16 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
         .eq('key', key)
         .single();
       if (data?.value) {
-        return JSON.parse(data.value);
+        const phone = JSON.parse(data.value);
+        if (phone && String(phone).length >= 7) {
+          return phone;
+        }
       }
     } catch (e) {}
-    return lid;
+
+    // Tier 3: Unresolvable LID — return null to signal skip
+    logger.debug({ remoteJid, sessionId }, 'Unresolvable LID — skipping message');
+    return null;
   }
   return remoteJid
     .replace('@s.whatsapp.net', '')
@@ -341,6 +363,10 @@ export async function handleMessage(message, sock, sessionId) {
 
     const rawRemoteJid = message.key.remoteJid;
     const remoteJid = await normalizeRemoteJid(rawRemoteJid, sock, sessionId);
+    if (remoteJid === null) {
+      console.log(`[${sessionId}] SKIP: unresolvable LID ${rawRemoteJid}, key=${message.key?.id}`);
+      return null;
+    }
     const fromMe = Boolean(message.key.fromMe);
     const timestampValue = Number(message.messageTimestamp ?? Math.floor(Date.now() / 1000));
     const timestamp = new Date(timestampValue * 1000).toISOString();

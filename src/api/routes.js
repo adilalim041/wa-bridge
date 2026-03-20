@@ -374,6 +374,77 @@ export function setupRoutes(app) {
     }
   });
 
+  // One-time cleanup of garbage LID entries (short numeric remote_jid values)
+  router.post('/admin/cleanup-lid-garbage', async (req, res) => {
+    try {
+      const { sessionId } = req.query;
+
+      // Find all chats with short numeric remote_jid (LID garbage)
+      let chatQuery = supabase
+        .from('chats')
+        .select('remote_jid, session_id');
+
+      if (sessionId) {
+        chatQuery = chatQuery.eq('session_id', sessionId);
+      }
+
+      const { data: allChats, error: findError } = await chatQuery;
+      if (findError) {
+        return res.status(500).json({ error: findError.message });
+      }
+
+      // Filter to only short numeric strings (LID garbage like "40", "20", "69")
+      const garbageEntries = (allChats || []).filter(c => {
+        const jid = c.remote_jid;
+        return /^\d+$/.test(jid) && jid.length < 7;
+      });
+
+      if (garbageEntries.length === 0) {
+        return res.json({ success: true, message: 'No garbage LID entries found', cleaned: { count: 0 } });
+      }
+
+      let deletedMessages = 0;
+      let deletedChats = 0;
+      let deletedDialogSessions = 0;
+
+      for (const { remote_jid, session_id } of garbageEntries) {
+        const { count: msgCount } = await supabase
+          .from('messages')
+          .delete({ count: 'exact' })
+          .eq('remote_jid', remote_jid)
+          .eq('session_id', session_id);
+        deletedMessages += msgCount || 0;
+
+        const { count: dsCount } = await supabase
+          .from('dialog_sessions')
+          .delete({ count: 'exact' })
+          .eq('remote_jid', remote_jid)
+          .eq('session_id', session_id);
+        deletedDialogSessions += dsCount || 0;
+
+        const { count: chatCount } = await supabase
+          .from('chats')
+          .delete({ count: 'exact' })
+          .eq('remote_jid', remote_jid)
+          .eq('session_id', session_id);
+        deletedChats += chatCount || 0;
+      }
+
+      res.json({
+        success: true,
+        cleaned: {
+          garbageJids: garbageEntries.map(g => g.remote_jid),
+          deletedMessages,
+          deletedChats,
+          deletedDialogSessions,
+        },
+      });
+    } catch (error) {
+      logger.error({ err: error }, 'Cleanup LID garbage failed');
+      res.status(500).json({ error: 'Cleanup failed' });
+    }
+  });
+
   router.get('/health', async (_req, res) => {
     const { data: configs } = await supabase
       .from('session_config')
