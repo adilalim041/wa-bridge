@@ -141,7 +141,7 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
         if (pnJid) {
           // pnJid format: "77014135151:0@s.whatsapp.net" → extract phone
           const phone = pnJid.split(':')[0].split('@')[0];
-          if (phone && phone.length >= 7) {
+          if (phone && phone.length >= 7 && phone.length <= 15) {
             return phone;
           }
         }
@@ -161,7 +161,7 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
         .single();
       if (data?.value) {
         const phone = JSON.parse(data.value);
-        if (phone && String(phone).length >= 7) {
+        if (phone && String(phone).length >= 7 && String(phone).length <= 15) {
           return phone;
         }
       }

@@ -393,10 +393,11 @@ export function setupRoutes(app) {
         return res.status(500).json({ error: findError.message });
       }
 
-      // Filter to only short numeric strings (LID garbage like "40", "20", "69")
+      // Filter garbage: short LIDs (<7 digits) or long LIDs (>13 digits, no real phone is that long)
       const garbageEntries = (allChats || []).filter(c => {
         const jid = c.remote_jid;
-        return /^\d+$/.test(jid) && jid.length < 7;
+        if (!/^\d+$/.test(jid)) return false;
+        return jid.length < 7 || jid.length > 13;
       });
 
       if (garbageEntries.length === 0) {
