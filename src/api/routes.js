@@ -232,7 +232,7 @@ export function setupRoutes(app) {
       const { data: aiData } = await sessionFilter(
         supabase
           .from('chat_ai')
-          .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion')
+          .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues')
           .gte('analyzed_at', since)
       );
 
@@ -291,6 +291,38 @@ export function setupRoutes(app) {
       // Action required count
       const actionRequired = ai.filter((r) => r.action_required).length;
 
+      // Customer types breakdown
+      const customerTypes = {};
+      for (const row of ai) {
+        const ct = row.customer_type || 'unknown';
+        customerTypes[ct] = (customerTypes[ct] || 0) + 1;
+      }
+
+      // Consultation quality avg
+      const cScores = ai.map((r) => r.consultation_score).filter((s) => s != null && s > 0);
+      const avgConsultationScore = cScores.length > 0
+        ? Math.round(cScores.reduce((a, b) => a + b, 0) / cScores.length)
+        : null;
+
+      // Manager issues breakdown
+      const issuesMap = {};
+      for (const row of ai) {
+        for (const issue of row.manager_issues ?? []) {
+          issuesMap[issue] = (issuesMap[issue] || 0) + 1;
+        }
+      }
+      const managerIssues = Object.entries(issuesMap)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([issue, count]) => ({ issue, count }));
+
+      // Followup stats
+      const followupStats = { done: 0, missed: 0, pending: 0, not_needed: 0 };
+      for (const row of ai) {
+        const fs = row.followup_status || 'not_needed';
+        if (followupStats[fs] !== undefined) followupStats[fs]++;
+      }
+
       // 3. Dialog sessions count
       const { count: totalDialogs } = await sessionFilter(
         supabase
@@ -324,6 +356,7 @@ export function setupRoutes(app) {
           hotLeads: leads.hot,
           totalDialogs: totalDialogs || 0,
           actionRequired,
+          avgConsultationScore,
         },
         leads,
         stages,
@@ -331,6 +364,9 @@ export function setupRoutes(app) {
         topRisks,
         actionChats,
         dailyStats,
+        customerTypes,
+        managerIssues,
+        followupStats,
       });
     } catch (error) {
       logger.error({ err: error }, 'Analytics summary failed');

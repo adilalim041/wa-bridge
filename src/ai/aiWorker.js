@@ -20,10 +20,19 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
   "intent": "одно из: price_inquiry, complaint, availability, measurement_request, delivery, consultation, collaboration, small_talk, spam, other",
   "lead_temperature": "одно из: hot, warm, cold, dead",
   "lead_source": "одно из: instagram_ad, google_ad, word_of_mouth, repeat_client, designer_partner, showroom_visit, incoming_call, unknown",
+  "customer_type": "одно из: end_client, designer, partner, contractor, spam, unknown",
   "dialog_topic": "одно из: sink_sale, faucet_sale, complaint, service, consultation, partnership, other",
   "deal_stage": "одно из: first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused",
   "sentiment": "одно из: positive, neutral, negative, aggressive",
   "risk_flags": ["массив из возможных: client_unhappy, manager_rude, slow_response, potential_return, lost_lead"],
+  "consultation_quality": {
+    "score": 0-100,
+    "questions_asked": ["какие ключевые вопросы менеджер задал из чек-листа"],
+    "questions_missed": ["какие обязательные вопросы менеджер НЕ задал"],
+    "upsell_offered": true/false
+  },
+  "followup_status": "одно из: not_needed, done, missed, pending",
+  "manager_issues": ["массив из возможных: slow_first_response, no_followup, poor_consultation, no_photos, no_showroom_invite, no_upsell, rude_tone, formal_tone, no_alternative"],
   "summary_ru": "Краткое резюме на русском, 2-3 предложения максимум",
   "action_required": true/false,
   "action_suggestion": "Что менеджеру стоит сделать дальше (на русском), или null",
@@ -37,8 +46,42 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
 - dead = отказался, не отвечает давно
 - lead_source определяй по контексту первых сообщений (если упоминают Instagram/рекламу/шоурум)
 - risk_flags = пустой массив если всё нормально
-- Используй справочную информацию ниже для точного определения моделей продукции и оценки соответствия стандартам продаж
-- Отвечай ТОЛЬКО JSON, ничего больше
+
+Правила для customer_type:
+- end_client = покупает для себя/своего дома
+- designer = дизайнер интерьера, подбирает для клиента
+- partner = представитель магазина, оптовик, дилер
+- contractor = подрядчик, строитель
+- spam = нерелевантное обращение, бот, реклама
+- unknown = недостаточно данных для определения
+
+Правила для consultation_quality:
+- score 0-100 на основе чек-листа из стандартов продаж
+- Для моек проверь 7 вопросов: размер тумбы, материал столешницы, тип монтажа, кол-во чаш, цвет/материал мойки, нужен ли смеситель, название модели
+- Для смесителей проверь 4 вопроса: совместимость с мойкой, выдвижной излив, цвет/покрытие, бюджет
+- upsell_offered = предложил ли менеджер сопутствующие товары (дозатор, диспоузер, корзина, разделочная доска)
+- Если диалог не про продажу (small_talk, spam) — score = null
+
+Правила для followup_status:
+- done = менеджер сам написал повторно после паузы в диалоге
+- missed = клиент проявил интерес, но менеджер НЕ написал повторно (прошло >24 часов)
+- pending = диалог свежий, follow-up ещё не требуется
+- not_needed = разговор активный, завершён сделкой или отказом
+
+Правила для manager_issues (конкретные ошибки менеджера):
+- slow_first_response = первый ответ менеджера дольше 2 часов
+- no_followup = не написал повторно заинтересованному клиенту
+- poor_consultation = не задал обязательные вопросы из чек-листа
+- no_photos = клиент просил фото/каталог, менеджер не отправил
+- no_showroom_invite = не предложил посетить шоурум
+- no_upsell = не предложил сопутствующие товары
+- rude_tone = грубый или неприветливый тон
+- formal_tone = слишком сухой/формальный ответ без эмпатии
+- no_alternative = сказал "нет в наличии" без предложения альтернативы
+- manager_issues = пустой массив если менеджер работает хорошо
+
+Используй справочную информацию ниже для точного определения моделей продукции и оценки соответствия стандартам продаж.
+Отвечай ТОЛЬКО JSON, ничего больше.
 
 ${KNOWLEDGE_BASE}`;
 
@@ -80,7 +123,31 @@ async function callClaude(messages) {
   }
 }
 
-function formatDialogForAI(messages, contactInfo) {
+async function getResponseTimeContext(sessionId, remoteJid) {
+  try {
+    const { data } = await supabase
+      .from('manager_analytics')
+      .select('response_time_seconds')
+      .eq('session_id', sessionId)
+      .eq('remote_jid', remoteJid)
+      .not('response_time_seconds', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (!data?.length) return '';
+
+    const times = data.map((r) => r.response_time_seconds);
+    const avg = Math.round(times.reduce((a, b) => a + b, 0) / times.length);
+    const max = Math.max(...times);
+
+    const fmt = (s) => (s < 60 ? `${s}с` : s < 3600 ? `${Math.round(s / 60)}м` : `${(s / 3600).toFixed(1)}ч`);
+    return `[Время ответа менеджера: среднее ${fmt(avg)}, самый медленный ${fmt(max)}]\n`;
+  } catch {
+    return '';
+  }
+}
+
+function formatDialogForAI(messages, contactInfo, responseTimeCtx) {
   let context = '';
 
   if (contactInfo) {
@@ -88,8 +155,11 @@ function formatDialogForAI(messages, contactInfo) {
     if (contactInfo.role) context += `, роль: ${contactInfo.role}`;
     if (contactInfo.company) context += `, компания: ${contactInfo.company}`;
     if (contactInfo.city) context += `, город: ${contactInfo.city}`;
-    context += ']\n\n';
+    context += ']\n';
   }
+
+  if (responseTimeCtx) context += responseTimeCtx;
+  context += '\n';
 
   for (const msg of messages) {
     const time = new Date(msg.timestamp).toLocaleString('ru-RU', {
@@ -131,36 +201,59 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
       .eq('remote_jid', remoteJid)
       .maybeSingle();
 
-    const dialogText = formatDialogForAI(messages, contact);
+    const responseTimeCtx = await getResponseTimeContext(sessionId, remoteJid);
+    const dialogText = formatDialogForAI(messages, contact, responseTimeCtx);
     const analysis = await callClaude(dialogText);
 
     if (!analysis) {
       return false;
     }
 
-    const { error: saveError } = await supabase
+    const cq = analysis.consultation_quality || {};
+    const baseRow = {
+      dialog_session_id: dialogSessionId,
+      session_id: sessionId,
+      remote_jid: remoteJid,
+      intent: analysis.intent || 'other',
+      lead_temperature: analysis.lead_temperature || 'cold',
+      lead_source: analysis.lead_source || 'unknown',
+      dialog_topic: analysis.dialog_topic || 'other',
+      deal_stage: analysis.deal_stage || 'first_contact',
+      sentiment: analysis.sentiment || 'neutral',
+      risk_flags: Array.isArray(analysis.risk_flags) ? analysis.risk_flags : [],
+      summary_ru: analysis.summary_ru || null,
+      action_required: Boolean(analysis.action_required),
+      action_suggestion: analysis.action_suggestion || null,
+      confidence: Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : 0,
+      analyzed_at: new Date().toISOString(),
+      message_count_analyzed: messages.length,
+      // New fields (require migration)
+      customer_type: analysis.customer_type || 'unknown',
+      consultation_score: Number.isFinite(Number(cq.score)) ? Number(cq.score) : null,
+      consultation_details: {
+        questions_asked: Array.isArray(cq.questions_asked) ? cq.questions_asked : [],
+        questions_missed: Array.isArray(cq.questions_missed) ? cq.questions_missed : [],
+        upsell_offered: Boolean(cq.upsell_offered),
+      },
+      followup_status: analysis.followup_status || 'not_needed',
+      manager_issues: Array.isArray(analysis.manager_issues) ? analysis.manager_issues : [],
+    };
+
+    let { error: saveError } = await supabase
       .from('chat_ai')
-      .upsert(
-        {
-          dialog_session_id: dialogSessionId,
-          session_id: sessionId,
-          remote_jid: remoteJid,
-          intent: analysis.intent || 'other',
-          lead_temperature: analysis.lead_temperature || 'cold',
-          lead_source: analysis.lead_source || 'unknown',
-          dialog_topic: analysis.dialog_topic || 'other',
-          deal_stage: analysis.deal_stage || 'first_contact',
-          sentiment: analysis.sentiment || 'neutral',
-          risk_flags: Array.isArray(analysis.risk_flags) ? analysis.risk_flags : [],
-          summary_ru: analysis.summary_ru || null,
-          action_required: Boolean(analysis.action_required),
-          action_suggestion: analysis.action_suggestion || null,
-          confidence: Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : 0,
-          analyzed_at: new Date().toISOString(),
-          message_count_analyzed: messages.length,
-        },
-        { onConflict: 'dialog_session_id' }
-      );
+      .upsert(baseRow, { onConflict: 'dialog_session_id' });
+
+    // Fallback: if new columns don't exist yet, save without them
+    if (saveError && saveError.message?.includes('column')) {
+      const { customer_type, consultation_score, consultation_details, followup_status, manager_issues, ...fallbackRow } = baseRow;
+      const fallbackResult = await supabase
+        .from('chat_ai')
+        .upsert(fallbackRow, { onConflict: 'dialog_session_id' });
+      saveError = fallbackResult.error;
+      if (!saveError) {
+        logger.warn('Saved AI analysis without new columns — run migration to enable extended fields');
+      }
+    }
 
     if (saveError) {
       logger.error({ err: saveError, dialogSessionId }, 'Failed to save AI analysis');
