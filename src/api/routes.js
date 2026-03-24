@@ -3,6 +3,7 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
+import { runAnalysisNow, isAnalysisRunning } from '../ai/aiWorker.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { enqueueForAI } from '../ai/queueManager.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
@@ -172,6 +173,25 @@ async function renderQrPage(sessionId, displayName, state) {
 
 export function setupRoutes(app) {
   const router = express.Router();
+
+  // On-demand AI analysis — triggered from dashboard
+  router.post('/ai/analyze', async (req, res) => {
+    if (isAnalysisRunning()) {
+      return res.json({ success: false, error: 'Анализ уже выполняется', running: true });
+    }
+
+    // Run async, return immediately
+    res.json({ success: true, message: 'Анализ запущен' });
+
+    // Process in background
+    runAnalysisNow().then((result) => {
+      logger.info(result, 'On-demand AI analysis finished');
+    });
+  });
+
+  router.get('/ai/analyze/status', (req, res) => {
+    res.json({ running: isAnalysisRunning() });
+  });
 
   router.post('/ai/chat', async (req, res) => {
     const inputMessages = Array.isArray(req.body?.messages) ? req.body.messages : null;

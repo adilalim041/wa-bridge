@@ -4,10 +4,8 @@ import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
-const BATCH_INTERVAL_MS = 60 * 1000;        // check queue every 60s (was 30s)
 const MAX_CONTEXT_MESSAGES = 20;
-const SESSION_IDLE_MS = 5 * 60 * 1000;      // wait 5 min of silence before analyzing (was 10s)
-const REANALYZE_COOLDOWN_MS = 30 * 60 * 1000; // don't re-analyze same dialog within 30 min
+const REANALYZE_COOLDOWN_MS = 60 * 60 * 1000; // don't re-analyze same dialog within 1 hour
 
 let workerTimer = null;
 let initialRunTimer = null;
@@ -318,11 +316,6 @@ async function processQueue() {
     }
 
     for (const item of latestBySession.values()) {
-      const idleFor = Date.now() - new Date(item.created_at).getTime();
-      if (idleFor < SESSION_IDLE_MS) {
-        continue;
-      }
-
       // Skip if already analyzed recently (cooldown)
       const { data: existingAnalysis } = await supabase
         .from('chat_ai')
@@ -377,41 +370,86 @@ async function processQueue() {
   }
 }
 
+// Run analysis on-demand (triggered by API call or schedule)
+let isRunning = false;
+
+export async function runAnalysisNow() {
+  if (!ANTHROPIC_API_KEY) {
+    logger.warn('ANTHROPIC_API_KEY not set — AI analysis disabled');
+    return { success: false, error: 'API key not configured' };
+  }
+
+  if (isRunning) {
+    return { success: false, error: 'Analysis already in progress' };
+  }
+
+  isRunning = true;
+  const startTime = Date.now();
+  let processed = 0;
+  let failed = 0;
+
+  try {
+    // Process all pending items in queue (not just one batch)
+    let hasMore = true;
+    while (hasMore) {
+      const beforeCount = processed + failed;
+      await processQueue();
+
+      // Count what was processed this round
+      const { count } = await supabase
+        .from('ai_queue')
+        .select('*', { count: 'exact', head: true })
+        .eq('status', 'pending');
+
+      hasMore = (count || 0) > 0;
+
+      // Safety: count total processed
+      const { count: doneCount } = await supabase
+        .from('ai_queue')
+        .select('*', { count: 'exact', head: true })
+        .eq('status', 'done')
+        .gte('processed_at', new Date(startTime).toISOString());
+
+      const { count: failCount } = await supabase
+        .from('ai_queue')
+        .select('*', { count: 'exact', head: true })
+        .eq('status', 'failed')
+        .gte('processed_at', new Date(startTime).toISOString());
+
+      processed = doneCount || 0;
+      failed = failCount || 0;
+
+      // Safety limit — max 100 analyses per run
+      if (processed + failed >= 100) {
+        logger.warn('AI analysis hit safety limit of 100 per run');
+        break;
+      }
+    }
+  } catch (error) {
+    logger.error({ err: error }, 'Error during on-demand AI analysis');
+  } finally {
+    isRunning = false;
+  }
+
+  const durationSec = Math.round((Date.now() - startTime) / 1000);
+  logger.info({ processed, failed, durationSec }, 'AI analysis run complete');
+
+  return { success: true, processed, failed, durationSec };
+}
+
+export function isAnalysisRunning() {
+  return isRunning;
+}
+
+// Kept for backward compat — now a no-op (analysis is on-demand)
 export function startAIWorker() {
   if (!ANTHROPIC_API_KEY) {
     logger.warn('ANTHROPIC_API_KEY not set — AI worker disabled');
     return;
   }
-
-  if (workerTimer || initialRunTimer) {
-    logger.warn('AI worker already running');
-    return;
-  }
-
-  logger.info({ interval: BATCH_INTERVAL_MS }, 'Starting AI worker');
-
-  initialRunTimer = setTimeout(() => {
-    initialRunTimer = null;
-    processQueue().catch((error) => {
-      logger.error({ err: error }, 'Initial AI worker run failed');
-    });
-  }, 10000);
-
-  workerTimer = setInterval(() => {
-    processQueue().catch((error) => {
-      logger.error({ err: error }, 'Scheduled AI worker run failed');
-    });
-  }, BATCH_INTERVAL_MS);
+  logger.info('AI worker ready (on-demand mode — call POST /ai/analyze to run)');
 }
 
 export function stopAIWorker() {
-  if (initialRunTimer) {
-    clearTimeout(initialRunTimer);
-    initialRunTimer = null;
-  }
-
-  if (workerTimer) {
-    clearInterval(workerTimer);
-    workerTimer = null;
-  }
+  // nothing to stop — no timers
 }
