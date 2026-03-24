@@ -218,7 +218,14 @@ export async function getChatsWithLastMessage(sessionId) {
       });
 
     if (!rpcError && rpcData) {
-      return rpcData.map((row) => ({
+      return rpcData
+        .filter((row) => {
+          const jid = row.remote_jid;
+          if (!jid || jid.includes('-')) return true; // groups ok
+          const digits = jid.replace(/\D/g, '');
+          return digits.length >= 7 && digits.length <= 13;
+        })
+        .map((row) => ({
         remoteJid: row.remote_jid,
         chatType: row.chat_type,
         displayName: row.display_name,
@@ -266,7 +273,15 @@ export async function getChatsWithLastMessage(sessionId) {
 
     if (!chatList?.length) return [];
 
-    const jids = chatList.map((c) => c.remote_jid);
+    // Filter out LID garbage JIDs
+    const cleanChats = chatList.filter((c) => {
+      const jid = c.remote_jid;
+      if (!jid || jid.includes('-')) return true;
+      const digits = jid.replace(/\D/g, '');
+      return digits.length >= 7 && digits.length <= 13;
+    });
+
+    const jids = cleanChats.map((c) => c.remote_jid);
 
     const { data: crmContacts } = await supabase
       .from('contacts_crm')
@@ -282,8 +297,8 @@ export async function getChatsWithLastMessage(sessionId) {
     const BATCH_SIZE = 50;
     const result = [];
 
-    for (let i = 0; i < chatList.length; i += BATCH_SIZE) {
-      const batch = chatList.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < cleanChats.length; i += BATCH_SIZE) {
+      const batch = cleanChats.slice(i, i + BATCH_SIZE);
       const batchResults = await Promise.all(
         batch.map(async (chat) => {
           const [

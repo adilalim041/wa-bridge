@@ -67,6 +67,14 @@ function buildWhatsAppJid(remoteJid) {
   return remoteJid.includes('-') ? `${remoteJid}@g.us` : `${remoteJid}@s.whatsapp.net`;
 }
 
+// Filter out garbage LID JIDs (too short or too long numeric IDs)
+function isGarbageJid(jid) {
+  if (!jid || typeof jid !== 'string') return true;
+  if (jid.includes('-')) return false; // group JIDs are fine
+  const digits = jid.replace(/\D/g, '');
+  return digits.length < 7 || digits.length > 13;
+}
+
 function escapeHtml(value = '') {
   return value
     .replace(/&/g, '&amp;')
@@ -261,46 +269,51 @@ export function setupRoutes(app) {
 
   router.get('/analytics/summary', async (req, res) => {
     const sessionId = req.query.session_id || null;
-    const date = req.query.date || null; // YYYY-MM-DD — specific day analysis
+    const dateFrom = req.query.date_from || req.query.date || null; // YYYY-MM-DD
+    const dateTo = req.query.date_to || req.query.date || null;     // YYYY-MM-DD (same as from for single day)
     const days = Math.min(Number(req.query.days) || 7, 90);
 
-    // If date is provided, filter by that specific day; otherwise use days range
-    const dayStart = date ? `${date}T00:00:00+05:00` : null;
-    const dayEnd = date ? `${date}T23:59:59+05:00` : null;
-    const since = date ? dayStart : new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    // Date range or days-based
+    const rangeStart = dateFrom ? `${dateFrom}T00:00:00+05:00` : null;
+    const rangeEnd = dateTo ? `${dateTo}T23:59:59+05:00` : null;
+    const since = rangeStart || new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
     try {
       // Build session filter
       const sessionFilter = (query) => sessionId ? query.eq('session_id', sessionId) : query;
 
       // 1. KPI: response times
-      const { data: responseTimes } = await sessionFilter(
-        supabase
-          .from('manager_analytics')
-          .select('response_time_seconds')
-          .gte('created_at', since)
-          .not('response_time_seconds', 'is', null)
-      );
+      let rtQuery = supabase
+        .from('manager_analytics')
+        .select('response_time_seconds')
+        .gte('created_at', since)
+        .not('response_time_seconds', 'is', null);
+      if (rangeEnd) rtQuery = rtQuery.lte('created_at', rangeEnd);
+
+      const { data: responseTimes } = await sessionFilter(rtQuery);
 
       const rtValues = (responseTimes ?? []).map((r) => r.response_time_seconds).filter((v) => v > 0);
       const avgResponseTime = rtValues.length > 0
         ? Math.round(rtValues.reduce((a, b) => a + b, 0) / rtValues.length)
         : 0;
 
-      // 2. AI analysis breakdown — filter by analysis_date if date param provided
+      // 2. AI analysis breakdown — filter by analysis_date range or days
       let aiQuery = supabase
         .from('chat_ai')
         .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues');
 
-      if (date) {
-        aiQuery = aiQuery.eq('analysis_date', date);
+      if (dateFrom && dateTo && dateFrom === dateTo) {
+        aiQuery = aiQuery.eq('analysis_date', dateFrom);
+      } else if (dateFrom) {
+        aiQuery = aiQuery.gte('analysis_date', dateFrom);
+        if (dateTo) aiQuery = aiQuery.lte('analysis_date', dateTo);
       } else {
         aiQuery = aiQuery.gte('analyzed_at', since);
       }
 
       const { data: aiData } = await sessionFilter(aiQuery);
 
-      const ai = aiData ?? [];
+      const ai = (aiData ?? []).filter((row) => !isGarbageJid(row.remote_jid));
 
       // Lead temperature
       const leads = { hot: 0, warm: 0, cold: 0, dead: 0 };
@@ -392,7 +405,7 @@ export function setupRoutes(app) {
         .from('dialog_sessions')
         .select('*', { count: 'exact', head: true })
         .gte('started_at', since);
-      if (dayEnd) dialogQuery = dialogQuery.lte('started_at', dayEnd);
+      if (rangeEnd) dialogQuery = dialogQuery.lte('started_at', rangeEnd);
       const { count: totalDialogs } = await sessionFilter(dialogQuery);
 
       // 4. Daily message trend
@@ -401,7 +414,7 @@ export function setupRoutes(app) {
         .select('timestamp')
         .gte('timestamp', since)
         .order('timestamp', { ascending: true });
-      if (dayEnd) msgQuery = msgQuery.lte('timestamp', dayEnd);
+      if (rangeEnd) msgQuery = msgQuery.lte('timestamp', rangeEnd);
       const { data: dailyMessages } = await sessionFilter(msgQuery);
 
       const dailyMap = {};
@@ -414,7 +427,7 @@ export function setupRoutes(app) {
         .sort((a, b) => a.date.localeCompare(b.date));
 
       return res.json({
-        period: { days, since, date: date || null },
+        period: { days, since, dateFrom: dateFrom || null, dateTo: dateTo || null },
         kpi: {
           avgResponseTime,
           hotLeads: leads.hot,
