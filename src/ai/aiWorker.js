@@ -5,10 +5,10 @@ import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
 const MAX_CONTEXT_MESSAGES = 20;
-const REANALYZE_COOLDOWN_MS = 60 * 60 * 1000; // don't re-analyze same dialog within 1 hour
+const DAILY_ANALYSIS_HOUR = Number(process.env.DAILY_ANALYSIS_HOUR || 23); // 23:00 default
 
-let workerTimer = null;
-let initialRunTimer = null;
+let dailyTimer = null;
+let isRunning = false;
 
 const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Kazakhstan (японская кухонная сантехника: мойки, смесители).
 Ты анализируешь переписки менеджеров с клиентами в WhatsApp.
@@ -175,7 +175,13 @@ function formatDialogForAI(messages, contactInfo, responseTimeCtx) {
   return context;
 }
 
-async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
+function todayDateStr() {
+  // Almaty timezone: UTC+5
+  const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
+  return now.toISOString().slice(0, 10);
+}
+
+async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analysisDate) {
   try {
     const { data: messageRows, error: msgError } = await supabase
       .from('messages')
@@ -187,7 +193,6 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
       .limit(MAX_CONTEXT_MESSAGES);
 
     if (msgError || !messageRows?.length) {
-      logger.error({ err: msgError, dialogSessionId }, 'Failed to fetch messages for AI');
       return false;
     }
 
@@ -209,10 +214,11 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
     }
 
     const cq = analysis.consultation_quality || {};
-    const baseRow = {
+    const row = {
       dialog_session_id: dialogSessionId,
       session_id: sessionId,
       remote_jid: remoteJid,
+      analysis_date: analysisDate,
       intent: analysis.intent || 'other',
       lead_temperature: analysis.lead_temperature || 'cold',
       lead_source: analysis.lead_source || 'unknown',
@@ -226,7 +232,6 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
       confidence: Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : 0,
       analyzed_at: new Date().toISOString(),
       message_count_analyzed: messages.length,
-      // New fields (require migration)
       customer_type: analysis.customer_type || 'unknown',
       consultation_score: Number.isFinite(Number(cq.score)) ? Number(cq.score) : null,
       consultation_details: {
@@ -238,20 +243,18 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
       manager_issues: Array.isArray(analysis.manager_issues) ? analysis.manager_issues : [],
     };
 
+    // Try with analysis_date (new schema)
     let { error: saveError } = await supabase
       .from('chat_ai')
-      .upsert(baseRow, { onConflict: 'dialog_session_id' });
+      .upsert(row, { onConflict: 'dialog_session_id,analysis_date' });
 
-    // Fallback: if new columns don't exist yet, save without them
-    if (saveError && saveError.message?.includes('column')) {
-      const { customer_type, consultation_score, consultation_details, followup_status, manager_issues, ...fallbackRow } = baseRow;
-      const fallbackResult = await supabase
+    // Fallback: old schema without analysis_date column
+    if (saveError && (saveError.message?.includes('analysis_date') || saveError.message?.includes('column'))) {
+      const { analysis_date, ...fallbackRow } = row;
+      const result = await supabase
         .from('chat_ai')
         .upsert(fallbackRow, { onConflict: 'dialog_session_id' });
-      saveError = fallbackResult.error;
-      if (!saveError) {
-        logger.warn('Saved AI analysis without new columns — run migration to enable extended fields');
-      }
+      saveError = result.error;
     }
 
     if (saveError) {
@@ -259,14 +262,6 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
       return false;
     }
 
-    logger.info(
-      {
-        dialogSessionId,
-        intent: analysis.intent,
-        temperature: analysis.lead_temperature,
-      },
-      'AI analysis complete'
-    );
     return true;
   } catch (error) {
     logger.error({ err: error, dialogSessionId }, 'Unexpected error in AI processing');
@@ -274,182 +269,142 @@ async function processDialogSession(dialogSessionId, sessionId, remoteJid) {
   }
 }
 
-async function processQueue() {
-  try {
-    // Unstick items stuck in 'processing' for more than 5 minutes
-    const stuckCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    const { data: stuckItems } = await supabase
-      .from('ai_queue')
-      .update({ status: 'pending' })
-      .eq('status', 'processing')
-      .lt('created_at', stuckCutoff)
-      .select('dialog_session_id');
-
-    if (stuckItems?.length) {
-      logger.warn({ count: stuckItems.length }, 'Unstuck AI queue items back to pending');
-    }
-
-    const { data: pending, error } = await supabase
-      .from('ai_queue')
-      .select('id, dialog_session_id, session_id, remote_jid, created_at')
-      .eq('status', 'pending')
-      .order('created_at', { ascending: true })
-      .limit(50);
-
-    if (error || !pending?.length) {
-      if (error) {
-        logger.error({ err: error }, 'Failed to fetch AI queue');
-      }
-      return;
-    }
-
-    const latestBySession = new Map();
-    for (const item of pending) {
-      if (!item.dialog_session_id) {
-        continue;
-      }
-
-      const existing = latestBySession.get(item.dialog_session_id);
-      if (!existing || new Date(item.created_at) > new Date(existing.created_at)) {
-        latestBySession.set(item.dialog_session_id, item);
-      }
-    }
-
-    for (const item of latestBySession.values()) {
-      // Skip if already analyzed recently (cooldown)
-      const { data: existingAnalysis } = await supabase
-        .from('chat_ai')
-        .select('analyzed_at')
-        .eq('dialog_session_id', item.dialog_session_id)
-        .maybeSingle();
-
-      if (existingAnalysis?.analyzed_at) {
-        const sinceLastAnalysis = Date.now() - new Date(existingAnalysis.analyzed_at).getTime();
-        if (sinceLastAnalysis < REANALYZE_COOLDOWN_MS) {
-          // Mark as done — already analyzed recently, skip
-          await supabase
-            .from('ai_queue')
-            .update({ status: 'done', processed_at: new Date().toISOString() })
-            .eq('dialog_session_id', item.dialog_session_id)
-            .eq('status', 'pending');
-          continue;
-        }
-      }
-
-      await supabase
-        .from('ai_queue')
-        .update({ status: 'processing' })
-        .eq('dialog_session_id', item.dialog_session_id)
-        .eq('status', 'pending');
-
-      const success = await processDialogSession(
-        item.dialog_session_id,
-        item.session_id,
-        item.remote_jid
-      );
-
-      await supabase
-        .from('ai_queue')
-        .update({
-          status: success ? 'done' : 'failed',
-          processed_at: new Date().toISOString(),
-        })
-        .eq('dialog_session_id', item.dialog_session_id)
-        .eq('status', 'processing');
-
-      if (success) {
-        await supabase
-          .from('messages')
-          .update({ ai_processed: true })
-          .eq('dialog_session_id', item.dialog_session_id)
-          .eq('ai_processed', false);
-      }
-    }
-  } catch (error) {
-    logger.error({ err: error }, 'Error processing AI queue');
-  }
-}
-
-// Run analysis on-demand (triggered by API call or schedule)
-let isRunning = false;
-
-export async function runAnalysisNow() {
+// Find all dialog sessions with activity on a given date and analyze them
+export async function runDailyAnalysis(date) {
   if (!ANTHROPIC_API_KEY) {
-    logger.warn('ANTHROPIC_API_KEY not set — AI analysis disabled');
     return { success: false, error: 'API key not configured' };
   }
 
   if (isRunning) {
-    return { success: false, error: 'Analysis already in progress' };
+    return { success: false, error: 'Analysis already in progress', running: true };
   }
 
   isRunning = true;
+  const analysisDate = date || todayDateStr();
   const startTime = Date.now();
   let processed = 0;
   let failed = 0;
+  let skipped = 0;
 
   try {
-    // Process all pending items in queue (not just one batch)
-    let hasMore = true;
-    while (hasMore) {
-      const beforeCount = processed + failed;
-      await processQueue();
+    const dayStart = `${analysisDate}T00:00:00+05:00`;
+    const dayEnd = `${analysisDate}T23:59:59+05:00`;
 
-      // Count what was processed this round
-      const { count } = await supabase
-        .from('ai_queue')
-        .select('*', { count: 'exact', head: true })
-        .eq('status', 'pending');
+    // Find dialog sessions that had messages on this date
+    const { data: activeSessions, error } = await supabase
+      .from('dialog_sessions')
+      .select('id, session_id, remote_jid, message_count')
+      .gte('last_message_at', dayStart)
+      .lte('started_at', dayEnd)
+      .order('last_message_at', { ascending: false });
 
-      hasMore = (count || 0) > 0;
+    if (error) {
+      logger.error({ err: error }, 'Failed to fetch active dialog sessions');
+      isRunning = false;
+      return { success: false, error: error.message };
+    }
 
-      // Safety: count total processed
-      const { count: doneCount } = await supabase
-        .from('ai_queue')
-        .select('*', { count: 'exact', head: true })
-        .eq('status', 'done')
-        .gte('processed_at', new Date(startTime).toISOString());
+    if (!activeSessions?.length) {
+      isRunning = false;
+      return { success: true, processed: 0, failed: 0, skipped: 0, date: analysisDate, message: 'No dialogs found for this date' };
+    }
 
-      const { count: failCount } = await supabase
-        .from('ai_queue')
-        .select('*', { count: 'exact', head: true })
-        .eq('status', 'failed')
-        .gte('processed_at', new Date(startTime).toISOString());
+    // Skip dialogs with only 1 message (just "Привет" etc)
+    const meaningful = activeSessions.filter((s) => (s.message_count || 0) >= 2);
+    skipped = activeSessions.length - meaningful.length;
 
-      processed = doneCount || 0;
-      failed = failCount || 0;
+    // Check which ones already have analysis for this date
+    const dialogIds = meaningful.map((s) => s.id);
+    const { data: existingAnalyses } = await supabase
+      .from('chat_ai')
+      .select('dialog_session_id')
+      .in('dialog_session_id', dialogIds)
+      .eq('analysis_date', analysisDate);
 
-      // Safety limit — max 100 analyses per run
+    const alreadyDone = new Set((existingAnalyses || []).map((a) => a.dialog_session_id));
+
+    for (const session of meaningful) {
+      if (alreadyDone.has(session.id)) {
+        skipped++;
+        continue;
+      }
+
+      // Safety limit
       if (processed + failed >= 100) {
-        logger.warn('AI analysis hit safety limit of 100 per run');
+        logger.warn('Daily analysis hit safety limit of 100');
         break;
+      }
+
+      const success = await analyzeDialogForDate(
+        session.id,
+        session.session_id,
+        session.remote_jid,
+        analysisDate
+      );
+
+      if (success) {
+        processed++;
+      } else {
+        failed++;
       }
     }
   } catch (error) {
-    logger.error({ err: error }, 'Error during on-demand AI analysis');
+    logger.error({ err: error }, 'Error during daily analysis');
   } finally {
     isRunning = false;
   }
 
   const durationSec = Math.round((Date.now() - startTime) / 1000);
-  logger.info({ processed, failed, durationSec }, 'AI analysis run complete');
+  logger.info({ processed, failed, skipped, durationSec, date: analysisDate }, 'Daily AI analysis complete');
 
-  return { success: true, processed, failed, durationSec };
+  return { success: true, processed, failed, skipped, date: analysisDate, durationSec };
 }
 
 export function isAnalysisRunning() {
   return isRunning;
 }
 
-// Kept for backward compat — now a no-op (analysis is on-demand)
+// Schedule daily analysis at configured hour (Almaty time)
+function scheduleDailyRun() {
+  const now = new Date(Date.now() + 5 * 60 * 60 * 1000); // Almaty UTC+5
+  const nextRun = new Date(now);
+  nextRun.setUTCHours(DAILY_ANALYSIS_HOUR - 5, 0, 0, 0); // Convert Almaty hour to UTC
+
+  if (nextRun <= new Date()) {
+    // Already past today's run time — schedule for tomorrow
+    nextRun.setDate(nextRun.getDate() + 1);
+  }
+
+  const msUntilRun = nextRun.getTime() - Date.now();
+  const hoursUntil = (msUntilRun / 3600000).toFixed(1);
+
+  logger.info({ nextRun: nextRun.toISOString(), hoursUntil }, `Daily analysis scheduled at ${DAILY_ANALYSIS_HOUR}:00 Almaty time`);
+
+  dailyTimer = setTimeout(async () => {
+    logger.info('Running scheduled daily analysis');
+    try {
+      const result = await runDailyAnalysis();
+      logger.info(result, 'Scheduled daily analysis finished');
+    } catch (error) {
+      logger.error({ err: error }, 'Scheduled daily analysis failed');
+    }
+    // Schedule next day
+    scheduleDailyRun();
+  }, msUntilRun);
+}
+
 export function startAIWorker() {
   if (!ANTHROPIC_API_KEY) {
     logger.warn('ANTHROPIC_API_KEY not set — AI worker disabled');
     return;
   }
-  logger.info('AI worker ready (on-demand mode — call POST /ai/analyze to run)');
+  scheduleDailyRun();
+  logger.info('AI worker ready (daily auto + on-demand via POST /ai/analyze)');
 }
 
 export function stopAIWorker() {
-  // nothing to stop — no timers
+  if (dailyTimer) {
+    clearTimeout(dailyTimer);
+    dailyTimer = null;
+  }
 }

@@ -3,7 +3,7 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
-import { runAnalysisNow, isAnalysisRunning } from '../ai/aiWorker.js';
+import { runDailyAnalysis, isAnalysisRunning } from '../ai/aiWorker.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { enqueueForAI } from '../ai/queueManager.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
@@ -174,23 +174,57 @@ async function renderQrPage(sessionId, displayName, state) {
 export function setupRoutes(app) {
   const router = express.Router();
 
-  // On-demand AI analysis — triggered from dashboard
+  // On-demand daily analysis — accepts optional ?date=YYYY-MM-DD
   router.post('/ai/analyze', async (req, res) => {
     if (isAnalysisRunning()) {
       return res.json({ success: false, error: 'Анализ уже выполняется', running: true });
     }
 
-    // Run async, return immediately
-    res.json({ success: true, message: 'Анализ запущен' });
+    const date = req.query.date || req.body?.date || null; // YYYY-MM-DD or null (= today)
+    res.json({ success: true, message: 'Анализ запущен', date: date || 'today' });
 
-    // Process in background
-    runAnalysisNow().then((result) => {
-      logger.info(result, 'On-demand AI analysis finished');
+    runDailyAnalysis(date).then((result) => {
+      logger.info(result, 'On-demand daily analysis finished');
     });
   });
 
   router.get('/ai/analyze/status', (req, res) => {
     res.json({ running: isAnalysisRunning() });
+  });
+
+  // Get list of dates that have analysis data
+  router.get('/ai/analyze/dates', async (req, res) => {
+    try {
+      const sessionId = req.query.session_id || null;
+      let query = supabase
+        .from('chat_ai')
+        .select('analysis_date')
+        .not('analysis_date', 'is', null)
+        .order('analysis_date', { ascending: false })
+        .limit(90);
+
+      if (sessionId) {
+        query = query.eq('session_id', sessionId);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        return res.status(500).json({ error: error.message });
+      }
+
+      // Deduplicate dates and count analyses per date
+      const dateMap = new Map();
+      for (const row of data || []) {
+        const d = row.analysis_date;
+        dateMap.set(d, (dateMap.get(d) || 0) + 1);
+      }
+
+      const dates = Array.from(dateMap.entries()).map(([date, count]) => ({ date, count }));
+      res.json({ dates });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   router.post('/ai/chat', async (req, res) => {
@@ -227,8 +261,13 @@ export function setupRoutes(app) {
 
   router.get('/analytics/summary', async (req, res) => {
     const sessionId = req.query.session_id || null;
+    const date = req.query.date || null; // YYYY-MM-DD — specific day analysis
     const days = Math.min(Number(req.query.days) || 7, 90);
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+    // If date is provided, filter by that specific day; otherwise use days range
+    const dayStart = date ? `${date}T00:00:00+05:00` : null;
+    const dayEnd = date ? `${date}T23:59:59+05:00` : null;
+    const since = date ? dayStart : new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
     try {
       // Build session filter
@@ -248,13 +287,18 @@ export function setupRoutes(app) {
         ? Math.round(rtValues.reduce((a, b) => a + b, 0) / rtValues.length)
         : 0;
 
-      // 2. AI analysis breakdown
-      const { data: aiData } = await sessionFilter(
-        supabase
-          .from('chat_ai')
-          .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues')
-          .gte('analyzed_at', since)
-      );
+      // 2. AI analysis breakdown — filter by analysis_date if date param provided
+      let aiQuery = supabase
+        .from('chat_ai')
+        .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues');
+
+      if (date) {
+        aiQuery = aiQuery.eq('analysis_date', date);
+      } else {
+        aiQuery = aiQuery.gte('analyzed_at', since);
+      }
+
+      const { data: aiData } = await sessionFilter(aiQuery);
 
       const ai = aiData ?? [];
 
@@ -344,21 +388,21 @@ export function setupRoutes(app) {
       }
 
       // 3. Dialog sessions count
-      const { count: totalDialogs } = await sessionFilter(
-        supabase
-          .from('dialog_sessions')
-          .select('*', { count: 'exact', head: true })
-          .gte('started_at', since)
-      );
+      let dialogQuery = supabase
+        .from('dialog_sessions')
+        .select('*', { count: 'exact', head: true })
+        .gte('started_at', since);
+      if (dayEnd) dialogQuery = dialogQuery.lte('started_at', dayEnd);
+      const { count: totalDialogs } = await sessionFilter(dialogQuery);
 
       // 4. Daily message trend
-      const { data: dailyMessages } = await sessionFilter(
-        supabase
-          .from('messages')
-          .select('timestamp')
-          .gte('timestamp', since)
-          .order('timestamp', { ascending: true })
-      );
+      let msgQuery = supabase
+        .from('messages')
+        .select('timestamp')
+        .gte('timestamp', since)
+        .order('timestamp', { ascending: true });
+      if (dayEnd) msgQuery = msgQuery.lte('timestamp', dayEnd);
+      const { data: dailyMessages } = await sessionFilter(msgQuery);
 
       const dailyMap = {};
       for (const msg of dailyMessages ?? []) {
@@ -370,7 +414,7 @@ export function setupRoutes(app) {
         .sort((a, b) => a.date.localeCompare(b.date));
 
       return res.json({
-        period: { days, since },
+        period: { days, since, date: date || null },
         kpi: {
           avgResponseTime,
           hotLeads: leads.hot,
