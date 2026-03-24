@@ -214,7 +214,7 @@ export async function getChatsWithLastMessage(sessionId) {
     const { data: rpcData, error: rpcError } = await supabase
       .rpc('get_chats_with_last_message', {
         p_session_id: sessionId,
-        p_limit: 300,
+        p_limit: 2000,
       });
 
     if (!rpcError && rpcData) {
@@ -257,7 +257,7 @@ export async function getChatsWithLastMessage(sessionId) {
       .eq('session_id', sessionId)
       .or('is_hidden.is.null,is_hidden.eq.false')
       .order('last_message_at', { ascending: false })
-      .limit(300);
+      .limit(2000);
 
     if (chatError) {
       logger.error({ err: chatError, sessionId }, 'Failed to fetch chats');
