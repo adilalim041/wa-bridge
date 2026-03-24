@@ -210,7 +210,47 @@ export async function getContacts(sessionId) {
 
 export async function getChatsWithLastMessage(sessionId) {
   try {
-    // 1. Fetch chats (limit 300 — plenty for any dashboard view)
+    // Try optimized RPC first (single SQL query with LATERAL JOINs)
+    const { data: rpcData, error: rpcError } = await supabase
+      .rpc('get_chats_with_last_message', {
+        p_session_id: sessionId,
+        p_limit: 300,
+      });
+
+    if (!rpcError && rpcData) {
+      return rpcData.map((row) => ({
+        remoteJid: row.remote_jid,
+        chatType: row.chat_type,
+        displayName: row.display_name,
+        participantCount: row.participant_count,
+        phoneNumber: row.phone_number,
+        isMuted: row.is_muted,
+        mutedUntil: row.muted_until || null,
+        tags: row.tags || [],
+        lastMessage: row.last_message_body || null,
+        lastMessageType: row.last_message_type || 'text',
+        lastTimestamp: row.last_timestamp,
+        fromMe: row.last_from_me,
+        pushName: row.last_push_name || null,
+        sender: row.last_sender || null,
+        mediaUrl: row.last_media_url || null,
+        mediaType: row.last_media_type || null,
+        fileName: row.last_file_name || null,
+        unreadCount: Number(row.unread_count) || 0,
+        hasCrmContact: Boolean(row.crm_first_name),
+        crmName: row.crm_first_name
+          ? `${row.crm_first_name}${row.crm_last_name ? ` ${row.crm_last_name}` : ''}`
+          : null,
+        crmRole: row.crm_role || null,
+        crmAvatarUrl: row.crm_avatar_url || null,
+      }));
+    }
+
+    // Fallback: RPC not available yet — use multi-query approach
+    if (rpcError) {
+      logger.warn({ err: rpcError.message }, 'RPC not available, using fallback queries');
+    }
+
     const { data: chatList, error: chatError } = await supabase
       .from('chats')
       .select('*')
@@ -228,7 +268,6 @@ export async function getChatsWithLastMessage(sessionId) {
 
     const jids = chatList.map((c) => c.remote_jid);
 
-    // 2. Batch fetch CRM contacts for all chats in one query
     const { data: crmContacts } = await supabase
       .from('contacts_crm')
       .select('remote_jid, first_name, last_name, role, avatar_url')
@@ -240,7 +279,6 @@ export async function getChatsWithLastMessage(sessionId) {
       crmMap.set(c.remote_jid, c);
     }
 
-    // 3. Per-chat queries: last message + unread count (2 queries per chat instead of 3)
     const BATCH_SIZE = 50;
     const result = [];
 

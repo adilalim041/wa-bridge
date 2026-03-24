@@ -29,10 +29,11 @@ export function startServer() {
         next();
     });
 
-    // Rate limiting — 100 requests per 15 min per IP
+    // Rate limiting — 300 requests per 15 min per IP (dashboard use)
+    // WhatsApp messages bypass this entirely (they come via Baileys, not HTTP)
     app.use(rateLimit({
         windowMs: 15 * 60 * 1000,
-        max: 100,
+        max: 300,
         standardHeaders: true,
         legacyHeaders: false,
         skip: (req) => req.path === '/health' || req.path === '/ws',
