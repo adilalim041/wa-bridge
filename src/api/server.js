@@ -1,5 +1,6 @@
 import express from 'express';
 import { createServer } from 'http';
+import rateLimit from 'express-rate-limit';
 import { config, logger } from '../config.js';
 import { setupRoutes } from './routes.js';
 import { setupWebSocket } from './websocket.js';
@@ -28,19 +29,33 @@ export function startServer() {
         next();
     });
 
-    // API key auth — skip for health & public endpoints
-    const API_KEY = process.env.API_KEY || null;
-    if (API_KEY) {
-        app.use((req, res, next) => {
-            if (req.path === '/health' || req.path === '/ws') return next();
-            const key = req.headers['x-api-key'] || req.query.apiKey;
-            if (key !== API_KEY) {
-                return res.status(401).json({ error: 'Invalid or missing API key' });
-            }
-            next();
-        });
-        logger.info('API key authentication enabled');
-    }
+    // Rate limiting — 100 requests per 15 min per IP
+    app.use(rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 100,
+        standardHeaders: true,
+        legacyHeaders: false,
+        skip: (req) => req.path === '/health' || req.path === '/ws',
+    }));
+
+    // Stricter limit for admin/destructive endpoints — 10 per 15 min
+    app.use('/admin', rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 10,
+        message: { error: 'Too many admin requests, try again later' },
+    }));
+
+    // API key auth — always required, skip only health & ws
+    const API_KEY = process.env.API_KEY;
+    app.use((req, res, next) => {
+        if (req.path === '/health' || req.path === '/ws') return next();
+        const key = req.headers['x-api-key'] || req.query.apiKey;
+        if (key !== API_KEY) {
+            return res.status(401).json({ error: 'Invalid or missing API key' });
+        }
+        next();
+    });
+    logger.info('API key authentication enabled');
 
     setupRoutes(app);
     setupWebSocket(httpServer);

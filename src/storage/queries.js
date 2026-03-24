@@ -210,99 +210,105 @@ export async function getContacts(sessionId) {
 
 export async function getChatsWithLastMessage(sessionId) {
   try {
+    // 1. Fetch chats (limit 300 — plenty for any dashboard view)
     const { data: chatList, error: chatError } = await supabase
       .from('chats')
       .select('*')
       .eq('session_id', sessionId)
       .or('is_hidden.is.null,is_hidden.eq.false')
-      .order('last_message_at', { ascending: false });
+      .order('last_message_at', { ascending: false })
+      .limit(300);
 
     if (chatError) {
       logger.error({ err: chatError, sessionId }, 'Failed to fetch chats');
       return [];
     }
 
-    const result = await Promise.all(
-      (chatList ?? []).map(async (chat) => {
-        const [
-          { data: messages, error },
-          { count, error: unreadError },
-          { data: crmContact, error: crmError },
-        ] = await Promise.all([
-          supabase
-            .from('messages')
-            .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
-            .eq('session_id', sessionId)
-            .eq('remote_jid', chat.remote_jid)
-            .order('timestamp', { ascending: false })
-            .limit(1),
-          supabase
-            .from('messages')
-            .select('*', { count: 'exact', head: true })
-            .eq('session_id', sessionId)
-            .eq('remote_jid', chat.remote_jid)
-            .eq('from_me', false)
-            .is('read_at', null),
-          supabase
-            .from('contacts_crm')
-            .select('first_name, last_name, role, avatar_url')
-            .eq('session_id', sessionId)
-            .eq('remote_jid', chat.remote_jid)
-            .maybeSingle(),
-        ]);
+    if (!chatList?.length) return [];
 
-        if (error) {
-          logger.error(
-            { err: error, sessionId, remoteJid: chat.remote_jid },
-            'Failed to fetch last message for chat'
-          );
-        }
+    const jids = chatList.map((c) => c.remote_jid);
 
-        if (unreadError) {
-          logger.error(
-            { err: unreadError, sessionId, remoteJid: chat.remote_jid },
-            'Failed to count unread messages'
-          );
-        }
+    // 2. Batch fetch CRM contacts for all chats in one query
+    const { data: crmContacts } = await supabase
+      .from('contacts_crm')
+      .select('remote_jid, first_name, last_name, role, avatar_url')
+      .eq('session_id', sessionId)
+      .in('remote_jid', jids);
 
-        if (crmError) {
-          logger.error(
-            { err: crmError, sessionId, remoteJid: chat.remote_jid },
-            'Failed to fetch CRM contact for chat'
-          );
-        }
+    const crmMap = new Map();
+    for (const c of crmContacts ?? []) {
+      crmMap.set(c.remote_jid, c);
+    }
 
-        const lastMessage = messages?.[0] || null;
-        const crmName = crmContact
-          ? `${crmContact.first_name}${crmContact.last_name ? ` ${crmContact.last_name}` : ''}`
-          : null;
+    // 3. Per-chat queries: last message + unread count (2 queries per chat instead of 3)
+    const BATCH_SIZE = 50;
+    const result = [];
 
-        return {
-          remoteJid: chat.remote_jid,
-          chatType: chat.chat_type,
-          displayName: chat.display_name,
-          participantCount: chat.participant_count,
-          phoneNumber: chat.phone_number || chat.remote_jid,
-          isMuted: chat.is_muted || false,
-          mutedUntil: chat.muted_until || null,
-          tags: chat.tags || [],
-          lastMessage: lastMessage?.body || null,
-          lastMessageType: lastMessage?.message_type || 'text',
-          lastTimestamp: lastMessage?.timestamp || chat.last_message_at,
-          fromMe: lastMessage?.from_me || false,
-          pushName: lastMessage?.push_name || null,
-          sender: lastMessage?.sender || null,
-          mediaUrl: lastMessage?.media_url || null,
-          mediaType: lastMessage?.media_type || null,
-          fileName: lastMessage?.file_name || null,
-          unreadCount: count || 0,
-          hasCrmContact: Boolean(crmContact),
-          crmName,
-          crmRole: crmContact?.role || null,
-          crmAvatarUrl: crmContact?.avatar_url || null,
-        };
-      })
-    );
+    for (let i = 0; i < chatList.length; i += BATCH_SIZE) {
+      const batch = chatList.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(
+        batch.map(async (chat) => {
+          const [
+            { data: messages, error },
+            { count, error: unreadError },
+          ] = await Promise.all([
+            supabase
+              .from('messages')
+              .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
+              .eq('session_id', sessionId)
+              .eq('remote_jid', chat.remote_jid)
+              .order('timestamp', { ascending: false })
+              .limit(1),
+            supabase
+              .from('messages')
+              .select('*', { count: 'exact', head: true })
+              .eq('session_id', sessionId)
+              .eq('remote_jid', chat.remote_jid)
+              .eq('from_me', false)
+              .is('read_at', null),
+          ]);
+
+          if (error) {
+            logger.error({ err: error, sessionId, remoteJid: chat.remote_jid }, 'Failed to fetch last message');
+          }
+          if (unreadError) {
+            logger.error({ err: unreadError, sessionId, remoteJid: chat.remote_jid }, 'Failed to count unread');
+          }
+
+          const lastMessage = messages?.[0] || null;
+          const crmContact = crmMap.get(chat.remote_jid) || null;
+          const crmName = crmContact
+            ? `${crmContact.first_name}${crmContact.last_name ? ` ${crmContact.last_name}` : ''}`
+            : null;
+
+          return {
+            remoteJid: chat.remote_jid,
+            chatType: chat.chat_type,
+            displayName: chat.display_name,
+            participantCount: chat.participant_count,
+            phoneNumber: chat.phone_number || chat.remote_jid,
+            isMuted: chat.is_muted || false,
+            mutedUntil: chat.muted_until || null,
+            tags: chat.tags || [],
+            lastMessage: lastMessage?.body || null,
+            lastMessageType: lastMessage?.message_type || 'text',
+            lastTimestamp: lastMessage?.timestamp || chat.last_message_at,
+            fromMe: lastMessage?.from_me || false,
+            pushName: lastMessage?.push_name || null,
+            sender: lastMessage?.sender || null,
+            mediaUrl: lastMessage?.media_url || null,
+            mediaType: lastMessage?.media_type || null,
+            fileName: lastMessage?.file_name || null,
+            unreadCount: count || 0,
+            hasCrmContact: Boolean(crmContact),
+            crmName,
+            crmRole: crmContact?.role || null,
+            crmAvatarUrl: crmContact?.avatar_url || null,
+          };
+        })
+      );
+      result.push(...batchResults);
+    }
 
     return result;
   } catch (error) {
