@@ -282,17 +282,53 @@ export function setupRoutes(app) {
       // Build session filter
       const sessionFilter = (query) => sessionId ? query.eq('session_id', sessionId) : query;
 
-      // 1. KPI: response times
+      // 1. KPI: response times (adjusted for working hours 10:00-20:00 Almaty)
       let rtQuery = supabase
         .from('manager_analytics')
-        .select('response_time_seconds')
+        .select('customer_message_at, manager_response_at')
         .gte('created_at', since)
-        .not('response_time_seconds', 'is', null);
+        .not('manager_response_at', 'is', null);
       if (rangeEnd) rtQuery = rtQuery.lte('created_at', rangeEnd);
 
       const { data: responseTimes } = await sessionFilter(rtQuery);
 
-      const rtValues = (responseTimes ?? []).map((r) => r.response_time_seconds).filter((v) => v > 0);
+      // Calculate working-hours-only response time for each entry
+      const WORK_START = 10; // 10:00 Almaty
+      const WORK_END = 20;   // 20:00 Almaty
+      const ALMATY_OFFSET = 5 * 3600000; // UTC+5 in ms
+
+      function calcWorkingSeconds(customerAt, managerAt) {
+        if (!customerAt || !managerAt) return 0;
+        const cAlmaty = new Date(new Date(customerAt).getTime() + ALMATY_OFFSET);
+        const mAlmaty = new Date(new Date(managerAt).getTime() + ALMATY_OFFSET);
+        // Clamp customer time to work hours start
+        const cHour = cAlmaty.getUTCHours() + cAlmaty.getUTCMinutes() / 60;
+        const start = new Date(cAlmaty);
+        if (cHour < WORK_START) {
+          start.setUTCHours(WORK_START, 0, 0, 0);
+        } else if (cHour >= WORK_END) {
+          start.setUTCDate(start.getUTCDate() + 1);
+          start.setUTCHours(WORK_START, 0, 0, 0);
+        }
+        let total = 0;
+        const cur = new Date(start);
+        for (let safety = 0; safety < 30 && cur < mAlmaty; safety++) {
+          const dayEnd = new Date(cur);
+          dayEnd.setUTCHours(WORK_END, 0, 0, 0);
+          if (dayEnd > mAlmaty) {
+            total += (mAlmaty - cur) / 1000;
+            break;
+          }
+          total += (dayEnd - cur) / 1000;
+          cur.setUTCDate(cur.getUTCDate() + 1);
+          cur.setUTCHours(WORK_START, 0, 0, 0);
+        }
+        return Math.max(0, Math.round(total));
+      }
+
+      const rtValues = (responseTimes ?? [])
+        .map((r) => calcWorkingSeconds(r.customer_message_at, r.manager_response_at))
+        .filter((v) => v > 0);
       const avgResponseTime = rtValues.length > 0
         ? Math.round(rtValues.reduce((a, b) => a + b, 0) / rtValues.length)
         : 0;
