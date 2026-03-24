@@ -4,9 +4,10 @@ import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
-const BATCH_INTERVAL_MS = 30 * 1000;
+const BATCH_INTERVAL_MS = 60 * 1000;        // check queue every 60s (was 30s)
 const MAX_CONTEXT_MESSAGES = 20;
-const SESSION_IDLE_MS = 10 * 1000;
+const SESSION_IDLE_MS = 5 * 60 * 1000;      // wait 5 min of silence before analyzing (was 10s)
+const REANALYZE_COOLDOWN_MS = 30 * 60 * 1000; // don't re-analyze same dialog within 30 min
 
 let workerTimer = null;
 let initialRunTimer = null;
@@ -320,6 +321,26 @@ async function processQueue() {
       const idleFor = Date.now() - new Date(item.created_at).getTime();
       if (idleFor < SESSION_IDLE_MS) {
         continue;
+      }
+
+      // Skip if already analyzed recently (cooldown)
+      const { data: existingAnalysis } = await supabase
+        .from('chat_ai')
+        .select('analyzed_at')
+        .eq('dialog_session_id', item.dialog_session_id)
+        .maybeSingle();
+
+      if (existingAnalysis?.analyzed_at) {
+        const sinceLastAnalysis = Date.now() - new Date(existingAnalysis.analyzed_at).getTime();
+        if (sinceLastAnalysis < REANALYZE_COOLDOWN_MS) {
+          // Mark as done — already analyzed recently, skip
+          await supabase
+            .from('ai_queue')
+            .update({ status: 'done', processed_at: new Date().toISOString() })
+            .eq('dialog_session_id', item.dialog_session_id)
+            .eq('status', 'pending');
+          continue;
+        }
       }
 
       await supabase
