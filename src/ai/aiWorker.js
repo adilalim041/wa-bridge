@@ -4,7 +4,8 @@ import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
-const MAX_CONTEXT_MESSAGES = 20;
+const MAX_CONTEXT_MESSAGES = 30;  // messages from target day
+const PREV_DAY_CONTEXT = 10;      // extra messages from before target day for context
 const DAILY_ANALYSIS_HOUR = Number(process.env.DAILY_ANALYSIS_HOUR || 23); // 23:00 default
 
 let dailyTimer = null;
@@ -183,20 +184,37 @@ function todayDateStr() {
 
 async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analysisDate) {
   try {
-    const { data: messageRows, error: msgError } = await supabase
+    const dayStart = `${analysisDate}T00:00:00+05:00`;
+    const dayEnd = `${analysisDate}T23:59:59+05:00`;
+
+    // 1. Get messages FROM the target day
+    const { data: dayMessages, error: dayErr } = await supabase
       .from('messages')
       .select('body, from_me, timestamp, message_type, push_name')
       .eq('session_id', sessionId)
       .eq('remote_jid', remoteJid)
-      .eq('dialog_session_id', dialogSessionId)
-      .order('timestamp', { ascending: false })
+      .gte('timestamp', dayStart)
+      .lte('timestamp', dayEnd)
+      .order('timestamp', { ascending: true })
       .limit(MAX_CONTEXT_MESSAGES);
 
-    if (msgError || !messageRows?.length) {
+    // 2. Get earlier messages for context (before target day)
+    const { data: prevMessages } = await supabase
+      .from('messages')
+      .select('body, from_me, timestamp, message_type, push_name')
+      .eq('session_id', sessionId)
+      .eq('remote_jid', remoteJid)
+      .lt('timestamp', dayStart)
+      .order('timestamp', { ascending: false })
+      .limit(PREV_DAY_CONTEXT);
+
+    if (dayErr || !dayMessages?.length) {
       return false;
     }
 
-    const messages = [...messageRows].reverse();
+    // Combine: previous context (chronological) + today's messages
+    const contextMsgs = prevMessages ? [...prevMessages].reverse() : [];
+    const messages = [...contextMsgs, ...dayMessages];
 
     const { data: contact } = await supabase
       .from('contacts_crm')
@@ -206,7 +224,10 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
       .maybeSingle();
 
     const responseTimeCtx = await getResponseTimeContext(sessionId, remoteJid);
-    const dialogText = formatDialogForAI(messages, contact, responseTimeCtx);
+    const contextNote = contextMsgs.length > 0
+      ? `[Контекст: ${contextMsgs.length} сообщений из предыдущих дней для понимания истории диалога. Анализируй в первую очередь сообщения за ${analysisDate}.]\n`
+      : '';
+    const dialogText = contextNote + formatDialogForAI(messages, contact, responseTimeCtx);
     const analysis = await callClaude(dialogText);
 
     if (!analysis) {
@@ -231,7 +252,7 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
       action_suggestion: analysis.action_suggestion || null,
       confidence: Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : 0,
       analyzed_at: new Date().toISOString(),
-      message_count_analyzed: messages.length,
+      message_count_analyzed: dayMessages.length,
       customer_type: analysis.customer_type || 'unknown',
       consultation_score: Number.isFinite(Number(cq.score)) ? Number(cq.score) : null,
       consultation_details: {
@@ -243,19 +264,9 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
       manager_issues: Array.isArray(analysis.manager_issues) ? analysis.manager_issues : [],
     };
 
-    // Try with analysis_date (new schema)
-    let { error: saveError } = await supabase
+    const { error: saveError } = await supabase
       .from('chat_ai')
       .upsert(row, { onConflict: 'dialog_session_id,analysis_date' });
-
-    // Fallback: old schema without analysis_date column
-    if (saveError && (saveError.message?.includes('analysis_date') || saveError.message?.includes('column'))) {
-      const { analysis_date, ...fallbackRow } = row;
-      const result = await supabase
-        .from('chat_ai')
-        .upsert(fallbackRow, { onConflict: 'dialog_session_id' });
-      saveError = result.error;
-    }
 
     if (saveError) {
       logger.error({ err: saveError, dialogSessionId }, 'Failed to save AI analysis');
