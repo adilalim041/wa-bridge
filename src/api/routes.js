@@ -914,6 +914,7 @@ export function setupRoutes(app) {
   router.post('/sessions/:sessionId/chats/:phone/read-all', async (req, res) => {
     const { sessionId } = req.params;
     const remoteJid = normalizeChatId(req.params.phone);
+    const stealth = req.query.stealth === 'true' || req.body?.stealth === true;
 
     if (!remoteJid) {
       return res.status(400).json({ error: 'phone is required' });
@@ -961,23 +962,27 @@ export function setupRoutes(app) {
         return res.status(500).json({ error: 'Failed to mark all messages as read' });
       }
 
-      const sock = sessionManager.getSession(sessionId)?.sock;
-      if (sock?.user && recentUnread?.length) {
-        try {
-          const jid = buildWhatsAppJid(remoteJid);
-          const keys = recentUnread.map((row) => ({
-            remoteJid: jid,
-            id: row.message_id,
-            participant: row.chat_type === 'group' && row.sender ? `${row.sender}@s.whatsapp.net` : undefined,
-          }));
+      // Stealth mode: update DB (reset unread in dashboard) but do NOT send WhatsApp read receipt
+      // This way the client never sees blue checkmarks
+      if (!stealth) {
+        const sock = sessionManager.getSession(sessionId)?.sock;
+        if (sock?.user && recentUnread?.length) {
+          try {
+            const jid = buildWhatsAppJid(remoteJid);
+            const keys = recentUnread.map((row) => ({
+              remoteJid: jid,
+              id: row.message_id,
+              participant: row.chat_type === 'group' && row.sender ? `${row.sender}@s.whatsapp.net` : undefined,
+            }));
 
-          await sock.readMessages(keys);
-        } catch (receiptError) {
-          logger.error({ err: receiptError, sessionId, remoteJid }, 'Failed to send bulk read receipt');
+            await sock.readMessages(keys);
+          } catch (receiptError) {
+            logger.error({ err: receiptError, sessionId, remoteJid }, 'Failed to send bulk read receipt');
+          }
         }
       }
 
-      return res.json({ success: true, readAt, updated: count || 0 });
+      return res.json({ success: true, readAt, updated: count || 0, stealth });
     } catch (error) {
       logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error marking all as read');
       return res.status(500).json({ error: 'Failed to mark all messages as read' });
