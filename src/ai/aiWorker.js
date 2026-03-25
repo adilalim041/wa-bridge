@@ -545,6 +545,109 @@ export async function backfillAutoTags() {
   }
 }
 
+// Lightweight: classify untagged chats by reading their messages directly
+const CLASSIFY_PROMPT = `Определи тип собеседника по переписке. Верни ТОЛЬКО JSON:
+{"customer_type": "одно из: end_client, designer, partner, contractor, colleague, personal, spam, unknown"}
+
+Правила:
+- end_client = покупает для себя/своего дома
+- designer = дизайнер интерьера, подбирает для клиента
+- partner = представитель магазина, оптовик, дилер
+- contractor = подрядчик, строитель
+- colleague = коллега, сотрудник компании
+- personal = личная переписка, друзья, родственники
+- spam = нерелевантное, бот, реклама
+- unknown = недостаточно данных
+
+Отвечай ТОЛЬКО JSON.`;
+
+export async function classifyUntaggedChats() {
+  if (!ANTHROPIC_API_KEY) return { success: false, error: 'No API key', classified: 0 };
+
+  try {
+    // Find chats with no AI auto-tags
+    const { data: chats } = await supabase
+      .from('chats')
+      .select('session_id, remote_jid, tags')
+      .order('updated_at', { ascending: false })
+      .limit(500);
+
+    if (!chats?.length) return { success: true, classified: 0 };
+
+    const untagged = chats.filter((c) => {
+      const tags = Array.isArray(c.tags) ? c.tags : [];
+      return !tags.some((t) => AI_AUTO_TAGS.has(t));
+    });
+
+    if (!untagged.length) return { success: true, classified: 0, message: 'All chats already tagged' };
+
+    let classified = 0;
+    let failed = 0;
+
+    for (const chat of untagged) {
+      // Get last 15 messages for classification
+      const { data: msgs } = await supabase
+        .from('messages')
+        .select('body, from_me, timestamp, message_type')
+        .eq('session_id', chat.session_id)
+        .eq('remote_jid', chat.remote_jid)
+        .order('timestamp', { ascending: false })
+        .limit(15);
+
+      if (!msgs?.length || msgs.length < 2) continue;
+
+      const reversed = [...msgs].reverse();
+      let text = '';
+      for (const m of reversed) {
+        const sender = m.from_me ? 'МЕНЕДЖЕР' : 'КЛИЕНТ';
+        text += `${sender}: ${m.body || `[${m.message_type || 'медиа'}]`}\n`;
+      }
+
+      try {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: AI_MODEL,
+            max_tokens: 100,
+            system: CLASSIFY_PROMPT,
+            messages: [{ role: 'user', content: text }],
+          }),
+        });
+
+        if (!response.ok) {
+          failed++;
+          if (response.status === 429) {
+            await new Promise((r) => setTimeout(r, 5000));
+          }
+          continue;
+        }
+
+        const data = await response.json();
+        const raw = (data.content?.[0]?.text || '').replace(/```json\s*|```\s*/g, '').trim();
+        const result = JSON.parse(raw);
+
+        if (result.customer_type && CUSTOMER_TYPE_TAG[result.customer_type]) {
+          await applyAutoTag(chat.session_id, chat.remote_jid, result.customer_type);
+          classified++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+
+    logger.info({ classified, failed, total: untagged.length }, 'Classify untagged chats complete');
+    return { success: true, classified, failed, total: untagged.length };
+  } catch (err) {
+    logger.error({ err }, 'classifyUntaggedChats failed');
+    return { success: false, error: err.message, classified: 0 };
+  }
+}
+
 // Schedule daily analysis at configured hour (Almaty time)
 function scheduleDailyRun() {
   const now = new Date(Date.now() + 5 * 60 * 60 * 1000); // Almaty UTC+5

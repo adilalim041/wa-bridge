@@ -3,7 +3,7 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
-import { runDailyAnalysis, isAnalysisRunning, backfillAutoTags } from '../ai/aiWorker.js';
+import { runDailyAnalysis, isAnalysisRunning, backfillAutoTags, classifyUntaggedChats } from '../ai/aiWorker.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { enqueueForAI } from '../ai/queueManager.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
@@ -208,6 +208,14 @@ export function setupRoutes(app) {
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
+  });
+
+  // Classify untagged chats using lightweight AI (no full analysis needed)
+  router.post('/ai/classify-chats', async (req, res) => {
+    res.json({ success: true, message: 'Classification started' });
+    classifyUntaggedChats().then((result) => {
+      logger.info(result, 'Classify untagged chats finished');
+    });
   });
 
   // Get list of dates that have analysis data
