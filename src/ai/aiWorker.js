@@ -20,7 +20,7 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
   "intent": "одно из: price_inquiry, complaint, availability, measurement_request, delivery, consultation, collaboration, small_talk, spam, other",
   "lead_temperature": "одно из: hot, warm, cold, dead",
   "lead_source": "одно из: instagram_ad, google_ad, word_of_mouth, repeat_client, designer_partner, showroom_visit, incoming_call, unknown",
-  "customer_type": "одно из: end_client, designer, partner, contractor, spam, unknown",
+  "customer_type": "одно из: end_client, designer, partner, contractor, colleague, personal, spam, unknown",
   "dialog_topic": "одно из: sink_sale, faucet_sale, complaint, service, consultation, partnership, other",
   "deal_stage": "одно из: first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused",
   "sentiment": "одно из: positive, neutral, negative, aggressive",
@@ -58,8 +58,10 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
 - designer = дизайнер интерьера, подбирает для клиента
 - partner = представитель магазина, оптовик, дилер
 - contractor = подрядчик, строитель
+- colleague = коллега, сотрудник компании, внутренняя переписка
+- personal = личная переписка, друзья, родственники, не по работе
 - spam = нерелевантное обращение, бот, реклама
-- unknown = недостаточно данных для определения
+- unknown = недостаточно данных для определения (слишком мало сообщений)
 
 Правила для consultation_quality:
 - score 0-100 на основе чек-листа из стандартов продаж
@@ -301,10 +303,99 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
       return false;
     }
 
+    // Auto-tag chat based on AI analysis
+    await applyAutoTag(sessionId, remoteJid, row.customer_type);
+
     return true;
   } catch (error) {
     logger.error({ err: error, dialogSessionId }, 'Unexpected error in AI processing');
     return false;
+  }
+}
+
+// Map AI customer_type → tag name (Russian)
+const CUSTOMER_TYPE_TAG = {
+  end_client: 'клиент',
+  designer: 'дизайнер',
+  partner: 'партнёр',
+  contractor: 'подрядчик',
+  colleague: 'коллега',
+  personal: 'личное',
+  spam: 'спам',
+  unknown: 'неизвестно',
+};
+
+const AI_AUTO_TAGS = new Set(Object.values(CUSTOMER_TYPE_TAG));
+
+async function applyAutoTag(sessionId, remoteJid, customerType) {
+  const newTag = CUSTOMER_TYPE_TAG[customerType];
+  if (!newTag) return;
+
+  try {
+    // Fetch current tags
+    const { data: chat } = await supabase
+      .from('chats')
+      .select('tags')
+      .eq('session_id', sessionId)
+      .eq('remote_jid', remoteJid)
+      .maybeSingle();
+
+    const existingTags = Array.isArray(chat?.tags) ? chat.tags : [];
+
+    // Remove any previous AI auto-tags, then add the new one
+    const manualTags = existingTags.filter((t) => !AI_AUTO_TAGS.has(t));
+    const merged = [...new Set([...manualTags, newTag])].slice(0, 10);
+
+    await supabase
+      .from('chats')
+      .upsert(
+        { session_id: sessionId, remote_jid: remoteJid, tags: merged, updated_at: new Date().toISOString() },
+        { onConflict: 'session_id,remote_jid' }
+      );
+  } catch (err) {
+    logger.warn({ err, sessionId, remoteJid }, 'Failed to apply auto-tag');
+  }
+}
+
+const REANALYSIS_MESSAGE_THRESHOLD = 10;
+
+// Re-analyze dialogs that were tagged "unknown" once enough new messages arrive
+async function findUnknownDialogsForReanalysis(analysisDate) {
+  try {
+    // Get dialogs last analyzed as "unknown"
+    const { data: unknowns } = await supabase
+      .from('chat_ai')
+      .select('dialog_session_id, session_id, remote_jid, message_count_analyzed')
+      .eq('customer_type', 'unknown')
+      .order('analyzed_at', { ascending: false })
+      .limit(200);
+
+    if (!unknowns?.length) return [];
+
+    const toReanalyze = [];
+
+    for (const row of unknowns) {
+      // Count current messages in the dialog session
+      const { count } = await supabase
+        .from('messages')
+        .select('message_id', { count: 'exact', head: true })
+        .eq('session_id', row.session_id)
+        .eq('remote_jid', row.remote_jid)
+        .gte('timestamp', `${analysisDate}T00:00:00+05:00`)
+        .lte('timestamp', `${analysisDate}T23:59:59+05:00`);
+
+      const totalNow = count || 0;
+      const prevAnalyzed = row.message_count_analyzed || 0;
+
+      if (totalNow >= prevAnalyzed + REANALYSIS_MESSAGE_THRESHOLD) {
+        toReanalyze.push(row);
+      }
+    }
+
+    return toReanalyze;
+  } catch (err) {
+    logger.warn({ err }, 'Failed to find unknown dialogs for re-analysis');
+    return [];
   }
 }
 
@@ -386,6 +477,18 @@ export async function runDailyAnalysis(date) {
       } else {
         failed++;
       }
+    }
+
+    // Re-analyze "unknown" customer_type dialogs that now have 10+ new messages
+    const unknowns = await findUnknownDialogsForReanalysis(analysisDate);
+    let reanalyzed = 0;
+    for (const row of unknowns) {
+      if (processed + failed + reanalyzed >= 500) break;
+      const ok = await analyzeDialogForDate(row.dialog_session_id, row.session_id, row.remote_jid, analysisDate);
+      if (ok) reanalyzed++;
+    }
+    if (reanalyzed > 0) {
+      logger.info({ reanalyzed }, 'Re-analyzed previously unknown dialogs');
     }
   } catch (error) {
     logger.error({ err: error }, 'Error during daily analysis');
