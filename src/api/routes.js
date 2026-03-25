@@ -3,7 +3,7 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
-import { runDailyAnalysis, isAnalysisRunning } from '../ai/aiWorker.js';
+import { runDailyAnalysis, isAnalysisRunning, backfillAutoTags } from '../ai/aiWorker.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { enqueueForAI } from '../ai/queueManager.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
@@ -198,6 +198,16 @@ export function setupRoutes(app) {
 
   router.get('/ai/analyze/status', (req, res) => {
     res.json({ running: isAnalysisRunning() });
+  });
+
+  // One-time backfill: apply auto-tags from existing AI analyses
+  router.post('/ai/backfill-tags', async (req, res) => {
+    try {
+      const result = await backfillAutoTags();
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   // Get list of dates that have analysis data

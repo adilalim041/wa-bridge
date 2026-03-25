@@ -506,6 +506,45 @@ export function isAnalysisRunning() {
   return isRunning;
 }
 
+// Backfill auto-tags for all existing analyses that don't have tags yet
+export async function backfillAutoTags() {
+  try {
+    // Get all unique (session_id, remote_jid, customer_type) from latest analyses
+    const { data: analyses, error } = await supabase
+      .from('chat_ai')
+      .select('session_id, remote_jid, customer_type')
+      .not('customer_type', 'is', null)
+      .order('analyzed_at', { ascending: false });
+
+    if (error || !analyses?.length) {
+      return { success: false, error: error?.message || 'No analyses found', tagged: 0 };
+    }
+
+    // Deduplicate — keep only the latest analysis per (session_id, remote_jid)
+    const seen = new Set();
+    const unique = [];
+    for (const row of analyses) {
+      const key = `${row.session_id}::${row.remote_jid}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(row);
+      }
+    }
+
+    let tagged = 0;
+    for (const row of unique) {
+      await applyAutoTag(row.session_id, row.remote_jid, row.customer_type);
+      tagged++;
+    }
+
+    logger.info({ tagged }, 'Backfill auto-tags complete');
+    return { success: true, tagged };
+  } catch (err) {
+    logger.error({ err }, 'Backfill auto-tags failed');
+    return { success: false, error: err.message, tagged: 0 };
+  }
+}
+
 // Schedule daily analysis at configured hour (Almaty time)
 function scheduleDailyRun() {
   const now = new Date(Date.now() + 5 * 60 * 60 * 1000); // Almaty UTC+5
