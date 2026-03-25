@@ -1,6 +1,60 @@
 import { logger } from '../config.js';
 import { supabase } from './supabase.js';
 
+// --- Failover queue for Supabase outages ---
+const MAX_QUEUE_SIZE = 1000;
+const FLUSH_INTERVAL_MS = 10_000;
+const FLUSH_BATCH_SIZE = 50;
+const failoverQueue = [];
+let flushTimer = null;
+
+function startFlushTimer() {
+  if (flushTimer) return;
+  flushTimer = setInterval(flushQueue, FLUSH_INTERVAL_MS);
+}
+
+async function flushQueue() {
+  if (failoverQueue.length === 0) {
+    if (flushTimer) {
+      clearInterval(flushTimer);
+      flushTimer = null;
+    }
+    return;
+  }
+
+  const batch = failoverQueue.splice(0, FLUSH_BATCH_SIZE);
+  const retryLater = [];
+
+  for (const row of batch) {
+    try {
+      const { error } = await supabase.from('messages').upsert(row, {
+        onConflict: 'message_id,session_id',
+        ignoreDuplicates: true,
+      });
+      if (error) retryLater.push(row);
+    } catch {
+      retryLater.push(row);
+    }
+  }
+
+  if (retryLater.length > 0) {
+    failoverQueue.unshift(...retryLater);
+    logger.warn({ queueSize: failoverQueue.length, failedBatch: retryLater.length }, 'Failover queue: some messages still failing');
+  } else {
+    logger.info({ flushed: batch.length, remaining: failoverQueue.length }, 'Failover queue: batch flushed');
+  }
+}
+
+export function getQueueStats() {
+  return { size: failoverQueue.length, maxSize: MAX_QUEUE_SIZE, timerActive: flushTimer !== null };
+}
+
+export async function flushQueueOnShutdown() {
+  if (failoverQueue.length === 0) return;
+  logger.info({ queueSize: failoverQueue.length }, 'Flushing failover queue on shutdown...');
+  await flushQueue();
+}
+
 export async function saveMessage(data) {
   const MAX_RETRIES = 3;
   const row = {
@@ -50,7 +104,14 @@ export async function saveMessage(data) {
     }
   }
 
-  logger.error({ messageId: data.messageId }, 'CRITICAL: Message lost after all retry attempts');
+  // All retries exhausted — queue for later flush instead of losing
+  if (failoverQueue.length >= MAX_QUEUE_SIZE) {
+    const dropped = failoverQueue.shift();
+    logger.warn({ droppedMessageId: dropped.message_id }, 'Failover queue full, dropping oldest message');
+  }
+  failoverQueue.push(row);
+  startFlushTimer();
+  logger.warn({ messageId: data.messageId, queueSize: failoverQueue.length }, 'Message queued for retry (Supabase outage)');
 }
 
 export async function upsertChat({

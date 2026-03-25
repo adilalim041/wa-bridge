@@ -71,9 +71,16 @@ export function getConnectionState(sessionId) {
   return connectionStates.get(sessionId) || { ...DEFAULT_STATE };
 }
 
-export async function startConnection({ sessionId, onSocket }) {
+export async function startConnection({ sessionId, onSocket, _prevSock }) {
   if (!sessionId) {
     throw new Error('sessionId is required');
+  }
+
+  // Clean up old socket listeners to prevent accumulation on reconnect
+  if (_prevSock?.ev) {
+    for (const event of ['connection.update', 'creds.update', 'messages.upsert', 'messaging-history.set', 'messages.update']) {
+      _prevSock.ev.removeAllListeners(event);
+    }
   }
 
   if (!activeSessions.has(sessionId)) {
@@ -227,7 +234,7 @@ export async function startConnection({ sessionId, onSocket }) {
             return;
           }
 
-          startConnection({ sessionId, onSocket }).catch((error) => {
+          startConnection({ sessionId, onSocket, _prevSock: sock }).catch((error) => {
             logger.error({ err: error, sessionId }, 'Failed to restart WhatsApp connection');
           });
         }, 3000);
@@ -251,7 +258,7 @@ export async function startConnection({ sessionId, onSocket }) {
           return;
         }
 
-        startConnection({ sessionId, onSocket }).catch((error) => {
+        startConnection({ sessionId, onSocket, _prevSock: sock }).catch((error) => {
           console.error(`[${sessionId}] Failed to reconnect:`, error.message);
         });
       }, delay);

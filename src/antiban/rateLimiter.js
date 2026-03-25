@@ -77,3 +77,7 @@ export function getRateLimiter(sessionId) {
 
   return limiters.get(sessionId);
 }
+
+export function removeRateLimiter(sessionId) {
+  limiters.delete(sessionId);
+}

@@ -12,7 +12,7 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats } from '../storage/queries.js';
 
 const CYRILLIC_MAP = {
   а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
@@ -582,6 +582,7 @@ export function setupRoutes(app) {
       status: 'ok',
       sessions,
       uptime: process.uptime(),
+      messageQueue: getQueueStats(),
     });
   });
 

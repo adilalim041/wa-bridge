@@ -1,4 +1,6 @@
 import { supabase } from '../storage/supabase.js';
+import { flushQueueOnShutdown } from '../storage/queries.js';
+import { removeRateLimiter } from '../antiban/rateLimiter.js';
 import { stopHealthMonitor } from '../monitor.js';
 import { acquireLock, releaseLock, startHeartbeat, stopHeartbeat } from '../storage/sessionLock.js';
 import { stopVersionChecker } from '../versionChecker.js';
@@ -23,14 +25,6 @@ async function updateSessionPhone(sessionId, sock) {
       updated_at: new Date().toISOString(),
     })
     .eq('session_id', sessionId);
-}
-
-function bindSocketMetadataUpdates(sessionId, sock) {
-  sock.ev.on('connection.update', async ({ connection }) => {
-    if (connection === 'open') {
-      await updateSessionPhone(sessionId, sock);
-    }
-  });
 }
 
 class SessionManager {
@@ -101,7 +95,6 @@ class SessionManager {
           const currentEntry = this.sessions.get(sessionId);
           if (currentEntry) {
             currentEntry.sock = newSock;
-            bindSocketMetadataUpdates(sessionId, newSock);
           }
         },
       });
@@ -134,6 +127,7 @@ class SessionManager {
     stopHealthMonitor(sessionId);
     stopVersionChecker(sessionId);
     stopHeartbeat(sessionId);
+    removeRateLimiter(sessionId);
     await releaseLock(sessionId);
     clearConnectionState(sessionId);
     this.sessions.delete(sessionId);
@@ -144,6 +138,7 @@ class SessionManager {
     for (const sessionId of sessionIds) {
       await this.stopSession(sessionId);
     }
+    await flushQueueOnShutdown();
   }
 
   getSession(sessionId) {
