@@ -87,9 +87,15 @@ export function emitSessionStatus(sessionId, status) {
   });
 
   for (const ws of wss.clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(payload);
+    if (ws.readyState !== WebSocket.OPEN) {
+      continue;
     }
+
+    if (ws.subscribedSessions && !ws.subscribedSessions.has(sessionId)) {
+      continue;
+    }
+
+    ws.send(payload);
   }
 }
 

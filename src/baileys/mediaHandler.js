@@ -33,10 +33,11 @@ function getMediaDescriptor(msg) {
     };
   }
 
-  if (msg.audioMessage) {
+  if (msg.audioMessage || msg.pttMessage) {
+    const audio = msg.audioMessage || msg.pttMessage;
     return {
       mediaType: 'audio',
-      mimeType: msg.audioMessage.mimetype || 'audio/ogg',
+      mimeType: audio.mimetype || 'audio/ogg; codecs=opus',
       fileName: null,
       resourceType: 'video',
     };

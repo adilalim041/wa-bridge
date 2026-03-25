@@ -232,7 +232,7 @@ function getMessageType(msg) {
     return 'video';
   }
 
-  if (msg.audioMessage) {
+  if (msg.audioMessage || msg.pttMessage) {
     return 'audio';
   }
 
@@ -288,7 +288,7 @@ function extractBody(msg) {
     return '[video]';
   }
 
-  if (msg.audioMessage) {
+  if (msg.audioMessage || msg.pttMessage) {
     return '[audio]';
   }
 
