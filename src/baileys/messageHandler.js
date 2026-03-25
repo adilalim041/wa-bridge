@@ -171,13 +171,15 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
     logger.debug({ remoteJid, sessionId }, 'Unresolvable LID — skipping message');
     return null;
   }
+  const isGroup = remoteJid.endsWith('@g.us');
   const cleaned = remoteJid
     .replace('@s.whatsapp.net', '')
     .replace('@g.us', '');
 
-  // Final safety: reject numbers that look like LIDs (>13 digits, non-numeric)
-  if (!cleaned.includes('-') && cleaned.length > 13) {
-    logger.debug({ remoteJid, cleaned, sessionId }, 'Rejected oversized JID as potential LID');
+  // Final safety: reject individual (non-group) JIDs >13 digits as potential LIDs
+  // Group IDs are always long (18+ digits) — that's normal, don't filter them
+  if (!isGroup && cleaned.length > 13) {
+    logger.debug({ remoteJid, cleaned, sessionId }, 'Rejected oversized non-group JID as potential LID');
     return null;
   }
 
