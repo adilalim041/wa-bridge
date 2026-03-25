@@ -141,7 +141,7 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
         if (pnJid) {
           // pnJid format: "77014135151:0@s.whatsapp.net" → extract phone
           const phone = pnJid.split(':')[0].split('@')[0];
-          if (phone && phone.length >= 7 && phone.length <= 15) {
+          if (phone && phone.length >= 7 && phone.length <= 13 && /^\d+$/.test(phone)) {
             return phone;
           }
         }
@@ -161,7 +161,7 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
         .single();
       if (data?.value) {
         const phone = JSON.parse(data.value);
-        if (phone && String(phone).length >= 7 && String(phone).length <= 15) {
+        if (phone && String(phone).length >= 7 && String(phone).length <= 13 && /^\d+$/.test(String(phone))) {
           return phone;
         }
       }
@@ -171,9 +171,17 @@ async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
     logger.debug({ remoteJid, sessionId }, 'Unresolvable LID — skipping message');
     return null;
   }
-  return remoteJid
+  const cleaned = remoteJid
     .replace('@s.whatsapp.net', '')
     .replace('@g.us', '');
+
+  // Final safety: reject numbers that look like LIDs (>13 digits, non-numeric)
+  if (!cleaned.includes('-') && cleaned.length > 13) {
+    logger.debug({ remoteJid, cleaned, sessionId }, 'Rejected oversized JID as potential LID');
+    return null;
+  }
+
+  return cleaned;
 }
 
 async function normalizeParticipant(participant = '', sock = null, sessionId = '') {
