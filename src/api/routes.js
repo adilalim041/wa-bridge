@@ -344,7 +344,10 @@ export function setupRoutes(app) {
         aiQuery = aiQuery.gte('analysis_date', dateFrom);
         if (dateTo) aiQuery = aiQuery.lte('analysis_date', dateTo);
       } else {
-        aiQuery = aiQuery.gte('analyzed_at', since);
+        // Convert days to date string for analysis_date filter
+        const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000 + 5 * 3600000);
+        const sinceDateStr = sinceDate.toISOString().slice(0, 10);
+        aiQuery = aiQuery.gte('analysis_date', sinceDateStr);
       }
 
       const { data: aiData } = await sessionFilter(aiQuery);
