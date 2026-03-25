@@ -8,6 +8,40 @@ const cloudinaryConfigured = Boolean(
 );
 let hasLoggedMissingCloudinaryConfig = false;
 
+// Circuit breaker: stop trying Cloudinary if it fails repeatedly
+const circuitBreaker = {
+  failures: 0,
+  lastFailure: 0,
+  openUntil: 0, // timestamp when circuit closes again
+  THRESHOLD: 3, // failures within window to trip
+  WINDOW_MS: 60_000, // 1 minute window
+  COOLDOWN_MS: 5 * 60_000, // 5 minutes cooldown
+  isOpen() {
+    if (Date.now() < this.openUntil) return true;
+    // Reset if cooldown passed
+    if (this.openUntil > 0 && Date.now() >= this.openUntil) {
+      this.failures = 0;
+      this.openUntil = 0;
+    }
+    return false;
+  },
+  recordFailure() {
+    const now = Date.now();
+    // Reset counter if last failure was outside window
+    if (now - this.lastFailure > this.WINDOW_MS) this.failures = 0;
+    this.failures++;
+    this.lastFailure = now;
+    if (this.failures >= this.THRESHOLD) {
+      this.openUntil = now + this.COOLDOWN_MS;
+      logger.warn(`Cloudinary circuit breaker OPEN — skipping uploads for 5 minutes (${this.failures} failures)`);
+    }
+  },
+  recordSuccess() {
+    this.failures = 0;
+    this.openUntil = 0;
+  },
+};
+
 cloudinary.config({
   cloud_name: config.cloudinaryCloudName,
   api_key: config.cloudinaryApiKey,
@@ -74,6 +108,11 @@ export async function processMedia(message, sessionId) {
       return null;
     }
 
+    if (circuitBreaker.isOpen()) {
+      logger.debug({ sessionId }, 'Cloudinary circuit breaker open — skipping upload');
+      return null;
+    }
+
     const descriptor = getMediaDescriptor(message?.message);
     if (!descriptor) {
       return null;
@@ -94,6 +133,7 @@ export async function processMedia(message, sessionId) {
           folder,
           public_id: publicId,
           resource_type: descriptor.resourceType,
+          timeout: 30000,
         },
         (error, uploadResult) => {
           if (error) {
@@ -108,6 +148,8 @@ export async function processMedia(message, sessionId) {
       Readable.from(buffer).pipe(uploadStream);
     });
 
+    circuitBreaker.recordSuccess();
+
     return {
       url: result.secure_url,
       publicId: result.public_id,
@@ -117,6 +159,7 @@ export async function processMedia(message, sessionId) {
       fileName: descriptor.fileName,
     };
   } catch (error) {
+    circuitBreaker.recordFailure();
     logger.error({ err: error, sessionId, messageId: message?.key?.id }, 'Failed to process media');
     return null;
   }

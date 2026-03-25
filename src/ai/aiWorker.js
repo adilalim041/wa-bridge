@@ -97,36 +97,58 @@ async function callClaude(messages) {
     return null;
   }
 
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: AI_MODEL,
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: messages }],
-      }),
-    });
+  const MAX_RETRIES = 2;
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      logger.error({ status: response.status, body: errorText }, 'Claude API error');
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: AI_MODEL,
+          max_tokens: 1024,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: messages }],
+        }),
+      });
+
+      if (!response.ok) {
+        const status = response.status;
+        const errorText = await response.text();
+
+        // Retry on rate limit (429) or server overload (529/503)
+        if ((status === 429 || status === 529 || status === 503) && attempt < MAX_RETRIES) {
+          const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
+          const delay = Math.max(retryAfter * 1000, 3000 * (attempt + 1));
+          logger.warn({ status, attempt, delay }, `Claude API ${status} — retrying in ${delay}ms`);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+
+        logger.error({ status, body: errorText }, 'Claude API error');
+        return null;
+      }
+
+      const data = await response.json();
+      const text = data.content?.[0]?.text || '';
+      const clean = text.replace(/```json\s*|```\s*/g, '').trim();
+      return JSON.parse(clean);
+    } catch (error) {
+      if (attempt < MAX_RETRIES) {
+        logger.warn({ err: error, attempt }, 'Claude API network error — retrying');
+        await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
+        continue;
+      }
+      logger.error({ err: error }, 'Failed to call Claude API after retries');
       return null;
     }
-
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '';
-    const clean = text.replace(/```json\s*|```\s*/g, '').trim();
-    return JSON.parse(clean);
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to call Claude API');
-    return null;
   }
+
+  return null;
 }
 
 async function getResponseTimeContext(sessionId, remoteJid) {
