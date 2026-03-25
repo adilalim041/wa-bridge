@@ -346,9 +346,9 @@ export async function runDailyAnalysis(date) {
         continue;
       }
 
-      // Safety limit
-      if (processed + failed >= 100) {
-        logger.warn('Daily analysis hit safety limit of 100');
+      // Safety limit — 500 per run (enough for 8 sessions × ~60 dialogs each)
+      if (processed + failed >= 500) {
+        logger.warn('Daily analysis hit safety limit of 500');
         break;
       }
 

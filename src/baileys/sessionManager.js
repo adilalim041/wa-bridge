@@ -56,11 +56,18 @@ class SessionManager {
       return;
     }
 
-    console.log(`Starting ${configs.length} session(s)...`);
+    console.log(`Starting ${configs.length} session(s) with staggered delay...`);
 
-    for (const session of configs) {
+    for (let i = 0; i < configs.length; i++) {
+      const session = configs[i];
       try {
         await this.startSession(session.session_id);
+        // Stagger sessions: 3-5 second random delay between each startup
+        if (i < configs.length - 1) {
+          const delay = 3000 + Math.floor(Math.random() * 2000);
+          console.log(`  Waiting ${(delay / 1000).toFixed(1)}s before next session...`);
+          await new Promise((r) => setTimeout(r, delay));
+        }
       } catch (error) {
         console.error(`Failed to start session ${session.session_id}:`, error.message);
       }

@@ -1,4 +1,5 @@
 import express from 'express';
+import helmet from 'helmet';
 import { createServer } from 'http';
 import rateLimit from 'express-rate-limit';
 import { config, logger } from '../config.js';
@@ -8,6 +9,12 @@ import { setupWebSocket } from './websocket.js';
 export function startServer() {
     const app = express();
     const httpServer = createServer(app);
+
+    // Security headers
+    app.use(helmet({
+        contentSecurityPolicy: false, // frontend handles this
+        crossOriginEmbedderPolicy: false, // allow cross-origin resources
+    }));
 
     app.use(express.json({ limit: '1mb' }));
 
@@ -44,6 +51,13 @@ export function startServer() {
         windowMs: 15 * 60 * 1000,
         max: 10,
         message: { error: 'Too many admin requests, try again later' },
+    }));
+
+    // AI chat rate limit — 20 per 15 min to protect Claude API credits
+    app.use('/ai/chat', rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 20,
+        message: { error: 'AI chat rate limit reached. Try again in a few minutes.' },
     }));
 
     // API key auth — always required, skip only health & ws

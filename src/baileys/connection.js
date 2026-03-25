@@ -95,7 +95,11 @@ export async function startConnection({ sessionId, onSocket }) {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['Omoikiri CRM', 'Desktop', '1.0'],
+    browser: [
+      ['Chrome', 'Firefox', 'Safari', 'Edge', 'Opera'][Math.floor(Math.random() * 5)],
+      'Desktop',
+      `${10 + Math.floor(Math.random() * 10)}.${Math.floor(Math.random() * 10)}.${Math.floor(Math.random() * 5000)}`,
+    ],
     version: waVersion,
     syncFullHistory: true,
     fireInitQueries: true,
