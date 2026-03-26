@@ -593,6 +593,7 @@ export async function classifyUntaggedChats() {
     let classified = 0;
     let failed = 0;
     let skippedFewMsgs = 0;
+    let firstError = null;
 
     for (const chat of untagged) {
       // Get last 15 messages for classification
@@ -641,6 +642,7 @@ export async function classifyUntaggedChats() {
         if (!response.ok) {
           const errText = await response.text();
           logger.warn({ status: response.status, errText, jid: chat.remote_jid }, 'classify: AI call failed');
+          if (!firstError) firstError = { status: response.status, body: errText.slice(0, 200) };
           failed++;
           if (response.status === 429) {
             await new Promise((r) => setTimeout(r, 5000));
@@ -659,12 +661,13 @@ export async function classifyUntaggedChats() {
         }
       } catch (classifyErr) {
         logger.warn({ err: classifyErr.message, jid: chat.remote_jid }, 'classify: error');
+        if (!firstError) firstError = { parseError: classifyErr.message };
         failed++;
       }
     }
 
     logger.info({ classified, failed, skippedFewMsgs, total: untagged.length }, 'Classify untagged chats complete');
-    return { success: true, classified, failed, skippedFewMsgs, total: untagged.length };
+    return { success: true, classified, failed, skippedFewMsgs, total: untagged.length, firstError };
   } catch (err) {
     logger.error({ err }, 'classifyUntaggedChats failed');
     return { success: false, error: err.message, classified: 0 };
