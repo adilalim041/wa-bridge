@@ -67,6 +67,17 @@ function buildWhatsAppJid(remoteJid) {
   return remoteJid.includes('-') ? `${remoteJid}@g.us` : `${remoteJid}@s.whatsapp.net`;
 }
 
+/**
+ * Check if a remote_jid represents a real phone contact (not LID, not group).
+ * Real phone numbers: 7-13 digits. LIDs: 14+ digits. Groups contain '-'.
+ */
+function isRealPhoneJid(jid) {
+  if (!jid) return false;
+  if (jid.includes('@g.us') || jid.includes('@lid') || jid.includes('-')) return false;
+  const digits = jid.replace(/@.*$/, '').replace(/\D/g, '');
+  return digits.length >= 7 && digits.length <= 13;
+}
+
 // Filter out garbage LID JIDs (too short or too long numeric IDs)
 function isGarbageJid(jid) {
   if (!jid || typeof jid !== 'string') return true;
@@ -1302,13 +1313,11 @@ export function setupRoutes(app) {
       const { data: analyses, error: aiErr } = await query;
       if (aiErr) throw aiErr;
 
-      // Keep only latest analysis per remote_jid, skip LIDs and groups
+      // Keep only latest analysis per real phone contact (skip LIDs, groups)
       const latestByJid = new Map();
       for (const row of analyses || []) {
         const key = row.remote_jid;
-        // Skip LID jids (>15 digit numbers) and groups
-        const digits = key.replace(/@.*$/, '');
-        if (digits.length > 15 || key.includes('@g.us') || key.includes('@lid')) continue;
+        if (!isRealPhoneJid(key)) continue;
         if (!latestByJid.has(key) || row.analysis_date > latestByJid.get(key).analysis_date) {
           latestByJid.set(key, row);
         }
@@ -1340,18 +1349,48 @@ export function setupRoutes(app) {
         if (!chatMap.has(c.remote_jid)) chatMap.set(c.remote_jid, c);
       }
 
+      // Fetch push_name from messages for contacts without display_name
+      const jidsNeedingName = jids.filter((jid) => {
+        const crm = crmMap.get(jid);
+        const chat = chatMap.get(jid);
+        return !crm && !chat?.display_name;
+      });
+      const pushNameMap = new Map();
+      if (jidsNeedingName.length) {
+        // Get latest push_name for each jid (from incoming messages)
+        for (let i = 0; i < jidsNeedingName.length; i += 50) {
+          const batch = jidsNeedingName.slice(i, i + 50);
+          const { data: msgs } = await supabase
+            .from('messages')
+            .select('remote_jid, push_name')
+            .in('remote_jid', batch)
+            .eq('from_me', false)
+            .not('push_name', 'is', null)
+            .order('timestamp', { ascending: false })
+            .limit(batch.length);
+          for (const m of msgs || []) {
+            if (m.push_name && !pushNameMap.has(m.remote_jid)) {
+              pushNameMap.set(m.remote_jid, m.push_name);
+            }
+          }
+        }
+      }
+
       // Build contacts with stages
       const contacts = [];
       for (const [jid, ai] of latestByJid) {
         const crm = crmMap.get(jid);
         const chat = chatMap.get(jid);
         const phone = jid.replace(/@s\.whatsapp\.net$/, '');
+        const name = crm
+          ? `${crm.first_name} ${crm.last_name || ''}`.trim()
+          : (chat?.display_name || pushNameMap.get(jid) || phone);
 
         contacts.push({
           remoteJid: jid,
           phone,
           sessionId: ai.session_id,
-          displayName: crm ? `${crm.first_name} ${crm.last_name || ''}`.trim() : (chat?.display_name || phone),
+          displayName: name,
           dealStage: ai.deal_stage || 'first_contact',
           customerType: ai.customer_type,
           leadTemperature: ai.lead_temperature,
