@@ -12,7 +12,7 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages } from '../storage/queries.js';
 
 const CYRILLIC_MAP = {
   а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
@@ -910,6 +910,32 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, sessionId, phone }, 'Failed to fetch messages');
       return res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+  });
+
+  // Cross-session: find all sessions where this contact exists
+  router.get('/contacts/:phone/linked-sessions', async (req, res) => {
+    const phone = normalizeChatId(req.params.phone);
+    try {
+      const sessions = await getLinkedSessions(phone);
+      return res.json(sessions);
+    } catch (error) {
+      logger.error({ err: error, phone }, 'Failed to fetch linked sessions');
+      return res.status(500).json({ error: 'Failed to fetch linked sessions' });
+    }
+  });
+
+  // Cross-session: get unified messages from ALL sessions for one contact
+  router.get('/contacts/:phone/unified-messages', async (req, res) => {
+    const phone = normalizeChatId(req.params.phone);
+    const limit = Number.parseInt(req.query.limit, 10) || 50;
+    const offset = Number.parseInt(req.query.offset, 10) || 0;
+    try {
+      const messages = await getUnifiedMessages(phone, limit, offset);
+      return res.json(messages);
+    } catch (error) {
+      logger.error({ err: error, phone }, 'Failed to fetch unified messages');
+      return res.status(500).json({ error: 'Failed to fetch unified messages' });
     }
   });
 

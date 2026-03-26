@@ -242,6 +242,66 @@ export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0) 
   }
 }
 
+// Find all sessions where this contact exists
+export async function getLinkedSessions(remoteJid) {
+  try {
+    const { data, error } = await supabase
+      .from('chats')
+      .select('session_id, display_name, last_message_at, tags')
+      .eq('remote_jid', remoteJid);
+
+    if (error) {
+      logger.error({ err: error, remoteJid }, 'Failed to fetch linked sessions');
+      return [];
+    }
+
+    if (!data?.length) return [];
+
+    // Enrich with session display names
+    const sessionIds = [...new Set(data.map((c) => c.session_id))];
+    const { data: configs } = await supabase
+      .from('session_config')
+      .select('session_id, display_name')
+      .in('session_id', sessionIds);
+
+    const configMap = {};
+    for (const c of configs || []) configMap[c.session_id] = c.display_name;
+
+    return data.map((c) => ({
+      sessionId: c.session_id,
+      sessionName: configMap[c.session_id] || c.session_id,
+      lastMessageAt: c.last_message_at,
+      contactName: c.display_name,
+      tags: c.tags || [],
+    }));
+  } catch (error) {
+    logger.error({ err: error, remoteJid }, 'Unexpected error in getLinkedSessions');
+    return [];
+  }
+}
+
+// Get messages from ALL sessions for one contact, sorted chronologically
+export async function getUnifiedMessages(remoteJid, limit = 50, offset = 0) {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('remote_jid', remoteJid)
+      .order('timestamp', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      logger.error({ err: error, remoteJid }, 'Failed to fetch unified messages');
+      return [];
+    }
+
+    return data ?? [];
+  } catch (error) {
+    logger.error({ err: error, remoteJid }, 'Unexpected error in getUnifiedMessages');
+    return [];
+  }
+}
+
 export async function getContacts(sessionId) {
   try {
     const { data, error } = await supabase
