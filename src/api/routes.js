@@ -1284,6 +1284,141 @@ export function setupRoutes(app) {
     }
   });
 
+  // ── CRM Funnel ───────────────────────────────────────────────────────
+  // Returns contacts grouped by deal stage (latest AI analysis per chat)
+  router.get('/crm/funnel', async (req, res) => {
+    const sessionId = req.query.session_id;
+    try {
+      // Get latest deal_stage per remote_jid from chat_ai
+      let query = supabase
+        .from('chat_ai')
+        .select('session_id, remote_jid, deal_stage, customer_type, lead_temperature, analysis_date, sentiment')
+        .order('analysis_date', { ascending: false });
+
+      if (sessionId && sessionId !== '__all__') {
+        query = query.eq('session_id', sessionId);
+      }
+
+      const { data: analyses, error: aiErr } = await query;
+      if (aiErr) throw aiErr;
+
+      // Keep only latest analysis per remote_jid (across sessions if __all__)
+      const latestByJid = new Map();
+      for (const row of analyses || []) {
+        const key = row.remote_jid;
+        if (!latestByJid.has(key) || row.analysis_date > latestByJid.get(key).analysis_date) {
+          latestByJid.set(key, row);
+        }
+      }
+
+      // Get CRM contact info and chat display names
+      const jids = [...latestByJid.keys()];
+      if (!jids.length) return res.json({ stages: {}, contacts: [] });
+
+      // Fetch CRM data
+      let crmQuery = supabase.from('contacts_crm').select('*');
+      if (sessionId && sessionId !== '__all__') {
+        crmQuery = crmQuery.eq('session_id', sessionId);
+      }
+      const { data: crmContacts } = await crmQuery;
+      const crmMap = new Map();
+      for (const c of crmContacts || []) {
+        crmMap.set(c.remote_jid, c);
+      }
+
+      // Fetch chat display names
+      let chatQuery = supabase.from('chats').select('session_id, remote_jid, display_name, tags, last_message_body, last_message_timestamp');
+      if (sessionId && sessionId !== '__all__') {
+        chatQuery = chatQuery.eq('session_id', sessionId);
+      }
+      const { data: chatRows } = await chatQuery;
+      const chatMap = new Map();
+      for (const c of chatRows || []) {
+        if (!chatMap.has(c.remote_jid)) chatMap.set(c.remote_jid, c);
+      }
+
+      // Build contacts with stages
+      const contacts = [];
+      for (const [jid, ai] of latestByJid) {
+        const crm = crmMap.get(jid);
+        const chat = chatMap.get(jid);
+        const phone = jid.replace(/@s\.whatsapp\.net$/, '');
+
+        contacts.push({
+          remoteJid: jid,
+          phone,
+          sessionId: ai.session_id,
+          displayName: crm ? `${crm.first_name} ${crm.last_name || ''}`.trim() : (chat?.display_name || phone),
+          dealStage: ai.deal_stage || 'first_contact',
+          customerType: ai.customer_type,
+          leadTemperature: ai.lead_temperature,
+          sentiment: ai.sentiment,
+          analysisDate: ai.analysis_date,
+          lastMessage: chat?.last_message_body,
+          lastMessageAt: chat?.last_message_timestamp,
+          avatarUrl: crm?.avatar_url,
+          city: crm?.city,
+          company: crm?.company,
+          tags: chat?.tags || [],
+        });
+      }
+
+      // Group by stage
+      const stages = {};
+      const STAGE_ORDER = ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+      for (const s of STAGE_ORDER) stages[s] = [];
+      for (const c of contacts) {
+        const stage = stages[c.dealStage] ? c.dealStage : 'first_contact';
+        stages[stage].push(c);
+      }
+
+      return res.json({ stages, total: contacts.length });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to fetch CRM funnel');
+      return res.status(500).json({ error: 'Failed to fetch funnel data' });
+    }
+  });
+
+  // Update deal stage manually
+  router.post('/crm/deal-stage', async (req, res) => {
+    const { sessionId, remoteJid, dealStage } = req.body || {};
+    const VALID_STAGES = ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+
+    if (!sessionId || !remoteJid || !VALID_STAGES.includes(dealStage)) {
+      return res.status(400).json({ error: 'sessionId, remoteJid, and valid dealStage required' });
+    }
+
+    try {
+      // Update the latest chat_ai record for this contact
+      const { data: latest } = await supabase
+        .from('chat_ai')
+        .select('id')
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid)
+        .order('analysis_date', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latest) {
+        await supabase.from('chat_ai').update({ deal_stage: dealStage }).eq('id', latest.id);
+      } else {
+        // No AI analysis yet — create a minimal record
+        await supabase.from('chat_ai').insert({
+          session_id: sessionId,
+          remote_jid: remoteJid,
+          deal_stage: dealStage,
+          analysis_date: new Date().toISOString().slice(0, 10),
+          customer_type: 'unknown',
+        });
+      }
+
+      return res.json({ success: true });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to update deal stage');
+      return res.status(500).json({ error: 'Failed to update deal stage' });
+    }
+  });
+
   router.get('/sessions/:sessionId/contacts', async (req, res) => {
     const { sessionId } = req.params;
     try {
