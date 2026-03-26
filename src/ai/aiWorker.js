@@ -333,24 +333,27 @@ async function applyAutoTag(sessionId, remoteJid, customerType) {
   if (!newTag) return;
 
   try {
-    // Fetch current tags
     const { data: chat } = await supabase
       .from('chats')
-      .select('tags')
+      .select('tags, ai_tag')
       .eq('session_id', sessionId)
       .eq('remote_jid', remoteJid)
       .maybeSingle();
 
     const existingTags = Array.isArray(chat?.tags) ? chat.tags : [];
 
-    // Remove any previous AI auto-tags, then add the new one
-    const manualTags = existingTags.filter((t) => !AI_AUTO_TAGS.has(t));
-    const merged = [...new Set([...manualTags, newTag])].slice(0, 10);
+    // If user manually set an AI-category tag, don't override it
+    const hasManualOverride = existingTags.some((t) => AI_AUTO_TAGS.has(t)) && chat?.ai_tag && chat.ai_tag !== existingTags.find((t) => AI_AUTO_TAGS.has(t));
+
+    // Remove previous AI auto-tag, add new one (unless manually overridden)
+    const withoutAiTags = existingTags.filter((t) => !AI_AUTO_TAGS.has(t));
+    const finalTag = hasManualOverride ? existingTags.find((t) => AI_AUTO_TAGS.has(t)) : newTag;
+    const merged = [...new Set([...withoutAiTags, finalTag])].slice(0, 10);
 
     await supabase
       .from('chats')
       .upsert(
-        { session_id: sessionId, remote_jid: remoteJid, tags: merged, updated_at: new Date().toISOString() },
+        { session_id: sessionId, remote_jid: remoteJid, tags: merged, ai_tag: newTag, updated_at: new Date().toISOString() },
         { onConflict: 'session_id,remote_jid' }
       );
   } catch (err) {
@@ -578,23 +581,29 @@ export async function classifyUntaggedChats() {
     if (chatsErr) return { success: false, error: chatsErr.message, classified: 0 };
     if (!chats?.length) return { success: true, classified: 0, message: 'No chats found' };
 
-    const untagged = chats.filter((c) => {
+    // Find chats: no AI tag at all, OR tagged "неизвестно" (re-check if enough messages now)
+    const RECHECK_MSG_THRESHOLD = 10;
+    const needsClassify = chats.filter((c) => {
       const tags = Array.isArray(c.tags) ? c.tags : [];
-      return !tags.some((t) => AI_AUTO_TAGS.has(t));
+      const hasAiTag = tags.some((t) => AI_AUTO_TAGS.has(t));
+      if (!hasAiTag) return true;
+      // Re-check "неизвестно" tags
+      if (tags.includes('неизвестно')) return true;
+      return false;
     });
 
-    if (!untagged.length) return { success: true, classified: 0, message: 'All chats already tagged' };
+    if (!needsClassify.length) return { success: true, classified: 0, message: 'All chats already tagged' };
 
-    logger.info({ untagged: untagged.length }, 'classifyUntaggedChats: starting');
+    logger.info({ needsClassify: needsClassify.length }, 'classifyUntaggedChats: starting');
 
     let classified = 0;
     let failed = 0;
-    let skippedFewMsgs = 0;
+    let taggedUnknown = 0;
     let firstError = null;
 
     // Prepare all chats with messages
     const prepared = [];
-    for (const chat of untagged) {
+    for (const chat of needsClassify) {
       const { data: msgs } = await supabase
         .from('messages')
         .select('body, from_me, message_type')
@@ -603,7 +612,19 @@ export async function classifyUntaggedChats() {
         .order('timestamp', { ascending: false })
         .limit(10);
 
-      if (!msgs?.length || msgs.length < 2) { skippedFewMsgs++; continue; }
+      // Chats with <2 messages → tag as "неизвестно" directly
+      if (!msgs?.length || msgs.length < 2) {
+        const tags = Array.isArray(chat.tags) ? chat.tags : [];
+        if (!tags.includes('неизвестно')) {
+          await applyAutoTag(chat.session_id, chat.remote_jid, 'unknown');
+          taggedUnknown++;
+        }
+        continue;
+      }
+
+      // Chats already "неизвестно" but still <RECHECK_MSG_THRESHOLD — skip re-check
+      const tags = Array.isArray(chat.tags) ? chat.tags : [];
+      if (tags.includes('неизвестно') && msgs.length < RECHECK_MSG_THRESHOLD) continue;
 
       let text = '';
       for (const m of [...msgs].reverse()) {
@@ -667,8 +688,8 @@ export async function classifyUntaggedChats() {
       }
     }
 
-    logger.info({ classified, failed, skippedFewMsgs, total: untagged.length }, 'Classify complete');
-    return { success: true, classified, failed, skippedFewMsgs, total: untagged.length, firstError };
+    logger.info({ classified, failed, taggedUnknown, total: needsClassify.length }, 'Classify complete');
+    return { success: true, classified, failed, taggedUnknown, total: needsClassify.length, firstError };
   } catch (err) {
     logger.error({ err }, 'classifyUntaggedChats failed');
     return { success: false, error: err.message, classified: 0 };
