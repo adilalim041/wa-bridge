@@ -1302,10 +1302,13 @@ export function setupRoutes(app) {
       const { data: analyses, error: aiErr } = await query;
       if (aiErr) throw aiErr;
 
-      // Keep only latest analysis per remote_jid (across sessions if __all__)
+      // Keep only latest analysis per remote_jid, skip LIDs and groups
       const latestByJid = new Map();
       for (const row of analyses || []) {
         const key = row.remote_jid;
+        // Skip LID jids (>15 digit numbers) and groups
+        const digits = key.replace(/@.*$/, '');
+        if (digits.length > 15 || key.includes('@g.us') || key.includes('@lid')) continue;
         if (!latestByJid.has(key) || row.analysis_date > latestByJid.get(key).analysis_date) {
           latestByJid.set(key, row);
         }
