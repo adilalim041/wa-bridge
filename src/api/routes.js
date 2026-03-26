@@ -1391,7 +1391,7 @@ export function setupRoutes(app) {
           phone,
           sessionId: ai.session_id,
           displayName: name,
-          dealStage: ai.deal_stage || 'first_contact',
+          dealStage: ai.deal_stage || 'needs_review',
           customerType: ai.customer_type,
           leadTemperature: ai.lead_temperature,
           sentiment: ai.sentiment,
@@ -1407,10 +1407,10 @@ export function setupRoutes(app) {
 
       // Group by stage
       const stages = {};
-      const STAGE_ORDER = ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+      const STAGE_ORDER = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
       for (const s of STAGE_ORDER) stages[s] = [];
       for (const c of contacts) {
-        const stage = stages[c.dealStage] ? c.dealStage : 'first_contact';
+        const stage = stages[c.dealStage] ? c.dealStage : 'needs_review';
         stages[stage].push(c);
       }
 
@@ -1424,7 +1424,7 @@ export function setupRoutes(app) {
   // Update deal stage manually
   router.post('/crm/deal-stage', async (req, res) => {
     const { sessionId, remoteJid, dealStage } = req.body || {};
-    const VALID_STAGES = ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+    const VALID_STAGES = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
 
     if (!sessionId || !remoteJid || !VALID_STAGES.includes(dealStage)) {
       return res.status(400).json({ error: 'sessionId, remoteJid, and valid dealStage required' });

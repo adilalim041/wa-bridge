@@ -22,7 +22,7 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
   "lead_source": "одно из: instagram_ad, google_ad, word_of_mouth, repeat_client, designer_partner, showroom_visit, incoming_call, unknown",
   "customer_type": "одно из: end_client, designer, partner, contractor, colleague, personal, spam, unknown",
   "dialog_topic": "одно из: sink_sale, faucet_sale, complaint, service, consultation, partnership, other",
-  "deal_stage": "одно из: first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused",
+  "deal_stage": "одно из: needs_review, first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused",
   "sentiment": "одно из: positive, neutral, negative, aggressive",
   "risk_flags": ["массив из возможных: client_unhappy, manager_rude, slow_response, potential_return, lost_lead"],
   "consultation_quality": {
@@ -40,6 +40,8 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
 }
 
 Правила:
+- needs_review = недостаточно данных для определения этапа (мало сообщений, неясный контекст, нерелевантный диалог). Используй ТОЛЬКО когда невозможно определить реальный этап.
+- first_contact = клиент впервые обратился и начал диалог о продукции
 - hot = клиент спрашивает цену, наличие, готов покупать
 - warm = интересуется, задаёт вопросы, но не решился
 - cold = просто спросил и пропал, или small talk
@@ -275,7 +277,7 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
       lead_temperature: analysis.lead_temperature || 'cold',
       lead_source: analysis.lead_source || 'unknown',
       dialog_topic: analysis.dialog_topic || 'other',
-      deal_stage: analysis.deal_stage || 'first_contact',
+      deal_stage: analysis.deal_stage || 'needs_review',
       sentiment: analysis.sentiment || 'neutral',
       risk_flags: Array.isArray(analysis.risk_flags) ? analysis.risk_flags : [],
       summary_ru: analysis.summary_ru || null,
