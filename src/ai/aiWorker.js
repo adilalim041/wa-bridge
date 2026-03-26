@@ -109,11 +109,12 @@ async function callClaude(messages) {
           'Content-Type': 'application/json',
           'x-api-key': ANTHROPIC_API_KEY,
           'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'prompt-caching-2024-07-31',
         },
         body: JSON.stringify({
           model: AI_MODEL,
           max_tokens: 1024,
-          system: SYSTEM_PROMPT,
+          system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
           messages: [{ role: 'user', content: messages }],
         }),
       });
@@ -545,11 +546,14 @@ export async function backfillAutoTags() {
   }
 }
 
-// Lightweight: classify untagged chats by reading their messages directly
-const CLASSIFY_PROMPT = `Определи тип собеседника по переписке. Верни ТОЛЬКО JSON:
-{"customer_type": "одно из: end_client, designer, partner, contractor, colleague, personal, spam, unknown"}
+// Lightweight batched classify: 10 chats per API call using Haiku
+const CLASSIFY_MODEL = 'claude-haiku-4-5-20251001';
+const CLASSIFY_BATCH_SIZE = 10;
+const CLASSIFY_PROMPT = `Ты классифицируешь собеседников в WhatsApp-чатах компании Omoikiri (японская кухонная сантехника).
+Для КАЖДОГО чата определи тип. Верни ТОЛЬКО JSON-массив:
+[{"id": 1, "customer_type": "тип"}, {"id": 2, "customer_type": "тип"}, ...]
 
-Правила:
+Возможные типы:
 - end_client = покупает для себя/своего дома
 - designer = дизайнер интерьера, подбирает для клиента
 - partner = представитель магазина, оптовик, дилер
@@ -559,26 +563,19 @@ const CLASSIFY_PROMPT = `Определи тип собеседника по п�
 - spam = нерелевантное, бот, реклама
 - unknown = недостаточно данных
 
-Отвечай ТОЛЬКО JSON.`;
+Верни JSON-массив БЕЗ пояснений.`;
 
 export async function classifyUntaggedChats() {
   if (!ANTHROPIC_API_KEY) return { success: false, error: 'No API key', classified: 0 };
 
   try {
-    // Find chats with no AI auto-tags
     const { data: chats, error: chatsErr } = await supabase
       .from('chats')
       .select('session_id, remote_jid, tags')
       .order('updated_at', { ascending: false })
       .limit(500);
 
-    if (chatsErr) {
-      logger.error({ err: chatsErr }, 'classifyUntaggedChats: failed to load chats');
-      return { success: false, error: chatsErr.message, classified: 0 };
-    }
-
-    logger.info({ totalChats: chats?.length || 0 }, 'classifyUntaggedChats: loaded chats');
-
+    if (chatsErr) return { success: false, error: chatsErr.message, classified: 0 };
     if (!chats?.length) return { success: true, classified: 0, message: 'No chats found' };
 
     const untagged = chats.filter((c) => {
@@ -586,41 +583,44 @@ export async function classifyUntaggedChats() {
       return !tags.some((t) => AI_AUTO_TAGS.has(t));
     });
 
-    logger.info({ untagged: untagged.length }, 'classifyUntaggedChats: untagged chats');
-
     if (!untagged.length) return { success: true, classified: 0, message: 'All chats already tagged' };
+
+    logger.info({ untagged: untagged.length }, 'classifyUntaggedChats: starting');
 
     let classified = 0;
     let failed = 0;
     let skippedFewMsgs = 0;
     let firstError = null;
 
+    // Prepare all chats with messages
+    const prepared = [];
     for (const chat of untagged) {
-      // Get last 15 messages for classification
-      const { data: msgs, error: msgsErr } = await supabase
+      const { data: msgs } = await supabase
         .from('messages')
-        .select('body, from_me, timestamp, message_type')
+        .select('body, from_me, message_type')
         .eq('session_id', chat.session_id)
         .eq('remote_jid', chat.remote_jid)
         .order('timestamp', { ascending: false })
-        .limit(15);
+        .limit(10);
 
-      if (msgsErr) {
-        logger.warn({ err: msgsErr, jid: chat.remote_jid }, 'classify: failed to load messages');
-        failed++;
-        continue;
-      }
+      if (!msgs?.length || msgs.length < 2) { skippedFewMsgs++; continue; }
 
-      if (!msgs?.length || msgs.length < 2) {
-        skippedFewMsgs++;
-        continue;
-      }
-
-      const reversed = [...msgs].reverse();
       let text = '';
-      for (const m of reversed) {
-        const sender = m.from_me ? 'МЕНЕДЖЕР' : 'КЛИЕНТ';
+      for (const m of [...msgs].reverse()) {
+        const sender = m.from_me ? 'М' : 'К';
         text += `${sender}: ${m.body || `[${m.message_type || 'медиа'}]`}\n`;
+      }
+      prepared.push({ chat, text });
+    }
+
+    // Process in batches of CLASSIFY_BATCH_SIZE
+    for (let i = 0; i < prepared.length; i += CLASSIFY_BATCH_SIZE) {
+      const batch = prepared.slice(i, i + CLASSIFY_BATCH_SIZE);
+
+      // Build multi-chat prompt
+      let batchText = '';
+      for (let j = 0; j < batch.length; j++) {
+        batchText += `--- ЧАТ ${j + 1} ---\n${batch[j].text}\n`;
       }
 
       try {
@@ -632,41 +632,42 @@ export async function classifyUntaggedChats() {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify({
-            model: AI_MODEL,
-            max_tokens: 100,
+            model: CLASSIFY_MODEL,
+            max_tokens: 300,
             system: CLASSIFY_PROMPT,
-            messages: [{ role: 'user', content: text }],
+            messages: [{ role: 'user', content: batchText }],
           }),
         });
 
         if (!response.ok) {
           const errText = await response.text();
-          logger.warn({ status: response.status, errText, jid: chat.remote_jid }, 'classify: AI call failed');
           if (!firstError) firstError = { status: response.status, body: errText.slice(0, 200) };
-          failed++;
-          if (response.status === 429) {
-            await new Promise((r) => setTimeout(r, 5000));
-          }
+          failed += batch.length;
+          if (response.status === 429) await new Promise((r) => setTimeout(r, 5000));
           continue;
         }
 
         const data = await response.json();
         const raw = (data.content?.[0]?.text || '').replace(/```json\s*|```\s*/g, '').trim();
-        const result = JSON.parse(raw);
+        const results = JSON.parse(raw);
 
-        if (result.customer_type && CUSTOMER_TYPE_TAG[result.customer_type]) {
-          await applyAutoTag(chat.session_id, chat.remote_jid, result.customer_type);
-          classified++;
-          logger.info({ jid: chat.remote_jid, type: result.customer_type }, 'classify: tagged');
+        if (Array.isArray(results)) {
+          for (const r of results) {
+            const idx = (r.id || 1) - 1;
+            if (idx >= 0 && idx < batch.length && r.customer_type && CUSTOMER_TYPE_TAG[r.customer_type]) {
+              const c = batch[idx].chat;
+              await applyAutoTag(c.session_id, c.remote_jid, r.customer_type);
+              classified++;
+            }
+          }
         }
-      } catch (classifyErr) {
-        logger.warn({ err: classifyErr.message, jid: chat.remote_jid }, 'classify: error');
-        if (!firstError) firstError = { parseError: classifyErr.message };
-        failed++;
+      } catch (batchErr) {
+        if (!firstError) firstError = { parseError: batchErr.message };
+        failed += batch.length;
       }
     }
 
-    logger.info({ classified, failed, skippedFewMsgs, total: untagged.length }, 'Classify untagged chats complete');
+    logger.info({ classified, failed, skippedFewMsgs, total: untagged.length }, 'Classify complete');
     return { success: true, classified, failed, skippedFewMsgs, total: untagged.length, firstError };
   } catch (err) {
     logger.error({ err }, 'classifyUntaggedChats failed');
