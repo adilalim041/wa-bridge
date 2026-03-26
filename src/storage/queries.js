@@ -282,6 +282,11 @@ export async function getLinkedSessions(remoteJid) {
 
 // Get messages from ALL sessions for one contact, sorted chronologically
 export async function getUnifiedMessages(remoteJid, limit = 50, offset = 0) {
+  // Reject LID/group jids
+  const digits = (remoteJid || '').replace(/@.*$/, '').replace(/\D/g, '');
+  if (!remoteJid || digits.length > 13 || remoteJid.includes('@g.us') || remoteJid.includes('@lid')) {
+    return [];
+  }
   try {
     const { data, error } = await supabase
       .from('messages')

@@ -603,19 +603,32 @@ export async function classifyUntaggedChats() {
     let taggedUnknown = 0;
     let firstError = null;
 
-    // Prepare all chats with messages
+    // Batch-load messages for all chats (avoid N+1 queries)
+    const jids = needsClassify.map((c) => c.remote_jid);
+    const msgsByJid = new Map();
+    for (let b = 0; b < jids.length; b += 100) {
+      const batchJids = jids.slice(b, b + 100);
+      const { data: batchMsgs } = await supabase
+        .from('messages')
+        .select('remote_jid, body, from_me, message_type, timestamp')
+        .in('remote_jid', batchJids)
+        .order('timestamp', { ascending: false })
+        .limit(batchJids.length * 10);
+
+      for (const m of batchMsgs || []) {
+        if (!msgsByJid.has(m.remote_jid)) msgsByJid.set(m.remote_jid, []);
+        const arr = msgsByJid.get(m.remote_jid);
+        if (arr.length < 10) arr.push(m);
+      }
+    }
+
+    // Prepare chats with their messages
     const prepared = [];
     for (const chat of needsClassify) {
-      const { data: msgs } = await supabase
-        .from('messages')
-        .select('body, from_me, message_type')
-        .eq('session_id', chat.session_id)
-        .eq('remote_jid', chat.remote_jid)
-        .order('timestamp', { ascending: false })
-        .limit(10);
+      const msgs = msgsByJid.get(chat.remote_jid) || [];
 
       // Chats with <2 messages → tag as "неизвестно" directly
-      if (!msgs?.length || msgs.length < 2) {
+      if (msgs.length < 2) {
         const tags = Array.isArray(chat.tags) ? chat.tags : [];
         if (!tags.includes('неизвестно')) {
           await applyAutoTag(chat.session_id, chat.remote_jid, 'unknown');

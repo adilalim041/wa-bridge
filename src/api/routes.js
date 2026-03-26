@@ -479,12 +479,13 @@ export function setupRoutes(app) {
       if (rangeEnd) dialogQuery = dialogQuery.lte('started_at', rangeEnd);
       const { count: totalDialogs } = await sessionFilter(dialogQuery);
 
-      // 4. Daily message trend
+      // 4. Daily message trend — only fetch timestamp column, limit to 10k max
       let msgQuery = supabase
         .from('messages')
         .select('timestamp')
         .gte('timestamp', since)
-        .order('timestamp', { ascending: true });
+        .order('timestamp', { ascending: true })
+        .limit(10000);
       if (rangeEnd) msgQuery = msgQuery.lte('timestamp', rangeEnd);
       const { data: dailyMessages } = await sessionFilter(msgQuery);
 
@@ -1149,6 +1150,17 @@ export function setupRoutes(app) {
 
     if (!firstName || !firstName.trim()) {
       return res.status(400).json({ error: 'firstName is required' });
+    }
+
+    // Input length validation — prevent oversized payloads
+    const MAX_LEN = 500;
+    for (const [key, val] of Object.entries({ firstName, lastName, role, company, city, responsibleManager })) {
+      if (val && String(val).length > MAX_LEN) {
+        return res.status(400).json({ error: `${key} too long (max ${MAX_LEN} chars)` });
+      }
+    }
+    if (notes && String(notes).length > 5000) {
+      return res.status(400).json({ error: 'notes too long (max 5000 chars)' });
     }
 
     try {

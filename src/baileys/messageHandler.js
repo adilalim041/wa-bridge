@@ -405,7 +405,10 @@ export async function handleMessage(message, sock, sessionId) {
       chatType = 'group';
 
       try {
-        const groupMeta = await sock.groupMetadata(rawRemoteJid);
+        const groupMeta = await Promise.race([
+          sock.groupMetadata(rawRemoteJid),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('groupMetadata timeout')), 5000)),
+        ]);
         chatDisplayName = groupMeta?.subject || null;
         participantCount = groupMeta?.participants?.length || null;
       } catch (error) {
