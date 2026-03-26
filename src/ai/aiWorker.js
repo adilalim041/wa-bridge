@@ -566,27 +566,37 @@ export async function classifyUntaggedChats() {
 
   try {
     // Find chats with no AI auto-tags
-    const { data: chats } = await supabase
+    const { data: chats, error: chatsErr } = await supabase
       .from('chats')
       .select('session_id, remote_jid, tags')
       .order('updated_at', { ascending: false })
       .limit(500);
 
-    if (!chats?.length) return { success: true, classified: 0 };
+    if (chatsErr) {
+      logger.error({ err: chatsErr }, 'classifyUntaggedChats: failed to load chats');
+      return { success: false, error: chatsErr.message, classified: 0 };
+    }
+
+    logger.info({ totalChats: chats?.length || 0 }, 'classifyUntaggedChats: loaded chats');
+
+    if (!chats?.length) return { success: true, classified: 0, message: 'No chats found' };
 
     const untagged = chats.filter((c) => {
       const tags = Array.isArray(c.tags) ? c.tags : [];
       return !tags.some((t) => AI_AUTO_TAGS.has(t));
     });
 
+    logger.info({ untagged: untagged.length }, 'classifyUntaggedChats: untagged chats');
+
     if (!untagged.length) return { success: true, classified: 0, message: 'All chats already tagged' };
 
     let classified = 0;
     let failed = 0;
+    let skippedFewMsgs = 0;
 
     for (const chat of untagged) {
       // Get last 15 messages for classification
-      const { data: msgs } = await supabase
+      const { data: msgs, error: msgsErr } = await supabase
         .from('messages')
         .select('body, from_me, timestamp, message_type')
         .eq('session_id', chat.session_id)
@@ -594,7 +604,16 @@ export async function classifyUntaggedChats() {
         .order('timestamp', { ascending: false })
         .limit(15);
 
-      if (!msgs?.length || msgs.length < 2) continue;
+      if (msgsErr) {
+        logger.warn({ err: msgsErr, jid: chat.remote_jid }, 'classify: failed to load messages');
+        failed++;
+        continue;
+      }
+
+      if (!msgs?.length || msgs.length < 2) {
+        skippedFewMsgs++;
+        continue;
+      }
 
       const reversed = [...msgs].reverse();
       let text = '';
@@ -620,6 +639,8 @@ export async function classifyUntaggedChats() {
         });
 
         if (!response.ok) {
+          const errText = await response.text();
+          logger.warn({ status: response.status, errText, jid: chat.remote_jid }, 'classify: AI call failed');
           failed++;
           if (response.status === 429) {
             await new Promise((r) => setTimeout(r, 5000));
@@ -634,14 +655,16 @@ export async function classifyUntaggedChats() {
         if (result.customer_type && CUSTOMER_TYPE_TAG[result.customer_type]) {
           await applyAutoTag(chat.session_id, chat.remote_jid, result.customer_type);
           classified++;
+          logger.info({ jid: chat.remote_jid, type: result.customer_type }, 'classify: tagged');
         }
-      } catch {
+      } catch (classifyErr) {
+        logger.warn({ err: classifyErr.message, jid: chat.remote_jid }, 'classify: error');
         failed++;
       }
     }
 
-    logger.info({ classified, failed, total: untagged.length }, 'Classify untagged chats complete');
-    return { success: true, classified, failed, total: untagged.length };
+    logger.info({ classified, failed, skippedFewMsgs, total: untagged.length }, 'Classify untagged chats complete');
+    return { success: true, classified, failed, skippedFewMsgs, total: untagged.length };
   } catch (err) {
     logger.error({ err }, 'classifyUntaggedChats failed');
     return { success: false, error: err.message, classified: 0 };

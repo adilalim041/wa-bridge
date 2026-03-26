@@ -212,10 +212,13 @@ export function setupRoutes(app) {
 
   // Classify untagged chats using lightweight AI (no full analysis needed)
   router.post('/ai/classify-chats', async (req, res) => {
-    res.json({ success: true, message: 'Classification started' });
-    classifyUntaggedChats().then((result) => {
-      logger.info(result, 'Classify untagged chats finished');
-    });
+    try {
+      const result = await classifyUntaggedChats();
+      res.json(result);
+    } catch (err) {
+      logger.error({ err }, 'classify-chats endpoint error');
+      res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   // Get list of dates that have analysis data
