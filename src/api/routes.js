@@ -3,7 +3,7 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
-import { runDailyAnalysis, isAnalysisRunning, backfillAutoTags, classifyUntaggedChats } from '../ai/aiWorker.js';
+import { runDailyAnalysis, isAnalysisRunning, backfillAutoTags, classifyUntaggedChats, reclassifyStuckContacts } from '../ai/aiWorker.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { enqueueForAI } from '../ai/queueManager.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
@@ -393,10 +393,11 @@ export function setupRoutes(app) {
         if (leads[row.lead_temperature] !== undefined) leads[row.lead_temperature]++;
       }
 
-      // Deal stages
-      const stages = {};
+      // Deal stages — always include all valid stages (even if 0) for consistent frontend rendering
+      const stages = { needs_review: 0, first_contact: 0, consultation: 0, model_selection: 0, price_negotiation: 0, payment: 0, delivery: 0, completed: 0, refused: 0 };
       for (const row of ai) {
-        stages[row.deal_stage] = (stages[row.deal_stage] || 0) + 1;
+        if (stages[row.deal_stage] !== undefined) stages[row.deal_stage]++;
+        else stages[row.deal_stage] = 1;
       }
 
       // Sentiment
@@ -1456,7 +1457,7 @@ export function setupRoutes(app) {
       // Get latest deal_stage per remote_jid from chat_ai
       let query = supabase
         .from('chat_ai')
-        .select('session_id, remote_jid, deal_stage, customer_type, lead_temperature, analysis_date, sentiment')
+        .select('session_id, remote_jid, deal_stage, customer_type, lead_temperature, analysis_date, sentiment, stage_source')
         .order('analysis_date', { ascending: false });
 
       if (sessionId && sessionId !== '__all__') {
@@ -1556,6 +1557,7 @@ export function setupRoutes(app) {
           company: crm?.company,
           dealValue: crm?.deal_value || null,
           tags: chat?.tags || [],
+          stageSource: ai.stage_source || null,
         });
       }
 
@@ -1596,7 +1598,11 @@ export function setupRoutes(app) {
         .maybeSingle();
 
       if (latest) {
-        await supabase.from('chat_ai').update({ deal_stage: dealStage }).eq('id', latest.id);
+        await supabase.from('chat_ai').update({
+          deal_stage: dealStage,
+          stage_source: 'manual',
+          stage_changed_at: new Date().toISOString(),
+        }).eq('id', latest.id);
       } else {
         // No AI analysis yet — create a minimal record
         await supabase.from('chat_ai').insert({
@@ -1605,6 +1611,8 @@ export function setupRoutes(app) {
           deal_stage: dealStage,
           analysis_date: new Date().toISOString().slice(0, 10),
           customer_type: 'unknown',
+          stage_source: 'manual',
+          stage_changed_at: new Date().toISOString(),
         });
       }
 
@@ -1612,6 +1620,17 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error }, 'Failed to update deal stage');
       return res.status(500).json({ error: 'Failed to update deal stage' });
+    }
+  });
+
+  // Re-classify contacts stuck at first_contact (rate limited: 1x per hour)
+  router.post('/crm/reclassify-stuck', async (req, res) => {
+    try {
+      const result = await reclassifyStuckContacts();
+      return res.json(result);
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to reclassify stuck contacts');
+      return res.status(500).json({ error: 'Failed to reclassify stuck contacts' });
     }
   });
 
