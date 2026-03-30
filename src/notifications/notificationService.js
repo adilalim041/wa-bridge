@@ -218,8 +218,122 @@ export async function sendDailySummary(analysisResult) {
   }
 }
 
+// ── Automatic follow-up task creation ──
+async function createFollowUpTasks() {
+  try {
+    const oneDayAgo = new Date(Date.now() - 24 * 3600000).toISOString();
+
+    // Get recent messages (last 48h) to find unanswered clients
+    const twoDaysAgo = new Date(Date.now() - 48 * 3600000).toISOString();
+    const { data: recentMsgs } = await supabase
+      .from('messages')
+      .select('remote_jid, session_id, from_me, timestamp, push_name')
+      .gt('timestamp', twoDaysAgo)
+      .not('remote_jid', 'like', '%@g.us')
+      .not('remote_jid', 'like', '%@lid')
+      .order('timestamp', { ascending: false })
+      .limit(1000);
+
+    if (!recentMsgs?.length) return;
+
+    // Group by remote_jid+session_id, keep only latest message per chat
+    const latestByChat = new Map();
+    for (const m of recentMsgs) {
+      const key = `${m.session_id}:${m.remote_jid}`;
+      if (!latestByChat.has(key)) {
+        latestByChat.set(key, m);
+      }
+    }
+
+    // Filter: last message from client, older than 24h
+    const unanswered = [];
+    for (const [, msg] of latestByChat) {
+      if (msg.from_me) continue; // Manager already replied
+      if (new Date(msg.timestamp) > new Date(oneDayAgo)) continue; // Too recent
+      unanswered.push(msg);
+    }
+
+    if (!unanswered.length) return;
+
+    // Check which chats have tag "клиент"
+    const jids = unanswered.map(u => u.remote_jid);
+    const { data: chats } = await supabase
+      .from('chats')
+      .select('remote_jid, session_id, tags, display_name')
+      .in('remote_jid', jids);
+
+    const chatMap = new Map();
+    for (const c of chats || []) {
+      chatMap.set(`${c.session_id}:${c.remote_jid}`, c);
+    }
+
+    // Filter to only "клиент" tags
+    const clientUnanswered = unanswered.filter(msg => {
+      const chat = chatMap.get(`${msg.session_id}:${msg.remote_jid}`);
+      return chat && Array.isArray(chat.tags) && chat.tags.includes('клиент');
+    });
+
+    if (!clientUnanswered.length) return;
+
+    // Check for existing pending follow-up tasks
+    const { data: existingTasks } = await supabase
+      .from('tasks')
+      .select('remote_jid, session_id')
+      .eq('status', 'pending')
+      .eq('task_type', 'follow_up')
+      .in('remote_jid', clientUnanswered.map(u => u.remote_jid));
+
+    const existingSet = new Set(
+      (existingTasks || []).map(t => `${t.session_id}:${t.remote_jid}`)
+    );
+
+    // Create tasks for clients without existing follow-up
+    const tasksToCreate = [];
+    for (const msg of clientUnanswered) {
+      const key = `${msg.session_id}:${msg.remote_jid}`;
+      if (existingSet.has(key)) continue;
+
+      const chat = chatMap.get(key);
+      const name = chat?.display_name || msg.push_name || msg.remote_jid.replace(/@.*$/, '');
+
+      tasksToCreate.push({
+        session_id: msg.session_id,
+        remote_jid: msg.remote_jid,
+        title: `Follow-up: написать ${name}`,
+        task_type: 'follow_up',
+        priority: 'medium',
+        status: 'pending',
+        due_date: new Date(Date.now() + 4 * 3600000).toISOString(), // Due in 4 hours
+        created_by: 'auto_followup',
+      });
+    }
+
+    if (!tasksToCreate.length) return;
+
+    const { error } = await supabase.from('tasks').insert(tasksToCreate);
+    if (error) throw error;
+
+    logger.info({ count: tasksToCreate.length }, 'Created auto follow-up tasks');
+
+    // Send Telegram summary if configured
+    if (isTelegramConfigured()) {
+      let msg = `<b>Follow-up задачи (${tasksToCreate.length})</b>\n\n`;
+      for (const task of tasksToCreate.slice(0, 5)) {
+        msg += `\u2022 ${task.title}\n`;
+      }
+      if (tasksToCreate.length > 5) {
+        msg += `\n... и ещё ${tasksToCreate.length - 5}`;
+      }
+      await sendTelegramMessage(msg);
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to create follow-up tasks');
+  }
+}
+
 // ── Periodic checker (runs every 30 min) ──
 let checkerInterval = null;
+let followUpRanToday = false;
 
 export function startNotificationChecker() {
   if (!isTelegramConfigured()) {
@@ -234,12 +348,27 @@ export function startNotificationChecker() {
     checkOverdueTasks();
     // TODO: re-enable when AI classification is verified
     // checkUnansweredChats();
+
+    // Check if follow-up should run on boot (10:00 Almaty window)
+    const almatyHour = (new Date().getUTCHours() + 5) % 24;
+    if (almatyHour === 10 && !followUpRanToday) {
+      followUpRanToday = true;
+      createFollowUpTasks();
+    }
   }, 60_000);
 
   checkerInterval = setInterval(() => {
     checkOverdueTasks();
     // TODO: re-enable when AI classification is verified
     // checkUnansweredChats();
+
+    // Daily follow-up task creation at 10:00 Almaty (UTC+5)
+    const almatyHour = (new Date().getUTCHours() + 5) % 24;
+    if (almatyHour === 10 && !followUpRanToday) {
+      followUpRanToday = true;
+      createFollowUpTasks();
+    }
+    if (almatyHour === 0) followUpRanToday = false; // Reset at midnight
   }, 30 * 60_000); // Every 30 minutes
 }
 

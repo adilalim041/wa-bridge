@@ -1956,6 +1956,97 @@ export function setupRoutes(app) {
     }
   });
 
+  // ── Monthly report ────────────────────────────────────────────────────
+  router.get('/reports/monthly', async (req, res) => {
+    try {
+      const { month } = req.query; // format: "2026-03"
+      if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ error: 'month parameter required (format: YYYY-MM)' });
+      }
+
+      const startDate = `${month}-01`;
+      const endMonth = new Date(startDate);
+      endMonth.setMonth(endMonth.getMonth() + 1);
+      const endDate = endMonth.toISOString().slice(0, 10);
+
+      // 1. Total unique chats with messages this month (ordered desc so first per key = latest)
+      const { data: msgStats } = await supabase
+        .from('messages')
+        .select('remote_jid, session_id, from_me')
+        .gte('timestamp', startDate)
+        .lt('timestamp', endDate)
+        .not('remote_jid', 'like', '%@g.us')
+        .order('timestamp', { ascending: false });
+
+      const uniqueChats = new Set((msgStats || []).map(m => `${m.session_id}:${m.remote_jid}`));
+      const totalConversations = uniqueChats.size;
+
+      // Messages from clients vs from managers
+      const fromClients = (msgStats || []).filter(m => !m.from_me).length;
+      const fromManagers = (msgStats || []).filter(m => m.from_me).length;
+
+      // 2. Tasks created this month
+      const { data: tasks } = await supabase
+        .from('tasks')
+        .select('id, status, task_type, created_by, completed_at')
+        .gte('created_at', startDate)
+        .lt('created_at', endDate);
+
+      const taskStats = {
+        total: (tasks || []).length,
+        completed: (tasks || []).filter(t => t.status === 'completed').length,
+        pending: (tasks || []).filter(t => t.status === 'pending').length,
+        autoFollowUp: (tasks || []).filter(t => t.created_by === 'auto_followup').length,
+      };
+
+      // 3. AI analysis results this month
+      const { data: analyses } = await supabase
+        .from('chat_ai')
+        .select('customer_type, lead_temperature, deal_stage, manager_issues')
+        .gte('analysis_date', startDate)
+        .lt('analysis_date', endDate);
+
+      const customerTypes = {};
+      const dealStages = {};
+      let hotLeads = 0;
+      let managerIssueCount = 0;
+
+      for (const a of analyses || []) {
+        const ct = a.customer_type || 'unknown';
+        customerTypes[ct] = (customerTypes[ct] || 0) + 1;
+
+        const ds = a.deal_stage || 'unknown';
+        dealStages[ds] = (dealStages[ds] || 0) + 1;
+
+        if (a.lead_temperature === 'hot') hotLeads++;
+        if (a.manager_issues?.length > 0) managerIssueCount++;
+      }
+
+      // 4. Unanswered clients (last message from client, no reply)
+      // msgStats is ordered by timestamp desc, so first entry per key = latest message
+      const chatLastMsg = new Map();
+      for (const m of msgStats || []) {
+        const key = `${m.session_id}:${m.remote_jid}`;
+        if (!chatLastMsg.has(key)) {
+          chatLastMsg.set(key, m);
+        }
+      }
+      const unansweredCount = [...chatLastMsg.values()].filter(m => !m.from_me).length;
+
+      res.json({
+        month,
+        totalConversations,
+        messages: { fromClients, fromManagers, total: fromClients + fromManagers },
+        tasks: taskStats,
+        analysis: { total: (analyses || []).length, customerTypes, dealStages, hotLeads, managerIssueCount },
+        unansweredAtEndOfMonth: unansweredCount,
+      });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to generate monthly report');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // ── Notification endpoints ──
 
   router.get('/notifications/status', (_req, res) => {
