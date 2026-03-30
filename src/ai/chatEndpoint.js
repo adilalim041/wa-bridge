@@ -581,6 +581,17 @@ async function executeTool(name, input = {}) {
         if (!dueDate) return JSON.stringify({ error: 'due_date is required' });
         if (title.length > 200) return JSON.stringify({ error: 'Title too long (max 200)' });
 
+        // Validate due_date is a valid date
+        const parsed = new Date(dueDate);
+        if (isNaN(parsed.getTime())) {
+          return JSON.stringify({ error: 'Error: invalid due_date format' });
+        }
+
+        // Validate remote_jid format if provided
+        if (input.remote_jid && !input.remote_jid.includes('@')) {
+          return JSON.stringify({ error: 'Error: invalid remote_jid format' });
+        }
+
         const VALID_TYPES = ['follow_up', 'call_back', 'send_quote', 'send_catalog', 'visit_showroom', 'custom'];
         const VALID_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
 

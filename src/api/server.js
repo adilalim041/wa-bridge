@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 import helmet from 'helmet';
 import { createServer } from 'http';
@@ -65,7 +66,10 @@ export function startServer() {
     app.use((req, res, next) => {
         if (req.path === '/health' || req.path === '/ws') return next();
         const key = req.headers['x-api-key'] || req.query.apiKey;
-        if (key !== API_KEY) {
+        const isValid = key && API_KEY &&
+            key.length === API_KEY.length &&
+            crypto.timingSafeEqual(Buffer.from(key), Buffer.from(API_KEY));
+        if (!isValid) {
             return res.status(401).json({ error: 'Invalid or missing API key' });
         }
         next();

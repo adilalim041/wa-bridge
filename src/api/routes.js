@@ -1606,13 +1606,15 @@ export function setupRoutes(app) {
 
   router.get('/tasks', async (req, res) => {
     try {
-      const { session_id, status, remote_jid, limit = 50, offset = 0 } = req.query;
+      const { session_id, status, remote_jid, limit, offset } = req.query;
+      const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+      const safeOffset = Math.max(Number(offset) || 0, 0);
 
       let query = supabase
         .from('tasks')
         .select('*')
         .order('due_date', { ascending: true })
-        .range(+offset, +offset + +limit - 1);
+        .range(safeOffset, safeOffset + safeLimit - 1);
 
       if (session_id && session_id !== '__all__') {
         query = query.eq('session_id', session_id);
@@ -1723,6 +1725,13 @@ export function setupRoutes(app) {
         if (key in updates) sanitized[key] = updates[key];
       }
 
+      if (sanitized.title && sanitized.title.length > 200) {
+        return res.status(400).json({ error: 'Title must be under 200 characters' });
+      }
+      if (sanitized.description && sanitized.description.length > 2000) {
+        return res.status(400).json({ error: 'Description must be under 2000 characters' });
+      }
+
       const { data, error } = await supabase
         .from('tasks')
         .update(sanitized)
@@ -1741,6 +1750,22 @@ export function setupRoutes(app) {
   router.delete('/tasks/:id', async (req, res) => {
     try {
       const { id } = req.params;
+      const { session_id } = req.query;
+
+      // If session_id provided, verify the task belongs to that session before deleting
+      if (session_id) {
+        const { data: task, error: fetchErr } = await supabase
+          .from('tasks')
+          .select('id, session_id')
+          .eq('id', id)
+          .maybeSingle();
+        if (fetchErr) throw fetchErr;
+        if (!task) return res.status(404).json({ error: 'Task not found' });
+        if (task.session_id !== session_id) {
+          return res.status(403).json({ error: 'Task does not belong to this session' });
+        }
+      }
+
       const { error } = await supabase.from('tasks').delete().eq('id', id);
       if (error) throw error;
       res.json({ success: true });
@@ -1901,7 +1926,14 @@ export function setupRoutes(app) {
     });
   });
 
+  let lastTestNotification = 0;
   router.post('/notifications/test', async (_req, res) => {
+    const now = Date.now();
+    if (now - lastTestNotification < 60000) {
+      return res.status(429).json({ error: 'Test notification rate limited. Wait 1 minute.' });
+    }
+    lastTestNotification = now;
+
     if (!isTelegramConfigured()) {
       return res.json({ success: false, message: 'Telegram not configured' });
     }
