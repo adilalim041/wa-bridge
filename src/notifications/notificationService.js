@@ -2,6 +2,9 @@ import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { sendTelegramMessage, isTelegramConfigured } from './telegramBot.js';
 
+let lastOverdueHash = '';
+let lastUnansweredHash = '';
+
 // ── Overdue task checker ──
 async function checkOverdueTasks() {
   if (!isTelegramConfigured()) return;
@@ -46,6 +49,11 @@ async function checkOverdueTasks() {
     if (overdue.length > 5) {
       msg += `\n... и ещё ${overdue.length - 5}`;
     }
+
+    // Deduplicate: don't send if same as last notification
+    const hash = overdue.map(t => t.id).sort().join(',');
+    if (hash === lastOverdueHash) return;
+    lastOverdueHash = hash;
 
     await sendTelegramMessage(msg);
     logger.info({ count: overdue.length }, 'Sent overdue tasks notification');
@@ -132,6 +140,11 @@ async function checkUnansweredChats() {
       if (preview) msg += `\n  "${preview}"`;
       msg += '\n';
     }
+
+    // Deduplicate: don't send if same contacts as last notification
+    const hash = toNotify.map(u => u.remote_jid).sort().join(',');
+    if (hash === lastUnansweredHash) return;
+    lastUnansweredHash = hash;
 
     await sendTelegramMessage(msg);
     logger.info({ count: unanswered.length }, 'Sent unanswered chats notification');
