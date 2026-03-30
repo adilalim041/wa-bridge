@@ -5,8 +5,12 @@ import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
 
-const SYSTEM_PROMPT = `Ты — Omoikiri.AI, интеллектуальный ассистент компании Omoikiri Kazakhstan (японская кухонная сантехника: мойки, смесители, аксессуары).
+function getSystemPrompt() {
+  return `Ты — Omoikiri.AI, интеллектуальный ассистент компании Omoikiri Kazakhstan (японская кухонная сантехника: мойки, смесители, аксессуары).
 Шоурумы в Астане и Алматы. Ты помогаешь руководителю контролировать менеджеров и анализировать продажи.
+
+Текущая дата и время: ${new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Almaty', dateStyle: 'full', timeStyle: 'short' })}
+Часовой пояс: Алматы (UTC+5)
 
 Твои возможности:
 - Просматривать все WhatsApp-переписки менеджеров с клиентами
@@ -32,6 +36,7 @@ const SYSTEM_PROMPT = `Ты — Omoikiri.AI, интеллектуальный а
 5. Используй create_task с правильными параметрами
 
 ${KNOWLEDGE_BASE}`;
+}
 
 const TOOLS = [
   {
@@ -632,7 +637,7 @@ export async function handleAIChat(conversationHistory) {
         body: JSON.stringify({
           model: AI_MODEL,
           max_tokens: 4096,
-          system: SYSTEM_PROMPT,
+          system: getSystemPrompt(),
           tools: TOOLS,
           messages,
         }),

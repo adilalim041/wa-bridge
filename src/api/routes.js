@@ -1583,7 +1583,7 @@ export function setupRoutes(app) {
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
 
-      let baseQuery = supabase.from('tasks').select('id, status, due_date, completed_at', { count: 'exact' });
+      let baseQuery = supabase.from('tasks').select('id, status, due_date, completed_at');
       if (session_id && session_id !== '__all__') {
         baseQuery = baseQuery.eq('session_id', session_id);
       }
