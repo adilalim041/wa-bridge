@@ -911,6 +911,98 @@ export function setupRoutes(app) {
     }
   });
 
+  // Full-text message search across all chats
+  router.get('/messages/search', async (req, res) => {
+    try {
+      const { q, session_id, limit = 50, offset = 0 } = req.query;
+
+      if (!q || q.length < 2) {
+        return res.status(400).json({ error: 'Query must be at least 2 characters' });
+      }
+      if (q.length > 200) {
+        return res.status(400).json({ error: 'Query too long (max 200)' });
+      }
+
+      // Use ilike for case-insensitive partial match
+      let query = supabase
+        .from('messages')
+        .select('message_id, session_id, remote_jid, body, from_me, message_type, timestamp, push_name')
+        .ilike('body', `%${q}%`)
+        .not('body', 'is', null)
+        .order('timestamp', { ascending: false })
+        .range(+offset, +offset + +limit - 1);
+
+      if (session_id && session_id !== '__all__') {
+        query = query.eq('session_id', session_id);
+      }
+
+      // Filter out LID and group JIDs
+      query = query.not('remote_jid', 'like', '%@g.us');
+      query = query.not('remote_jid', 'like', '%@lid');
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      // Enrich with contact names
+      const jids = [...new Set((data || []).map((m) => m.remote_jid))];
+      const nameMap = new Map();
+
+      if (jids.length) {
+        // CRM contacts
+        const { data: contacts } = await supabase
+          .from('contacts_crm')
+          .select('remote_jid, first_name, last_name')
+          .in('remote_jid', jids);
+        for (const c of contacts || []) {
+          nameMap.set(c.remote_jid, `${c.first_name || ''} ${c.last_name || ''}`.trim());
+        }
+
+        // Chat display names fallback
+        const { data: chats } = await supabase
+          .from('chats')
+          .select('remote_jid, display_name')
+          .in('remote_jid', jids);
+        for (const c of chats || []) {
+          if (!nameMap.has(c.remote_jid) && c.display_name) {
+            nameMap.set(c.remote_jid, c.display_name);
+          }
+        }
+      }
+
+      const results = (data || []).map((msg) => ({
+        messageId: msg.message_id,
+        sessionId: msg.session_id,
+        remoteJid: msg.remote_jid,
+        body: msg.body,
+        fromMe: msg.from_me,
+        messageType: msg.message_type,
+        timestamp: msg.timestamp,
+        pushName: msg.push_name,
+        contactName: nameMap.get(msg.remote_jid) || msg.push_name || msg.remote_jid.replace(/@.*$/, ''),
+      }));
+
+      // Count total matches (for "N results found" display)
+      let countQuery = supabase
+        .from('messages')
+        .select('message_id', { count: 'exact', head: true })
+        .ilike('body', `%${q}%`)
+        .not('body', 'is', null)
+        .not('remote_jid', 'like', '%@g.us')
+        .not('remote_jid', 'like', '%@lid');
+
+      if (session_id && session_id !== '__all__') {
+        countQuery = countQuery.eq('session_id', session_id);
+      }
+
+      const { count: totalCount } = await countQuery;
+
+      res.json({ results, total: totalCount || results.length, query: q });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to search messages');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   router.get('/sessions/:sessionId/messages/:phone', async (req, res) => {
     const { sessionId } = req.params;
     const phone = normalizeChatId(req.params.phone);
