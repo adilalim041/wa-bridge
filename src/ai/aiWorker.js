@@ -1,6 +1,7 @@
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { KNOWLEDGE_BASE } from './knowledgeBase.js';
+import { sendDailySummary, notifyHotLead } from '../notifications/notificationService.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -310,6 +311,13 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
 
     // Auto-tag chat based on AI analysis
     await applyAutoTag(sessionId, remoteJid, row.customer_type);
+
+    // Notify about hot leads via Telegram
+    if (row.lead_temperature === 'hot') {
+      const phone = remoteJid.replace(/@.*$/, '');
+      const name = contact ? `${contact.first_name || ''} ${contact.last_name || ''}`.trim() : '';
+      notifyHotLead(name, phone, row.summary_ru, row.action_suggestion).catch(() => {});
+    }
 
     return true;
   } catch (error) {
@@ -777,6 +785,10 @@ function scheduleDailyRun() {
     try {
       const result = await runDailyAnalysis();
       logger.info(result, 'Scheduled daily analysis finished');
+      // Send daily summary to Telegram after analysis completes
+      if (result?.success) {
+        await sendDailySummary(result);
+      }
     } catch (error) {
       logger.error({ err: error }, 'Scheduled daily analysis failed');
     }

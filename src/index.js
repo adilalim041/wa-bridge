@@ -6,6 +6,7 @@ import { stopHealthMonitor } from './monitor.js';
 import { stopVersionChecker } from './versionChecker.js';
 import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
 import { loadPhoneRegistry } from './baileys/messageHandler.js';
+import { startNotificationChecker, stopNotificationChecker } from './notifications/notificationService.js';
 
 let server;
 let keepAliveTimer;
@@ -35,6 +36,7 @@ async function bootstrap() {
   await loadPhoneRegistry();
   await sessionManager.startAll();
   startAIWorker();
+  startNotificationChecker();
   startKeepAlive();
 
   // Refresh phone registry every 60s to pick up new sessions
@@ -54,6 +56,7 @@ async function shutdown(signal) {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (phoneRefreshTimer) clearInterval(phoneRefreshTimer);
   stopAIWorker();
+  stopNotificationChecker();
   await sessionManager.stopAll();
   stopHealthMonitor();
   stopVersionChecker();

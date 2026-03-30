@@ -13,6 +13,7 @@ import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages } from '../storage/queries.js';
+import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 
 const CYRILLIC_MAP = {
   а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
@@ -1799,6 +1800,30 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, sessionId, jid }, 'Failed to send WhatsApp message');
       return res.status(500).json({ error: 'Failed to send message' });
+    }
+  });
+
+  // ── Notification endpoints ──
+
+  router.get('/notifications/status', (_req, res) => {
+    res.json({
+      telegram: isTelegramConfigured(),
+      message: isTelegramConfigured()
+        ? 'Telegram configured'
+        : 'Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars',
+    });
+  });
+
+  router.post('/notifications/test', async (_req, res) => {
+    if (!isTelegramConfigured()) {
+      return res.json({ success: false, message: 'Telegram not configured' });
+    }
+    try {
+      await sendTelegramMessage('<b>Тест уведомлений Omoikiri.AI</b>\n\nУведомления работают!');
+      res.json({ success: true });
+    } catch (err) {
+      logger.error({ err }, 'Test notification failed');
+      res.status(500).json({ success: false, error: err.message });
     }
   });
 
