@@ -764,6 +764,44 @@ export async function classifyUntaggedChats() {
   }
 }
 
+// Check if today's analysis was missed (e.g. after server restart) and run catch-up
+async function checkMissedAnalysis() {
+  try {
+    // Get today's date in Almaty timezone (UTC+5)
+    const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
+    const today = now.toISOString().slice(0, 10);
+    const almatyHour = now.getUTCHours(); // Already shifted by +5
+
+    // Only check if we're past the scheduled hour
+    if (almatyHour < DAILY_ANALYSIS_HOUR) return;
+
+    // Check if analysis ran today
+    const { data } = await supabase
+      .from('chat_ai')
+      .select('analysis_date')
+      .eq('analysis_date', today)
+      .limit(1);
+
+    if (data && data.length > 0) {
+      logger.info({ today }, 'Daily analysis already ran today, skipping catch-up');
+      return;
+    }
+
+    logger.info({ today }, 'Missed daily analysis detected, running catch-up');
+    try {
+      const result = await runDailyAnalysis(today);
+      logger.info({ result, today }, 'Catch-up daily analysis completed');
+      if (result?.success) {
+        await sendDailySummary(result);
+      }
+    } catch (err) {
+      logger.error({ err, today }, 'Catch-up daily analysis failed');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to check missed analysis');
+  }
+}
+
 // Schedule daily analysis at configured hour (Almaty time)
 function scheduleDailyRun() {
   const now = new Date(Date.now() + 5 * 60 * 60 * 1000); // Almaty UTC+5
@@ -791,9 +829,10 @@ function scheduleDailyRun() {
       }
     } catch (error) {
       logger.error({ err: error }, 'Scheduled daily analysis failed');
+    } finally {
+      // Always reschedule for next day, even if analysis threw
+      scheduleDailyRun();
     }
-    // Schedule next day
-    scheduleDailyRun();
   }, msUntilRun);
 }
 
@@ -803,6 +842,8 @@ export function startAIWorker() {
     return;
   }
   scheduleDailyRun();
+  // Check for missed analysis on startup (after 30s delay to let connections settle)
+  setTimeout(() => checkMissedAnalysis(), 30_000);
   logger.info('AI worker ready (daily auto + on-demand via POST /ai/analyze)');
 }
 
