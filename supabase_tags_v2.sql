@@ -1,8 +1,15 @@
 -- ============================================================
--- Optimized chat list function — replaces N+1 queries
+-- Wave 8A: Simplified tag system (4 tags + tag_confirmed)
 -- Run in Supabase SQL Editor
 -- ============================================================
 
+-- Add tag_confirmed column to chats table
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS tag_confirmed BOOLEAN DEFAULT FALSE;
+
+-- Create index for filtering by confirmation status
+CREATE INDEX IF NOT EXISTS idx_chats_tag_confirmed ON chats(tag_confirmed);
+
+-- Update the RPC function to include tag_confirmed
 CREATE OR REPLACE FUNCTION get_chats_with_last_message(
   p_session_id TEXT,
   p_limit INT DEFAULT 300

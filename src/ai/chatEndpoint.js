@@ -560,7 +560,7 @@ async function executeTool(name, input = {}) {
 
         const { error: tagErr } = await supabase
           .from('chats')
-          .update({ tags: cleanTags, updated_at: new Date().toISOString() })
+          .update({ tags: cleanTags, tag_confirmed: true, updated_at: new Date().toISOString() })
           .eq('session_id', sessionId)
           .eq('remote_jid', remoteJid);
 

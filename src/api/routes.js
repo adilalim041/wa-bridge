@@ -894,6 +894,7 @@ export function setupRoutes(app) {
             session_id: sessionId,
             remote_jid: remoteJid,
             tags: cleanTags,
+            tag_confirmed: true, // manual tag update = confirmed
             updated_at: new Date().toISOString(),
           },
           { onConflict: 'session_id,remote_jid' }
@@ -908,6 +909,46 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error updating tags');
       return res.status(500).json({ error: 'Failed to update tags' });
+    }
+  });
+
+  // Confirm (or change + confirm) a chat tag
+  router.post('/sessions/:sessionId/chats/:phone/confirm-tag', async (req, res) => {
+    const { sessionId } = req.params;
+    const remoteJid = normalizeChatId(req.params.phone);
+    const { tag } = req.body; // optional — if provided, change the tag AND confirm
+
+    if (!remoteJid) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    const VALID_TAGS = ['клиент', 'сотрудник', 'партнёр', 'неизвестно'];
+
+    try {
+      const updates = { tag_confirmed: true, updated_at: new Date().toISOString() };
+      if (tag) {
+        if (!VALID_TAGS.includes(tag)) {
+          return res.status(400).json({ error: 'Invalid tag. Must be one of: ' + VALID_TAGS.join(', ') });
+        }
+        // Replace ALL tags with just this one confirmed tag
+        updates.tags = [tag];
+      }
+
+      const { error } = await supabase
+        .from('chats')
+        .update(updates)
+        .eq('session_id', sessionId)
+        .eq('remote_jid', remoteJid);
+
+      if (error) {
+        logger.error({ err: error, sessionId, remoteJid }, 'Failed to confirm tag');
+        return res.status(500).json({ error: 'Failed to confirm tag' });
+      }
+
+      return res.json({ success: true });
+    } catch (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error confirming tag');
+      return res.status(500).json({ error: 'Failed to confirm tag' });
     }
   });
 
