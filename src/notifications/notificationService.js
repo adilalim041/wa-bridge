@@ -156,6 +156,8 @@ async function checkUnansweredChats() {
 // ── Hot lead alert ──
 export async function notifyHotLead(contactName, phone, topic, suggestion) {
   if (!isTelegramConfigured()) return;
+  // Disabled until AI classification is verified
+  return;
 
   let msg = `<b>Hot lead</b>\n`;
   msg += `${contactName || phone}`;
@@ -170,6 +172,8 @@ export async function notifyHotLead(contactName, phone, topic, suggestion) {
 // ── Daily summary ──
 export async function sendDailySummary(analysisResult) {
   if (!isTelegramConfigured()) return;
+  // Disabled until AI classification is verified
+  return;
 
   try {
     const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
@@ -228,12 +232,14 @@ export function startNotificationChecker() {
   // Run first check 1 minute after boot (let sessions connect first)
   setTimeout(() => {
     checkOverdueTasks();
-    checkUnansweredChats();
+    // TODO: re-enable when AI classification is verified
+    // checkUnansweredChats();
   }, 60_000);
 
   checkerInterval = setInterval(() => {
     checkOverdueTasks();
-    checkUnansweredChats();
+    // TODO: re-enable when AI classification is verified
+    // checkUnansweredChats();
   }, 30 * 60_000); // Every 30 minutes
 }
 
