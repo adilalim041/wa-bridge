@@ -1633,18 +1633,13 @@ export function setupRoutes(app) {
       const jids = [...new Set((data || []).filter(t => t.remote_jid).map(t => t.remote_jid))];
       const contactMap = new Map();
       if (jids.length) {
-        const { data: contacts } = await supabase
-          .from('contacts_crm')
-          .select('remote_jid, first_name, last_name, company')
-          .in('remote_jid', jids);
+        const [{ data: contacts }, { data: chats }] = await Promise.all([
+          supabase.from('contacts_crm').select('remote_jid, first_name, last_name, company').in('remote_jid', jids),
+          supabase.from('chats').select('remote_jid, display_name').in('remote_jid', jids),
+        ]);
         for (const c of contacts || []) {
           contactMap.set(c.remote_jid, c);
         }
-        // Also get display names from chats
-        const { data: chats } = await supabase
-          .from('chats')
-          .select('remote_jid, display_name')
-          .in('remote_jid', jids);
         for (const c of chats || []) {
           if (!contactMap.has(c.remote_jid) && c.display_name) {
             contactMap.set(c.remote_jid, { first_name: c.display_name, last_name: '' });
