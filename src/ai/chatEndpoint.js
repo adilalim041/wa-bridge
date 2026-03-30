@@ -151,6 +151,52 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: 'update_deal_stage',
+    description: 'Update the deal stage for a contact in the CRM funnel. Use when the user asks to move a contact to a different stage.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        session_id: {
+          type: 'string',
+          description: 'WhatsApp session ID',
+        },
+        remote_jid: {
+          type: 'string',
+          description: 'Phone number / chat JID (e.g. 77001234567@s.whatsapp.net)',
+        },
+        deal_stage: {
+          type: 'string',
+          enum: ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused', 'needs_review'],
+          description: 'New deal stage',
+        },
+      },
+      required: ['remote_jid', 'deal_stage'],
+    },
+  },
+  {
+    name: 'update_tags',
+    description: 'Update tags for a chat. Replaces existing tags with the new set.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        session_id: {
+          type: 'string',
+          description: 'WhatsApp session ID',
+        },
+        remote_jid: {
+          type: 'string',
+          description: 'Phone number / chat JID',
+        },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'New set of tags',
+        },
+      },
+      required: ['remote_jid', 'tags'],
+    },
+  },
 ];
 
 function normalizeLimit(value, fallback, max = 100) {
@@ -358,6 +404,96 @@ async function executeTool(name, input = {}) {
           negative_sentiment: negative || [],
           risk_flag_chats: risky || [],
         });
+      }
+
+      case 'update_deal_stage': {
+        const VALID_STAGES = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+        const sessionId = typeof input.session_id === 'string' && input.session_id.trim()
+          ? input.session_id.trim()
+          : 'omoikiri-main';
+        const remoteJid = typeof input.remote_jid === 'string' ? input.remote_jid.trim() : '';
+        const dealStage = input.deal_stage;
+
+        if (!remoteJid) {
+          return JSON.stringify({ error: 'remote_jid is required' });
+        }
+
+        if (!dealStage || !VALID_STAGES.includes(dealStage)) {
+          return JSON.stringify({ error: `Invalid deal_stage. Must be one of: ${VALID_STAGES.join(', ')}` });
+        }
+
+        // Find the latest chat_ai record
+        const { data: latest, error: findErr } = await supabase
+          .from('chat_ai')
+          .select('id')
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid)
+          .order('analysis_date', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (findErr) {
+          return JSON.stringify({ error: findErr.message });
+        }
+
+        if (latest) {
+          const { error: updErr } = await supabase
+            .from('chat_ai')
+            .update({ deal_stage: dealStage })
+            .eq('id', latest.id);
+
+          if (updErr) {
+            return JSON.stringify({ error: updErr.message });
+          }
+        } else {
+          // Create minimal chat_ai record
+          const { error: insErr } = await supabase.from('chat_ai').insert({
+            session_id: sessionId,
+            remote_jid: remoteJid,
+            deal_stage: dealStage,
+            analysis_date: new Date().toISOString().slice(0, 10),
+          });
+
+          if (insErr) {
+            return JSON.stringify({ error: insErr.message });
+          }
+        }
+
+        return JSON.stringify({ success: true, dealStage });
+      }
+
+      case 'update_tags': {
+        const sessionId = typeof input.session_id === 'string' && input.session_id.trim()
+          ? input.session_id.trim()
+          : 'omoikiri-main';
+        const remoteJid = typeof input.remote_jid === 'string' ? input.remote_jid.trim() : '';
+        const tags = input.tags;
+
+        if (!remoteJid) {
+          return JSON.stringify({ error: 'remote_jid is required' });
+        }
+
+        if (!Array.isArray(tags)) {
+          return JSON.stringify({ error: 'tags must be an array of strings' });
+        }
+
+        // Validate: max 10 tags, each max 50 chars
+        const cleanTags = tags
+          .filter((t) => typeof t === 'string' && t.trim().length > 0)
+          .map((t) => t.trim().slice(0, 50))
+          .slice(0, 10);
+
+        const { error: tagErr } = await supabase
+          .from('chats')
+          .update({ tags: cleanTags, updated_at: new Date().toISOString() })
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid);
+
+        if (tagErr) {
+          return JSON.stringify({ error: tagErr.message });
+        }
+
+        return JSON.stringify({ success: true, tags: cleanTags });
       }
 
       default:
