@@ -24,6 +24,13 @@ const SYSTEM_PROMPT = `Ты — Omoikiri.AI, интеллектуальный а
 - Будь проактивным: если видишь проблему, сообщи даже если не спрашивали
 - При оценке работы менеджеров сверяй с нашими стандартами продаж из базы знаний ниже
 
+Когда пользователь просит создать задачу или напоминание:
+1. Сначала найди контакт через get_chats с name_search если указано имя
+2. Определи remote_jid контакта из результатов
+3. Вычисли дату и время (учитывай что пользователь в Алматы, UTC+5)
+4. Определи тип задачи: call_back (перезвонить), send_quote (КП), send_catalog (каталог), visit_showroom (шоурум), follow_up (follow-up)
+5. Используй create_task с правильными параметрами
+
 ${KNOWLEDGE_BASE}`;
 
 const TOOLS = [
@@ -40,6 +47,10 @@ const TOOLS = [
         limit: {
           type: 'number',
           description: 'Количество чатов (по умолчанию 20)',
+        },
+        name_search: {
+          type: 'string',
+          description: 'Search chats by contact name or phone (partial match, case-insensitive). Also searches CRM contact names.',
         },
       },
       required: [],
@@ -197,6 +208,25 @@ const TOOLS = [
       required: ['remote_jid', 'tags'],
     },
   },
+  {
+    name: 'create_task',
+    description: 'Create a task/reminder in CRM. Use when user asks to schedule follow-ups, callbacks, send quotes, etc. You MUST first use get_chats or get_contacts to find the remote_jid for the contact if user mentions a name.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'WhatsApp session ID (default: use current session)' },
+        remote_jid: { type: 'string', description: 'Contact phone JID (e.g. 77001234567@s.whatsapp.net). Use get_chats to find it by name.' },
+        title: { type: 'string', description: 'Task title, max 200 chars' },
+        due_date: { type: 'string', description: 'Due date as ISO 8601 string (e.g. 2026-03-31T12:00:00+05:00)' },
+        description: { type: 'string', description: 'Optional details, max 2000 chars' },
+        task_type: { type: 'string', enum: ['follow_up', 'call_back', 'send_quote', 'send_catalog', 'visit_showroom', 'custom'], description: 'Type of task' },
+        priority: { type: 'string', enum: ['low', 'medium', 'high', 'urgent'], description: 'Priority level' },
+        deal_value: { type: 'number', description: 'Expected deal value' },
+        notes: { type: 'string', description: 'Additional notes' },
+      },
+      required: ['title', 'due_date'],
+    },
+  },
 ];
 
 function normalizeLimit(value, fallback, max = 100) {
@@ -212,14 +242,16 @@ async function executeTool(name, input = {}) {
   try {
     switch (name) {
       case 'get_chats': {
+        // If searching by name, fetch more rows to allow post-filter
+        const fetchLimit = input.name_search ? 200 : normalizeLimit(input.limit, 20);
         let query = supabase
           .from('chats')
           .select(
-            'session_id, remote_jid, display_name, chat_type, tags, is_muted, last_message_at, phone_number'
+            'session_id, remote_jid, display_name, chat_type, tags, is_muted, last_message_at, phone_number, push_name'
           )
           .neq('is_hidden', true)
           .order('last_message_at', { ascending: false })
-          .limit(normalizeLimit(input.limit, 20));
+          .limit(fetchLimit);
 
         if (input.session_id) {
           query = query.eq('session_id', input.session_id);
@@ -230,7 +262,45 @@ async function executeTool(name, input = {}) {
           return JSON.stringify({ error: error.message });
         }
 
-        return JSON.stringify(data || []);
+        let filtered = data || [];
+
+        // Enrich with CRM contact names so AI can find contacts by CRM name
+        const jids = filtered.map((c) => c.remote_jid).filter(Boolean);
+        if (jids.length > 0) {
+          const { data: crmContacts } = await supabase
+            .from('contacts_crm')
+            .select('remote_jid, first_name, last_name')
+            .in('remote_jid', jids);
+
+          if (crmContacts && crmContacts.length > 0) {
+            const crmMap = new Map(crmContacts.map((c) => [c.remote_jid, c]));
+            filtered = filtered.map((chat) => {
+              const crm = crmMap.get(chat.remote_jid);
+              if (crm) {
+                const crmName = [crm.first_name, crm.last_name].filter(Boolean).join(' ').trim();
+                return { ...chat, crm_name: crmName || undefined };
+              }
+              return chat;
+            });
+          }
+        }
+
+        // Filter by name_search if provided
+        if (input.name_search && typeof input.name_search === 'string') {
+          const q = input.name_search.toLowerCase();
+          filtered = filtered.filter((c) =>
+            (c.display_name || '').toLowerCase().includes(q) ||
+            (c.remote_jid || '').includes(q) ||
+            (c.push_name || '').toLowerCase().includes(q) ||
+            (c.crm_name || '').toLowerCase().includes(q)
+          );
+        }
+
+        // Apply final limit after filtering
+        const finalLimit = normalizeLimit(input.limit, 20);
+        filtered = filtered.slice(0, finalLimit);
+
+        return JSON.stringify(filtered);
       }
 
       case 'get_messages': {
@@ -494,6 +564,41 @@ async function executeTool(name, input = {}) {
         }
 
         return JSON.stringify({ success: true, tags: cleanTags });
+      }
+
+      case 'create_task': {
+        const sessionId = typeof input.session_id === 'string' && input.session_id.trim()
+          ? input.session_id.trim()
+          : 'omoikiri-main';
+        const title = (input.title || '').trim();
+        const dueDate = (input.due_date || '').trim();
+        if (!title) return JSON.stringify({ error: 'title is required' });
+        if (!dueDate) return JSON.stringify({ error: 'due_date is required' });
+        if (title.length > 200) return JSON.stringify({ error: 'Title too long (max 200)' });
+
+        const VALID_TYPES = ['follow_up', 'call_back', 'send_quote', 'send_catalog', 'visit_showroom', 'custom'];
+        const VALID_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
+
+        const { data, error } = await supabase
+          .from('tasks')
+          .insert({
+            session_id: sessionId,
+            remote_jid: input.remote_jid || null,
+            title,
+            description: input.description || null,
+            task_type: VALID_TYPES.includes(input.task_type) ? input.task_type : 'follow_up',
+            priority: VALID_PRIORITIES.includes(input.priority) ? input.priority : 'medium',
+            status: 'pending',
+            due_date: dueDate,
+            deal_value: input.deal_value || null,
+            notes: input.notes || null,
+            created_by: 'ai_chat',
+          })
+          .select()
+          .single();
+
+        if (error) return JSON.stringify({ error: error.message });
+        return JSON.stringify({ success: true, taskId: data.id, title: data.title, dueDate: data.due_date });
       }
 
       default:
