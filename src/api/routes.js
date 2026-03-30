@@ -1142,6 +1142,7 @@ export function setupRoutes(app) {
       avatarUrl,
       notes,
       phone: phoneNumber,
+      dealValue,
     } = req.body ?? {};
 
     if (!remoteJid) {
@@ -1176,8 +1177,14 @@ export function setupRoutes(app) {
         responsible_manager: responsibleManager?.trim() || null,
         avatar_url: avatarUrl || null,
         notes: notes?.trim() || null,
+        deal_value: dealValue != null ? dealValue : undefined,
         updated_at: new Date().toISOString(),
       };
+
+      // Remove undefined keys so they don't overwrite existing values
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === undefined) delete payload[key];
+      }
 
       const { data, error } = await supabase
         .from('contacts_crm')
@@ -1413,6 +1420,7 @@ export function setupRoutes(app) {
           avatarUrl: crm?.avatar_url,
           city: crm?.city,
           company: crm?.company,
+          dealValue: crm?.deal_value || null,
           tags: chat?.tags || [],
         });
       }
@@ -1472,6 +1480,189 @@ export function setupRoutes(app) {
       return res.status(500).json({ error: 'Failed to update deal stage' });
     }
   });
+
+  // ── Tasks & Reminders CRUD ──────────────────────────────────────────────
+
+  router.get('/tasks/stats', async (req, res) => {
+    try {
+      const { session_id } = req.query;
+      const now = new Date().toISOString();
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+
+      let baseQuery = supabase.from('tasks').select('id, status, due_date, completed_at', { count: 'exact' });
+      if (session_id && session_id !== '__all__') {
+        baseQuery = baseQuery.eq('session_id', session_id);
+      }
+
+      const { data: all } = await baseQuery;
+      const tasks = all || [];
+
+      const pending = tasks.filter(t => t.status === 'pending').length;
+      const overdue = tasks.filter(t => t.status === 'pending' && t.due_date < now).length;
+      const completedToday = tasks.filter(t => t.status === 'completed' && t.completed_at >= todayStart.toISOString()).length;
+      const upcomingToday = tasks.filter(t => t.status === 'pending' && t.due_date >= todayStart.toISOString() && t.due_date < new Date(todayStart.getTime() + 86400000).toISOString()).length;
+      const total = tasks.length;
+
+      res.json({ total, pending, overdue, completedToday, upcomingToday });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to fetch task stats');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  router.get('/tasks', async (req, res) => {
+    try {
+      const { session_id, status, remote_jid, limit = 50, offset = 0 } = req.query;
+
+      let query = supabase
+        .from('tasks')
+        .select('*')
+        .order('due_date', { ascending: true })
+        .range(+offset, +offset + +limit - 1);
+
+      if (session_id && session_id !== '__all__') {
+        query = query.eq('session_id', session_id);
+      }
+      if (remote_jid) {
+        query = query.eq('remote_jid', remote_jid);
+      }
+      if (status === 'overdue') {
+        query = query.eq('status', 'pending').lt('due_date', new Date().toISOString());
+      } else if (status && status !== 'all') {
+        query = query.eq('status', status);
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      // Enrich with contact info
+      const jids = [...new Set((data || []).filter(t => t.remote_jid).map(t => t.remote_jid))];
+      const contactMap = new Map();
+      if (jids.length) {
+        const { data: contacts } = await supabase
+          .from('contacts_crm')
+          .select('remote_jid, first_name, last_name, company')
+          .in('remote_jid', jids);
+        for (const c of contacts || []) {
+          contactMap.set(c.remote_jid, c);
+        }
+        // Also get display names from chats
+        const { data: chats } = await supabase
+          .from('chats')
+          .select('remote_jid, display_name')
+          .in('remote_jid', jids);
+        for (const c of chats || []) {
+          if (!contactMap.has(c.remote_jid) && c.display_name) {
+            contactMap.set(c.remote_jid, { first_name: c.display_name, last_name: '' });
+          }
+        }
+      }
+
+      const enriched = (data || []).map(task => {
+        const contact = contactMap.get(task.remote_jid);
+        return {
+          ...task,
+          contactName: contact ? `${contact.first_name || ''} ${contact.last_name || ''}`.trim() : null,
+          contactCompany: contact?.company || null,
+        };
+      });
+
+      res.json({ tasks: enriched });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to fetch tasks');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  router.post('/tasks', async (req, res) => {
+    try {
+      const { sessionId, remoteJid, title, description, taskType, priority, dueDate, assignedTo, dealValue, notes } = req.body;
+
+      if (!sessionId || !title || !dueDate) {
+        return res.status(400).json({ error: 'sessionId, title, and dueDate are required' });
+      }
+      if (title.length > 200) return res.status(400).json({ error: 'Title too long (max 200)' });
+      if (description && description.length > 2000) return res.status(400).json({ error: 'Description too long (max 2000)' });
+
+      const VALID_TYPES = ['follow_up', 'call_back', 'send_quote', 'send_catalog', 'visit_showroom', 'custom'];
+      const VALID_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
+
+      const { data, error } = await supabase
+        .from('tasks')
+        .insert({
+          session_id: sessionId,
+          remote_jid: remoteJid || null,
+          title: title.trim(),
+          description: description?.trim() || null,
+          task_type: VALID_TYPES.includes(taskType) ? taskType : 'follow_up',
+          priority: VALID_PRIORITIES.includes(priority) ? priority : 'medium',
+          status: 'pending',
+          due_date: dueDate,
+          assigned_to: assignedTo || null,
+          deal_value: dealValue || null,
+          notes: notes?.trim() || null,
+          created_by: 'manual',
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ task: data });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to create task');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  router.patch('/tasks/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updates = { ...req.body, updated_at: new Date().toISOString() };
+
+      // Auto-set completed_at
+      if (updates.status === 'completed' && !updates.completed_at) {
+        updates.completed_at = new Date().toISOString();
+      }
+      if (updates.status === 'pending') {
+        updates.completed_at = null;
+      }
+
+      // Sanitize — only allow valid fields
+      const ALLOWED = ['title', 'description', 'task_type', 'priority', 'status', 'due_date', 'completed_at', 'assigned_to', 'deal_value', 'notes', 'remote_jid', 'updated_at'];
+      const sanitized = {};
+      for (const key of ALLOWED) {
+        if (key in updates) sanitized[key] = updates[key];
+      }
+
+      const { data, error } = await supabase
+        .from('tasks')
+        .update(sanitized)
+        .eq('id', id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ task: data });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to update task');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  router.delete('/tasks/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { error } = await supabase.from('tasks').delete().eq('id', id);
+      if (error) throw error;
+      res.json({ success: true });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to delete task');
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── End Tasks & Reminders ──────────────────────────────────────────────
 
   router.get('/sessions/:sessionId/contacts', async (req, res) => {
     const { sessionId } = req.params;
