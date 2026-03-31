@@ -29,15 +29,15 @@ function getReconnectDelay(sessionId) {
   const attempt = (reconnectAttempts.get(sessionId) ?? 0) + 1;
   reconnectAttempts.set(sessionId, attempt);
 
-  if (attempt <= 5) {
-    return 5000;
-  }
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, then cap at 5 min
+  const baseDelay = Math.min(
+    1000 * Math.pow(2, Math.min(attempt - 1, 6)),  // 1s -> 64s
+    5 * 60 * 1000  // Cap at 5 minutes (was 30 min — way too long)
+  );
+  // Add 0-10% jitter to prevent thundering herd with multiple sessions
+  const jitter = Math.random() * baseDelay * 0.1;
 
-  if (attempt <= 8) {
-    return 5 * 60 * 1000;
-  }
-
-  return 30 * 60 * 1000;
+  return Math.round(baseDelay + jitter);
 }
 
 function resetReconnectAttempts(sessionId) {
@@ -81,6 +81,8 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
     for (const event of ['connection.update', 'creds.update', 'messages.upsert', 'messaging-history.set', 'messages.update']) {
       _prevSock.ev.removeAllListeners(event);
     }
+    // Close underlying WebSocket to prevent lingering connections
+    try { _prevSock.ws?.close(); } catch {}
   }
 
   if (!activeSessions.has(sessionId)) {
@@ -102,16 +104,14 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: [
-      ['Chrome', 'Firefox', 'Safari', 'Edge', 'Opera'][Math.floor(Math.random() * 5)],
-      'Desktop',
-      `${10 + Math.floor(Math.random() * 10)}.${Math.floor(Math.random() * 10)}.${Math.floor(Math.random() * 5000)}`,
-    ],
+    browser: ['Chrome', 'Desktop', '125.0.6422'],  // Fixed fingerprint — random browser on every reconnect looks suspicious to WhatsApp
     version: waVersion,
-    syncFullHistory: true,
-    fireInitQueries: true,
+    keepAliveIntervalMs: 15000,    // Ping WhatsApp every 15s (default 30s is too slow, causes timeout disconnects)
+    connectTimeoutMs: 60000,       // 60s connect timeout (default ~20s is too short for Railway)
+    syncFullHistory: false,        // Disabled — full history download on every reconnect causes massive load and timeouts
+    fireInitQueries: false,        // Disabled — unnecessary presence queries add load on reconnect
     markOnlineOnConnect: true,
-    shouldSyncHistoryMessage: () => true,
+    shouldSyncHistoryMessage: () => false,  // Skip history sync messages to reduce reconnect time
     getMessage: async (key) => {
       // Baileys calls this for message retries — fetch from Supabase
       try {
@@ -247,9 +247,9 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
       const delayStr = delay >= 60000 ? `${delay / 60000} min` : `${delay / 1000}s`;
       console.log(`[${sessionId}] Reconnecting in ${delayStr}... (attempt ${attempt})`);
 
-      if (attempt === 9) {
+      if (attempt === 15) {
         sendTelegramAlert(
-          `WA Bridge [${sessionId}]: 9 failed reconnect attempts. Switching to 30min interval.`
+          `WA Bridge [${sessionId}]: 15 failed reconnect attempts. Retrying every 5min.`
         ).catch(() => {});
       }
 
