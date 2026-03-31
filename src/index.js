@@ -2,7 +2,7 @@ import { startServer } from './api/server.js';
 import { sessionManager } from './baileys/sessionManager.js';
 import { logger } from './config.js';
 import { stopWebSocket } from './api/websocket.js';
-import { stopHealthMonitor } from './monitor.js';
+import { stopHealthMonitor, startSummaryScheduler, stopSummaryScheduler } from './monitor.js';
 import { stopVersionChecker } from './versionChecker.js';
 import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
 import { loadPhoneRegistry } from './baileys/messageHandler.js';
@@ -37,6 +37,7 @@ async function bootstrap() {
   await sessionManager.startAll();
   startAIWorker();
   startNotificationChecker();
+  startSummaryScheduler();
   startKeepAlive();
 
   // Refresh phone registry every 60s to pick up new sessions
@@ -59,6 +60,7 @@ async function shutdown(signal) {
   stopNotificationChecker();
   await sessionManager.stopAll();
   stopHealthMonitor();
+  stopSummaryScheduler();
   stopVersionChecker();
   stopWebSocket();
 
