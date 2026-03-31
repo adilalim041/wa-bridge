@@ -29,11 +29,19 @@ function getReconnectDelay(sessionId) {
   const attempt = (reconnectAttempts.get(sessionId) ?? 0) + 1;
   reconnectAttempts.set(sessionId, attempt);
 
-  // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, then cap at 5 min
-  const baseDelay = Math.min(
-    1000 * Math.pow(2, Math.min(attempt - 1, 6)),  // 1s -> 64s
-    5 * 60 * 1000  // Cap at 5 minutes (was 30 min — way too long)
-  );
+  // Three-tier backoff:
+  //   Attempts 1-7:  exponential 1s, 2s, 4s, 8s, 16s, 32s, 64s (fast recovery for hiccups)
+  //   Attempts 8-15: 3 minutes (moderate — give network time to recover)
+  //   Attempts 16+:  10 minutes (gentle — don't hammer WhatsApp during long outages)
+  let baseDelay;
+  if (attempt <= 7) {
+    baseDelay = 1000 * Math.pow(2, attempt - 1); // 1s -> 64s
+  } else if (attempt <= 15) {
+    baseDelay = 3 * 60 * 1000; // 3 min
+  } else {
+    baseDelay = 10 * 60 * 1000; // 10 min
+  }
+
   // Add 0-10% jitter to prevent thundering herd with multiple sessions
   const jitter = Math.random() * baseDelay * 0.1;
 
