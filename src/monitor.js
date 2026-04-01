@@ -194,3 +194,93 @@ function sendDisconnectSummary() {
   // Clear log after sending (keep disconnectedAt — those sessions are still down)
   disconnectLog.clear();
 }
+
+// --- Telegram bot command polling ---
+
+let pollingInterval = null;
+let lastUpdateId = 0;
+
+export function startTelegramPolling() {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+
+  // Poll every 10 seconds for new messages
+  pollingInterval = setInterval(pollTelegramUpdates, 10_000);
+  // First poll immediately
+  pollTelegramUpdates();
+}
+
+export function stopTelegramPolling() {
+  if (pollingInterval) {
+    clearInterval(pollingInterval);
+    pollingInterval = null;
+  }
+}
+
+async function pollTelegramUpdates() {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=0&allowed_updates=["message"]`;
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+
+    const { result } = await resp.json();
+    if (!result?.length) return;
+
+    for (const update of result) {
+      lastUpdateId = update.update_id;
+      const msg = update.message;
+      if (!msg?.text || String(msg.chat.id) !== TELEGRAM_CHAT_ID) continue;
+
+      const cmd = msg.text.trim().toLowerCase();
+      if (cmd === '/status' || cmd === '/s') {
+        await handleStatusCommand();
+      }
+    }
+  } catch {
+    // Silent — don't spam logs on network blips
+  }
+}
+
+async function handleStatusCommand() {
+  // Lazy import to avoid circular dependency (sessionManager imports monitor.js)
+  const { sessionManager } = await import('./baileys/sessionManager.js');
+  const states = sessionManager.getAllStates();
+  const sessionIds = Object.keys(states);
+
+  if (!sessionIds.length) {
+    return sendTelegramAlert('<b>Статус:</b> Нет активных сессий');
+  }
+
+  const now = Date.now();
+  let msg = '<b>WA Bridge — Статус</b>\n\n';
+
+  for (const id of sessionIds) {
+    const state = states[id];
+    const dcStart = disconnectedAt.get(id);
+
+    if (state.connected) {
+      const uptime = lastConnectedAt.get(id);
+      const uptimeMin = uptime ? Math.round((now - uptime) / 60000) : 0;
+      msg += `\u2705 <b>${id}</b>: подключён`;
+      if (uptimeMin > 0) msg += ` (${uptimeMin} мин)`;
+      if (state.user) msg += ` — ${state.user}`;
+      msg += '\n';
+    } else if (dcStart) {
+      const downMin = Math.round((now - dcStart) / 60000);
+      msg += `\u274c <b>${id}</b>: отключён ${downMin} мин`;
+      if (state.lastError) msg += `\n   <i>${state.lastError}</i>`;
+      msg += '\n';
+    } else {
+      msg += `\u26a0 <b>${id}</b>: неизвестно`;
+      if (state.lastError) msg += ` — ${state.lastError}`;
+      msg += '\n';
+    }
+  }
+
+  // Server uptime
+  const uptimeS = process.uptime();
+  const uptimeH = Math.floor(uptimeS / 3600);
+  const uptimeM = Math.floor((uptimeS % 3600) / 60);
+  msg += `\n<i>Сервер: ${uptimeH}ч ${uptimeM}м</i>`;
+
+  await sendTelegramAlert(msg);
+}
