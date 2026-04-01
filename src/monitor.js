@@ -46,10 +46,13 @@ export function updateConnectionStatus(sessionId, connected) {
     const dcStart = disconnectedAt.get(sessionId);
     if (dcStart) {
       const duration = Date.now() - dcStart;
-      if (!disconnectLog.has(sessionId)) {
-        disconnectLog.set(sessionId, []);
+      // Only log disconnects > 60s (skip brief reconnect flickers)
+      if (duration > 60_000) {
+        if (!disconnectLog.has(sessionId)) {
+          disconnectLog.set(sessionId, []);
+        }
+        disconnectLog.get(sessionId).push({ at: dcStart, duration });
       }
-      disconnectLog.get(sessionId).push({ at: dcStart, duration });
       disconnectedAt.delete(sessionId);
     }
 
@@ -173,11 +176,21 @@ function sendDisconnectSummary() {
     msg += `(макс. ${Math.round(maxDuration / 60000)} мин, всего ${Math.round(totalDuration / 60000)} мин)\n`;
   }
 
+  // Also report sessions currently disconnected
+  for (const [sessionId, dcStart] of disconnectedAt) {
+    hasEvents = true;
+    const duration = Math.round((Date.now() - dcStart) / 60000);
+    msg += `\u26a0 <b>${sessionId}</b>: отключён уже ${duration} мин\n`;
+  }
+
   if (!hasEvents) return; // Nothing to report
 
-  msg += '\nВсе подключения восстановлены.';
+  // Check if all sessions are connected
+  if (disconnectedAt.size === 0) {
+    msg += '\nВсе подключения активны.';
+  }
   sendTelegramAlert(msg).catch(() => {});
 
-  // Clear log after sending
+  // Clear log after sending (keep disconnectedAt — those sessions are still down)
   disconnectLog.clear();
 }
