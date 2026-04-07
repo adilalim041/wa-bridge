@@ -1,9 +1,36 @@
+# Node
 node_modules/
-auth_state/
+*.log
+logs/
+
+# Env / secrets
 .env
 .env.*
-.env.local
-.env.production
-.env.*.local
+!.env.example
 *.key
+*.pem
 credentials.json
+
+# WhatsApp auth (this project uses Supabase, but defense-in-depth)
+auth_state/
+auth_info/
+auth_info_baileys/
+.wwebjs_auth/
+.wwebjs_cache/
+session/
+sessions/
+*.session
+tokens/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/
+
+# Sub-projects (have their own git)
+bazav2/
+
+# Stray agent-office folder (lives at Desktop level, not inside this repo)
+shared/
