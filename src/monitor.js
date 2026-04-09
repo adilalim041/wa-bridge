@@ -7,11 +7,53 @@ const healthIntervals = new Map();
 const lastConnectedAt = new Map();
 const alertSent = new Map();
 
-const DOWNTIME_THRESHOLD = 20 * 60 * 1000; // 20 minutes — alert only for real outages
-const ALERT_COOLDOWN = 60 * 60 * 1000; // 60 minutes between alerts per session
+const DOWNTIME_THRESHOLD = 5 * 60 * 1000; // 5 minutes — enterprise threshold
+const ALERT_COOLDOWN = 30 * 60 * 1000; // 30 minutes between alerts per session
 const lastAlertTime = new Map(); // sessionId -> timestamp of last alert
 const disconnectedAt = new Map(); // sessionId -> timestamp when disconnect started
 const disconnectLog = new Map(); // sessionId -> [{at, duration}] for morning summary
+
+// Ban detection tracking
+const dailyDisconnects = new Map(); // sessionId -> { count, loggedOut, connectionReplaced, date }
+const BAN_ALERT_THRESHOLD = 3; // alert if >3 loggedOut/connectionReplaced per day
+
+export function trackDisconnectEvent(sessionId, statusCode) {
+  const today = new Date().toISOString().slice(0, 10);
+  let entry = dailyDisconnects.get(sessionId);
+  if (!entry || entry.date !== today) {
+    entry = { count: 0, loggedOut: 0, connectionReplaced: 0, date: today };
+  }
+  entry.count++;
+  if (statusCode === 401 || statusCode === 515) entry.loggedOut++; // DisconnectReason.loggedOut
+  if (statusCode === 440) entry.connectionReplaced++; // DisconnectReason.connectionReplaced
+  dailyDisconnects.set(sessionId, entry);
+
+  const critical = entry.loggedOut + entry.connectionReplaced;
+  if (critical >= BAN_ALERT_THRESHOLD) {
+    sendTelegramAlert(
+      `🛑 Ban risk [${sessionId}]: ${critical} critical disconnects today (${entry.loggedOut} loggedOut, ${entry.connectionReplaced} replaced). Check account immediately!`
+    ).catch(() => {});
+  }
+}
+
+// Mass disconnect detection
+let massDisconnectTimer = null;
+export function checkMassDisconnect(allSessionsCount) {
+  const disconnectedNow = disconnectedAt.size;
+  if (disconnectedNow >= 3 && disconnectedNow >= allSessionsCount * 0.5) {
+    if (!massDisconnectTimer) {
+      massDisconnectTimer = setTimeout(() => {
+        // Still many disconnected after 60s?
+        if (disconnectedAt.size >= 3) {
+          sendTelegramAlert(
+            `🚨 Mass disconnect: ${disconnectedAt.size}/${allSessionsCount} sessions down! Possible network/Railway issue.`
+          ).catch(() => {});
+        }
+        massDisconnectTimer = null;
+      }, 60000);
+    }
+  }
+}
 
 export async function sendTelegramAlert(message) {
   console.log(`[ALERT] ${message}`);

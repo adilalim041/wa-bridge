@@ -1,4 +1,5 @@
 import { WebSocketServer, WebSocket } from 'ws';
+import { logger } from '../config.js';
 
 let wss = null;
 let heartbeatInterval = null;
@@ -9,9 +10,21 @@ export function setupWebSocket(server) {
   }
 
   wss = new WebSocketServer({ server, path: '/ws' });
+  const API_KEY = process.env.API_KEY;
 
-  wss.on('connection', (ws) => {
-    console.log('Dashboard client connected via WebSocket');
+  wss.on('connection', (ws, req) => {
+    // Authenticate via query param: /ws?apiKey=...
+    if (API_KEY) {
+      const url = new URL(req.url, 'http://localhost');
+      const clientKey = url.searchParams.get('apiKey');
+      if (!clientKey || clientKey !== API_KEY) {
+        logger.warn('WebSocket connection rejected: invalid API key');
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+    }
+
+    logger.info('Dashboard client connected via WebSocket');
 
     ws.isAlive = true;
     ws.subscribedSessions = null;
@@ -32,7 +45,7 @@ export function setupWebSocket(server) {
     });
 
     ws.on('close', () => {
-      console.log('Dashboard client disconnected');
+      logger.debug('Dashboard client disconnected');
     });
   });
 

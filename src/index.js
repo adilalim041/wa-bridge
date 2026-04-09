@@ -59,24 +59,33 @@ async function shutdown(signal) {
   if (phoneRefreshTimer) clearInterval(phoneRefreshTimer);
   stopAIWorker();
   stopNotificationChecker();
-  await sessionManager.stopAll();
   stopHealthMonitor();
   stopSummaryScheduler();
   stopTelegramPolling();
   stopVersionChecker();
   stopWebSocket();
 
-  const closeTasks = [];
+  // Hard timeout: force exit after 15s if graceful shutdown hangs
+  const forceExitTimer = setTimeout(() => {
+    logger.error('Graceful shutdown timed out after 15s — forcing exit');
+    process.exit(1);
+  }, 15000);
+  forceExitTimer.unref(); // Don't keep process alive just for this timer
 
-  if (server) {
-    closeTasks.push(
-      new Promise((resolve) => {
-        server.close(() => resolve());
-      })
-    );
+  try {
+    await sessionManager.stopAll();
+  } catch (err) {
+    logger.error({ err }, 'Error stopping sessions during shutdown');
   }
 
-  await Promise.allSettled(closeTasks);
+  if (server) {
+    await new Promise((resolve) => {
+      server.close(() => resolve());
+      // If server doesn't close in 5s, continue anyway
+      setTimeout(resolve, 5000);
+    });
+  }
+
   process.exit(0);
 }
 

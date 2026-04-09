@@ -156,10 +156,8 @@ async function checkUnansweredChats() {
 // ── Hot lead alert ──
 export async function notifyHotLead(contactName, phone, topic, suggestion) {
   if (!isTelegramConfigured()) return;
-  // Disabled until AI classification is verified
-  return;
 
-  let msg = `<b>Hot lead</b>\n`;
+  let msg = `🔥 <b>Горячий лид</b>\n`;
   msg += `${contactName || phone}`;
   if (phone) msg += ` (+${phone})`;
   msg += '\n';
@@ -172,8 +170,6 @@ export async function notifyHotLead(contactName, phone, topic, suggestion) {
 // ── Daily summary ──
 export async function sendDailySummary(analysisResult) {
   if (!isTelegramConfigured()) return;
-  // Disabled until AI classification is verified
-  return;
 
   try {
     const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });

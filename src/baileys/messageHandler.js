@@ -1,7 +1,6 @@
 import { logger } from '../config.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
-import { enqueueForAI } from '../ai/queueManager.js';
 import { getContactName, saveContact, saveMessage, upsertChat } from '../storage/queries.js';
 import { supabase } from '../storage/supabase.js';
 import { processMedia } from './mediaHandler.js';
@@ -121,8 +120,8 @@ async function isChatHidden(sessionId, remoteJid) {
     hiddenCacheTimestamps.set(cacheKey, Date.now());
     return isHidden;
   } catch (error) {
-    logger.error({ err: error, sessionId, remoteJid }, 'Failed to resolve hidden chat state');
-    return false;
+    logger.error({ err: error, sessionId, remoteJid }, 'Failed to resolve hidden chat state — defaulting to hidden (fail-safe)');
+    return true; // Fail-safe: treat as hidden on DB error to prevent data leakage
   }
 }
 
@@ -464,18 +463,25 @@ export async function handleMessage(message, sock, sessionId) {
       );
 
       if (dialogSessionId) {
-        const { error: linkError } = await supabase
-          .from('messages')
-          .update({ dialog_session_id: dialogSessionId })
-          .eq('message_id', payload.messageId)
-          .eq('session_id', sessionId)
-          .eq('remote_jid', remoteJid);
+        // Retry linking up to 2 times — orphaned messages break AI analysis
+        let linked = false;
+        for (let linkAttempt = 0; linkAttempt < 2 && !linked; linkAttempt++) {
+          const { error: linkError } = await supabase
+            .from('messages')
+            .update({ dialog_session_id: dialogSessionId })
+            .eq('message_id', payload.messageId)
+            .eq('session_id', sessionId)
+            .eq('remote_jid', remoteJid);
 
-        if (linkError) {
-          logger.error(
-            { err: linkError, sessionId, remoteJid, messageId: payload.messageId, dialogSessionId },
-            'Failed to link message to dialog session'
-          );
+          if (!linkError) {
+            linked = true;
+          } else {
+            logger.error(
+              { err: linkError, sessionId, remoteJid, messageId: payload.messageId, dialogSessionId, attempt: linkAttempt },
+              'Failed to link message to dialog session'
+            );
+            if (linkAttempt < 1) await new Promise((r) => setTimeout(r, 1000));
+          }
         }
 
         await trackResponseTime(
@@ -486,7 +492,6 @@ export async function handleMessage(message, sock, sessionId) {
           payload.timestamp
         );
 
-        await enqueueForAI(sessionId, remoteJid, payload.messageId, dialogSessionId);
       }
     } catch (error) {
       logger.error(

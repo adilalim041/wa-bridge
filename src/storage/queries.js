@@ -1,12 +1,31 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { logger } from '../config.js';
 import { supabase } from './supabase.js';
 
 // --- Failover queue for Supabase outages ---
-const MAX_QUEUE_SIZE = 1000;
+const MAX_QUEUE_SIZE = 5000;
 const FLUSH_INTERVAL_MS = 10_000;
-const FLUSH_BATCH_SIZE = 50;
+const FLUSH_BATCH_SIZE = 200;
+const QUEUE_ALERT_THRESHOLD = 1000;
+const QUEUE_BACKUP_PATH = 'data/queue-backup.json';
 const failoverQueue = [];
 let flushTimer = null;
+let alertSent = false;
+
+// Load backed-up queue on startup
+try {
+  if (existsSync(QUEUE_BACKUP_PATH)) {
+    const backed = JSON.parse(readFileSync(QUEUE_BACKUP_PATH, 'utf-8'));
+    if (Array.isArray(backed) && backed.length > 0) {
+      failoverQueue.push(...backed);
+      logger.info({ restored: backed.length }, 'Restored messages from queue backup file');
+      startFlushTimer();
+    }
+    unlinkSync(QUEUE_BACKUP_PATH);
+  }
+} catch (err) {
+  logger.warn({ err }, 'Failed to restore queue backup');
+}
 
 function startFlushTimer() {
   if (flushTimer) return;
@@ -52,7 +71,25 @@ export function getQueueStats() {
 export async function flushQueueOnShutdown() {
   if (failoverQueue.length === 0) return;
   logger.info({ queueSize: failoverQueue.length }, 'Flushing failover queue on shutdown...');
-  await flushQueue();
+
+  // Try flushing up to 3 times
+  for (let attempt = 0; attempt < 3 && failoverQueue.length > 0; attempt++) {
+    await flushQueue();
+    if (failoverQueue.length > 0) {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+
+  // If messages remain after 3 attempts, persist to disk
+  if (failoverQueue.length > 0) {
+    try {
+      mkdirSync('data', { recursive: true });
+      writeFileSync(QUEUE_BACKUP_PATH, JSON.stringify(failoverQueue));
+      logger.warn({ saved: failoverQueue.length }, 'Saved remaining queue to disk backup');
+    } catch (err) {
+      logger.error({ err, lost: failoverQueue.length }, 'CRITICAL: Failed to backup queue — messages may be lost');
+    }
+  }
 }
 
 export async function saveMessage(data) {
@@ -106,12 +143,27 @@ export async function saveMessage(data) {
 
   // All retries exhausted — queue for later flush instead of losing
   if (failoverQueue.length >= MAX_QUEUE_SIZE) {
+    // Backup to disk before dropping
+    try {
+      mkdirSync('data', { recursive: true });
+      writeFileSync(QUEUE_BACKUP_PATH, JSON.stringify(failoverQueue));
+    } catch { /* best effort */ }
     const dropped = failoverQueue.shift();
-    logger.warn({ droppedMessageId: dropped.message_id }, 'Failover queue full, dropping oldest message');
+    logger.error({ droppedMessageId: dropped.message_id, queueSize: MAX_QUEUE_SIZE }, 'CRITICAL: Failover queue full, dropped oldest message');
   }
   failoverQueue.push(row);
   startFlushTimer();
   logger.warn({ messageId: data.messageId, queueSize: failoverQueue.length }, 'Message queued for retry (Supabase outage)');
+
+  // Alert via Telegram when queue grows beyond threshold
+  if (failoverQueue.length >= QUEUE_ALERT_THRESHOLD && !alertSent) {
+    alertSent = true;
+    import('../notifications/telegramBot.js').then(({ sendTelegramMessage }) => {
+      sendTelegramMessage(`⚠️ Failover queue: ${failoverQueue.length} messages queued. Supabase may be down.`).catch(() => {});
+    }).catch(() => {});
+    // Reset alert flag after 5 minutes
+    setTimeout(() => { alertSent = false; }, 5 * 60 * 1000);
+  }
 }
 
 export async function upsertChat({
@@ -334,7 +386,18 @@ export async function getContacts(sessionId) {
   }
 }
 
+// In-memory cache for getChatsWithLastMessage — 10s TTL, reduces DB load at 8 sessions
+const chatsCache = new Map(); // sessionId -> { data, timestamp }
+const CHATS_CACHE_TTL = 10_000; // 10 seconds
+
 export async function getChatsWithLastMessage(sessionId) {
+  // Check cache first
+  const cached = chatsCache.get(sessionId);
+  if (cached && Date.now() - cached.timestamp < CHATS_CACHE_TTL) {
+    return cached.data;
+  }
+
+  const queryStart = Date.now();
   try {
     // Try optimized RPC first (single SQL query with LATERAL JOINs)
     const { data: rpcData, error: rpcError } = await supabase
@@ -344,7 +407,7 @@ export async function getChatsWithLastMessage(sessionId) {
       });
 
     if (!rpcError && rpcData) {
-      return rpcData
+      const result = rpcData
         .filter((row) => {
           const jid = row.remote_jid;
           if (!jid || jid.includes('-')) return true; // groups ok
@@ -378,6 +441,10 @@ export async function getChatsWithLastMessage(sessionId) {
         crmRole: row.crm_role || null,
         crmAvatarUrl: row.crm_avatar_url || null,
       }));
+      const elapsed = Date.now() - queryStart;
+      if (elapsed > 2000) logger.warn({ sessionId, elapsed }, 'Slow getChatsWithLastMessage query');
+      chatsCache.set(sessionId, { data: result, timestamp: Date.now() });
+      return result;
     }
 
     // Fallback: RPC not available yet — use multi-query approach

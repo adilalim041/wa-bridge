@@ -2,7 +2,8 @@ import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { fetchLatestBaileysVersion, makeWASocket, DisconnectReason } from 'baileys';
 import { logger } from '../config.js';
-import { sendTelegramAlert, startHealthMonitor, updateConnectionStatus } from '../monitor.js';
+import { sendTelegramAlert, startHealthMonitor, updateConnectionStatus, trackDisconnectEvent, checkMassDisconnect } from '../monitor.js';
+import { logAudit } from '../storage/auditLog.js';
 import { supabase } from '../storage/supabase.js';
 import { useSupabaseAuthState } from '../storage/authState.js';
 import { emitNewMessage, emitSessionStatus } from '../api/websocket.js';
@@ -20,14 +21,55 @@ const connectionStates = new Map();
 const reconnectAttempts = new Map();
 const monitoredSessions = new Set();
 const activeSessions = new Set();
+const presenceTimers = new Map(); // Anti-ban: online/offline cycling per session
+
+// Reconnect semaphore — max 2 concurrent reconnections to avoid DB/WA flood
+const MAX_CONCURRENT_RECONNECTS = 2;
+let activeReconnects = 0;
+const reconnectQueue = [];
+
+function scheduleReconnect(sessionId, delayMs, reconnectFn) {
+  setTimeout(() => {
+    if (!activeSessions.has(sessionId)) return;
+
+    if (activeReconnects >= MAX_CONCURRENT_RECONNECTS) {
+      // Queue it — will be dequeued when a slot frees up
+      reconnectQueue.push({ sessionId, reconnectFn });
+      logger.info({ sessionId, queueLength: reconnectQueue.length }, 'Reconnect queued (semaphore full)');
+      return;
+    }
+
+    activeReconnects++;
+    reconnectFn().finally(() => {
+      activeReconnects--;
+      // Dequeue next waiting reconnect
+      if (reconnectQueue.length > 0) {
+        const next = reconnectQueue.shift();
+        if (activeSessions.has(next.sessionId)) {
+          activeReconnects++;
+          next.reconnectFn().finally(() => {
+            activeReconnects--;
+          });
+        }
+      }
+    });
+  }, delayMs);
+}
 
 function shouldPrintQrToTerminal() {
   return activeSessions.size <= 1;
 }
 
+const MAX_RECONNECT_ATTEMPTS = 25; // Hard limit — stop hammering WhatsApp after this
+
 function getReconnectDelay(sessionId) {
   const attempt = (reconnectAttempts.get(sessionId) ?? 0) + 1;
   reconnectAttempts.set(sessionId, attempt);
+
+  // Hard limit: stop reconnecting after MAX_RECONNECT_ATTEMPTS
+  if (attempt > MAX_RECONNECT_ATTEMPTS) {
+    return null; // Signal: stop retrying
+  }
 
   // Three-tier backoff:
   //   Attempts 1-7:  exponential 1s, 2s, 4s, 8s, 16s, 32s, 64s (fast recovery for hiccups)
@@ -118,7 +160,7 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
     connectTimeoutMs: 60000,       // 60s connect timeout (default ~20s is too short for Railway)
     syncFullHistory: false,        // Disabled — full history download on every reconnect causes massive load and timeouts
     fireInitQueries: false,        // Disabled — unnecessary presence queries add load on reconnect
-    markOnlineOnConnect: true,
+    markOnlineOnConnect: false,  // Don't auto-mark as online — "always online" triggers WhatsApp automation detection
     shouldSyncHistoryMessage: () => false,  // Skip history sync messages to reduce reconnect time
     getMessage: async (key) => {
       // Baileys calls this for message retries — fetch from Supabase
@@ -201,6 +243,26 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
           });
       }
 
+      // Anti-ban: periodic online/offline cycling to appear like a real phone
+      if (presenceTimers.has(sessionId)) clearInterval(presenceTimers.get(sessionId));
+      const cyclePresence = () => {
+        const onlineDuration = 20 * 60 * 1000 + Math.random() * 20 * 60 * 1000; // 20-40 min online
+        const offlineDuration = 5 * 60 * 1000 + Math.random() * 5 * 60 * 1000; // 5-10 min offline
+
+        setTimeout(() => {
+          if (!activeSessions.has(sessionId)) return;
+          sock.sendPresenceUpdate('unavailable').catch(() => {});
+          setTimeout(() => {
+            if (!activeSessions.has(sessionId)) return;
+            sock.sendPresenceUpdate('available').catch(() => {});
+          }, offlineDuration);
+        }, onlineDuration);
+      };
+      const presenceTimer = setInterval(cyclePresence, 30 * 60 * 1000 + Math.random() * 10 * 60 * 1000);
+      presenceTimers.set(sessionId, presenceTimer);
+      cyclePresence(); // Start first cycle
+
+      logAudit('session.connected', sessionId, { user: sock.user?.name || sock.user?.id });
       console.log(`[${sessionId}] Connected to WhatsApp as ${sock.user?.name || sock.user?.id || 'unknown user'}`);
     }
 
@@ -215,8 +277,14 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         lastError: `Status ${statusCode || 'unknown'}: ${reason}`,
       });
       updateConnectionStatus(sessionId, false);
+      logAudit('session.disconnected', sessionId, { statusCode, reason });
 
       console.log(`[${sessionId}] Connection closed. Status: ${statusCode}, Reason: ${reason}`);
+
+      // Anti-ban tracking + mass disconnect detection
+      if (presenceTimers.has(sessionId)) { clearInterval(presenceTimers.get(sessionId)); presenceTimers.delete(sessionId); }
+      if (statusCode) trackDisconnectEvent(sessionId, statusCode);
+      checkMassDisconnect(activeSessions.size);
 
       if (!activeSessions.has(sessionId)) {
         console.log(`[${sessionId}] Session stopped manually. Skipping reconnect.`);
@@ -237,39 +305,76 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         sendTelegramAlert(`WA Bridge [${sessionId}]: Session logged out! Need new QR scan.`).catch(() => {});
         console.log(`[${sessionId}] Session expired. Auth state cleared. Restarting for new QR...`);
 
-        setTimeout(() => {
-          if (!activeSessions.has(sessionId)) {
-            return;
-          }
-
+        const reconnectFn = () =>
           startConnection({ sessionId, onSocket, _prevSock: sock }).catch((error) => {
             logger.error({ err: error, sessionId }, 'Failed to restart WhatsApp connection');
           });
-        }, 3000);
+        scheduleReconnect(sessionId, 3000, reconnectFn);
 
         return;
       }
 
+      // connectionReplaced: account logged in on another device — DO NOT auto-reconnect
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        resetReconnectAttempts(sessionId);
+        sendTelegramAlert(
+          `⚠️ WA Bridge [${sessionId}]: Connection replaced — account logged in elsewhere! Auto-reconnect STOPPED. Scan new QR when ready.`
+        ).catch(() => {});
+        logger.warn({ sessionId, statusCode }, 'Connection replaced by another device — stopping reconnect');
+        return;
+      }
+
+      // restartRequired: Baileys detected protocol issue — restart via semaphore
+      if (statusCode === DisconnectReason.restartRequired) {
+        resetReconnectAttempts(sessionId);
+        logger.info({ sessionId }, 'Restart required by Baileys — reconnecting in 3s');
+        scheduleReconnect(sessionId, 3000, () =>
+          startConnection({ sessionId, onSocket, _prevSock: sock }).catch((err) => {
+            logger.error({ err, sessionId }, 'Failed to restart after restartRequired');
+          })
+        );
+        return;
+      }
+
+      // timedOut: use longer backoff to avoid hammering
+      if (statusCode === DisconnectReason.timedOut) {
+        const timeoutDelay = 5 * 60 * 1000;
+        logger.warn({ sessionId }, 'Connection timed out — backing off for 5 min');
+        scheduleReconnect(sessionId, timeoutDelay, () =>
+          startConnection({ sessionId, onSocket, _prevSock: sock }).catch((err) => {
+            logger.error({ err, sessionId }, 'Failed to reconnect after timeout');
+          })
+        );
+        return;
+      }
+
+      // Generic disconnect — use backoff with hard limit
       const delay = getReconnectDelay(sessionId);
       const attempt = reconnectAttempts.get(sessionId) ?? 0;
+
+      // Hard limit reached — stop reconnecting to protect account
+      if (delay === null) {
+        sendTelegramAlert(
+          `🛑 WA Bridge [${sessionId}]: ${MAX_RECONNECT_ATTEMPTS} reconnect attempts exceeded! Auto-reconnect STOPPED. Manual intervention required.`
+        ).catch(() => {});
+        logger.error({ sessionId, attempt }, 'Max reconnect attempts exceeded — stopping');
+        return;
+      }
+
       const delayStr = delay >= 60000 ? `${delay / 60000} min` : `${delay / 1000}s`;
       console.log(`[${sessionId}] Reconnecting in ${delayStr}... (attempt ${attempt})`);
 
       if (attempt === 15) {
         sendTelegramAlert(
-          `WA Bridge [${sessionId}]: 15 failed reconnect attempts. Retrying every 5min.`
+          `WA Bridge [${sessionId}]: 15 failed reconnect attempts. Retrying every 10min.`
         ).catch(() => {});
       }
 
-      setTimeout(() => {
-        if (!activeSessions.has(sessionId)) {
-          return;
-        }
-
+      scheduleReconnect(sessionId, delay, () =>
         startConnection({ sessionId, onSocket, _prevSock: sock }).catch((error) => {
           console.error(`[${sessionId}] Failed to reconnect:`, error.message);
-        });
-      }, delay);
+        })
+      );
     }
   });
 

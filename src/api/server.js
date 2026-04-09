@@ -67,7 +67,14 @@ export function startServer() {
     const API_KEY = process.env.API_KEY;
     app.use((req, res, next) => {
         if (req.path === '/health' || req.path === '/ws' || req.path.startsWith('/baza/')) return next();
-        const key = req.headers['x-api-key'] || req.query.apiKey;
+        // QR page: allow if apiKey in query (for browser access)
+        if (req.path.startsWith('/qr')) {
+            const qrKey = req.query.apiKey;
+            if (qrKey && API_KEY && qrKey.length === API_KEY.length && crypto.timingSafeEqual(Buffer.from(qrKey), Buffer.from(API_KEY))) {
+                return next();
+            }
+        }
+        const key = req.headers['x-api-key'];
         const isValid = key && API_KEY &&
             key.length === API_KEY.length &&
             crypto.timingSafeEqual(Buffer.from(key), Buffer.from(API_KEY));

@@ -118,7 +118,12 @@ export async function processMedia(message, sessionId) {
       return null;
     }
 
-    const buffer = await downloadMediaMessage(message, 'buffer', {});
+    // Download with 30s timeout to prevent hanging indefinitely
+    const downloadPromise = downloadMediaMessage(message, 'buffer', {});
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Media download timeout (30s)')), 30000)
+    );
+    const buffer = await Promise.race([downloadPromise, timeoutPromise]);
     if (!buffer || buffer.length === 0) {
       logger.warn(`[${sessionId}] Empty media buffer. Skipping upload.`);
       return null;
@@ -127,37 +132,53 @@ export async function processMedia(message, sessionId) {
     const folder = `wa-bridge/${sessionId}`;
     const publicId = `${message?.key?.id || 'media'}_${Date.now()}`;
 
-    const result = await new Promise((resolve, reject) => {
-      const uploadStream = cloudinary.uploader.upload_stream(
-        {
-          folder,
-          public_id: publicId,
-          resource_type: descriptor.resourceType,
-          timeout: 30000,
-        },
-        (error, uploadResult) => {
-          if (error) {
-            reject(error);
-            return;
-          }
+    // Retry upload up to 2 times on transient failures
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const result = await new Promise((resolve, reject) => {
+          const uploadStream = cloudinary.uploader.upload_stream(
+            {
+              folder,
+              public_id: publicId,
+              resource_type: descriptor.resourceType,
+              timeout: 30000,
+            },
+            (error, uploadResult) => {
+              if (error) {
+                reject(error);
+                return;
+              }
 
-          resolve(uploadResult);
+              resolve(uploadResult);
+            }
+          );
+
+          Readable.from(buffer).pipe(uploadStream);
+        });
+
+        circuitBreaker.recordSuccess();
+
+        return {
+          url: result.secure_url,
+          publicId: result.public_id,
+          mediaType: descriptor.mediaType,
+          mimeType: descriptor.mimeType,
+          fileSize: buffer.length,
+          fileName: descriptor.fileName,
+        };
+      } catch (uploadErr) {
+        lastError = uploadErr;
+        if (attempt < 2) {
+          logger.warn({ err: uploadErr, sessionId, attempt }, 'Cloudinary upload failed — retrying');
+          await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
         }
-      );
+      }
+    }
 
-      Readable.from(buffer).pipe(uploadStream);
-    });
-
-    circuitBreaker.recordSuccess();
-
-    return {
-      url: result.secure_url,
-      publicId: result.public_id,
-      mediaType: descriptor.mediaType,
-      mimeType: descriptor.mimeType,
-      fileSize: buffer.length,
-      fileName: descriptor.fileName,
-    };
+    circuitBreaker.recordFailure();
+    logger.error({ err: lastError, sessionId, messageId: message?.key?.id }, 'Failed to process media after 3 attempts');
+    return null;
   } catch (error) {
     circuitBreaker.recordFailure();
     logger.error({ err: error, sessionId, messageId: message?.key?.id }, 'Failed to process media');

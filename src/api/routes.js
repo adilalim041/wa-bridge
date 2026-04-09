@@ -5,7 +5,6 @@ import { v2 as cloudinary } from 'cloudinary';
 import { handleAIChat } from '../ai/chatEndpoint.js';
 import { runDailyAnalysis, isAnalysisRunning, backfillAutoTags, classifyUntaggedChats, reclassifyStuckContacts } from '../ai/aiWorker.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
-import { enqueueForAI } from '../ai/queueManager.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
 import { getRateLimiter, sendWithDelay } from '../antiban/rateLimiter.js';
 import { invalidateHiddenCache } from '../baileys/messageHandler.js';
@@ -608,8 +607,8 @@ export function setupRoutes(app) {
       const state = sessionManager.getSessionState(config.session_id);
       sessions[config.session_id] = {
         connected: state.connected,
-        user: state.user,
         hasQR: Boolean(state.qr),
+        // Don't expose user names in unauthenticated health endpoint
       };
     }
 
@@ -764,12 +763,59 @@ export function setupRoutes(app) {
 
   router.get('/sessions/:sessionId/chats', async (req, res) => {
     const { sessionId } = req.params;
+    const limit = Math.min(Number(req.query.limit) || 2000, 2000);
+    const offset = Number(req.query.offset) || 0;
     try {
-      const chats = await getChatsWithLastMessage(sessionId);
-      return res.json(chats);
+      const allChats = await getChatsWithLastMessage(sessionId);
+      const paginated = offset > 0 || limit < 2000
+        ? allChats.slice(offset, offset + limit)
+        : allChats;
+      return res.json(paginated);
     } catch (error) {
       logger.error({ err: error, sessionId }, 'Failed to fetch chats');
       return res.status(500).json({ error: 'Failed to fetch chats' });
+    }
+  });
+
+  // Unified chats across all sessions — server-side aggregation with pagination
+  router.get('/chats/all', async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const offset = Number(req.query.offset) || 0;
+    try {
+      // Get all active sessions
+      const { data: sessions } = await supabase
+        .from('session_config')
+        .select('session_id, display_name')
+        .eq('is_active', true);
+
+      if (!sessions?.length) {
+        return res.json({ chats: [], total: 0, hasMore: false });
+      }
+
+      // Fetch chats from all sessions in parallel (cached, 10s TTL)
+      const allPromises = sessions.map(async (s) => {
+        const chats = await getChatsWithLastMessage(s.session_id);
+        return chats.map((chat) => ({
+          ...chat,
+          _sessionId: s.session_id,
+          _sessionName: s.display_name,
+        }));
+      });
+
+      const allResults = await Promise.all(allPromises);
+      const merged = allResults.flat().sort((a, b) =>
+        new Date(b.lastTimestamp) - new Date(a.lastTimestamp)
+      );
+
+      const paginated = merged.slice(offset, offset + limit);
+      return res.json({
+        chats: paginated,
+        total: merged.length,
+        hasMore: offset + limit < merged.length,
+      });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to fetch unified chats');
+      return res.status(500).json({ error: 'Failed to fetch unified chats' });
     }
   });
 
@@ -1922,7 +1968,6 @@ export function setupRoutes(app) {
               .eq('session_id', sessionId);
 
             await trackResponseTime(sessionId, phone, dialogSessionId, true, now);
-            await enqueueForAI(sessionId, phone, messageId, dialogSessionId);
           }
         } catch (aiErr) {
           logger.error({ err: aiErr, sessionId, messageId }, 'AI pipeline failed for /send');

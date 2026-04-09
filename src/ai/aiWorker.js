@@ -2,6 +2,7 @@ import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 import { sendDailySummary, notifyHotLead } from '../notifications/notificationService.js';
+import { DailyAnalysisSchema, ClassifyBatchSchema, parseAIResponse } from './schemas.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -13,6 +14,8 @@ const VALID_STAGES = ['needs_review', 'first_contact', 'consultation', 'model_se
 
 let dailyTimer = null;
 let isRunning = false;
+let runningStartedAt = null;
+const MAX_RUNNING_MS = 2 * 60 * 60 * 1000; // 2 hours hard timeout
 
 const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Kazakhstan (японская кухонная сантехника: мойки, смесители).
 Ты анализируешь переписки менеджеров с клиентами в WhatsApp.
@@ -89,6 +92,20 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
 - no_alternative = сказал "нет в наличии" без предложения альтернативы
 - manager_issues = пустой массив если менеджер работает хорошо
 
+Правила для confidence (калибровка):
+- 0.9–1.0 = Диалог длинный, этапы очевидны, данных достаточно
+- 0.7–0.9 = Контекст ясен, но есть небольшая неоднозначность
+- 0.5–0.7 = Мало сообщений или смешанные сигналы
+- 0.3–0.5 = Очень мало данных, приходится гадать
+- 0.0–0.3 = Практически нет данных для анализа
+
+Edge cases:
+- Голосовые сообщения [аудио]: учитывай их наличие, но не можешь прочитать содержимое — упомяни это в summary_ru
+- Изображения [изображение]: если менеджер отправил фото, это ХОРОШО — не ставь no_photos
+- Пересланные сообщения: контакт мог переслать от другого человека — не путай с прямым общением
+- Группы WhatsApp: в группах может быть несколько участников — определяй customer_type по основному собеседнику
+- Короткие диалоги (2-3 сообщения): ставь confidence < 0.5, не пытайся угадать deal_stage — ставь needs_review
+
 Используй справочную информацию ниже для точного определения моделей продукции и оценки соответствия стандартам продаж.
 Отвечай ТОЛЬКО JSON, ничего больше.
 
@@ -139,8 +156,15 @@ async function callClaude(messages) {
 
       const data = await response.json();
       const text = data.content?.[0]?.text || '';
-      const clean = text.replace(/```json\s*|```\s*/g, '').trim();
-      return JSON.parse(clean);
+      const result = parseAIResponse(text, DailyAnalysisSchema);
+
+      if (result.success) {
+        return result.data;
+      }
+
+      logger.warn({ error: result.error, raw: result.raw }, 'AI response validation failed — using raw with defaults');
+      // .catch() in schema provides safe defaults, so re-parse leniently
+      return result.raw || null;
     } catch (error) {
       if (attempt < MAX_RETRIES) {
         logger.warn({ err: error, attempt }, 'Claude API network error — retrying');
@@ -443,11 +467,19 @@ export async function runDailyAnalysis(date) {
     return { success: false, error: 'API key not configured' };
   }
 
+  // Auto-release stale lock after MAX_RUNNING_MS
+  if (isRunning && runningStartedAt && (Date.now() - runningStartedAt > MAX_RUNNING_MS)) {
+    logger.warn({ startedAt: new Date(runningStartedAt).toISOString() }, 'AI analysis exceeded 2h timeout — force-releasing lock');
+    isRunning = false;
+    runningStartedAt = null;
+  }
+
   if (isRunning) {
     return { success: false, error: 'Analysis already in progress', running: true };
   }
 
   isRunning = true;
+  runningStartedAt = Date.now();
   const analysisDate = date || todayDateStr();
   const startTime = Date.now();
   let processed = 0;
@@ -458,12 +490,13 @@ export async function runDailyAnalysis(date) {
     const dayStart = `${analysisDate}T00:00:00+05:00`;
     const dayEnd = `${analysisDate}T23:59:59+05:00`;
 
-    // Find dialog sessions that had messages on this date
+    // Find dialog sessions that had activity on this date
+    // A dialog is active on date X if it has messages within that day's range
     const { data: activeSessions, error } = await supabase
       .from('dialog_sessions')
       .select('id, session_id, remote_jid, message_count')
       .gte('last_message_at', dayStart)
-      .lte('started_at', dayEnd)
+      .lte('last_message_at', dayEnd)
       .order('last_message_at', { ascending: false });
 
     if (error) {
@@ -532,6 +565,7 @@ export async function runDailyAnalysis(date) {
     logger.error({ err: error }, 'Error during daily analysis');
   } finally {
     isRunning = false;
+    runningStartedAt = null;
   }
 
   const durationSec = Math.round((Date.now() - startTime) / 1000);
@@ -747,8 +781,14 @@ export async function classifyUntaggedChats() {
         }
 
         const data = await response.json();
-        const raw = (data.content?.[0]?.text || '').replace(/```json\s*|```\s*/g, '').trim();
-        const results = JSON.parse(raw);
+        const rawText = data.content?.[0]?.text || '';
+        const parseResult = parseAIResponse(rawText, ClassifyBatchSchema);
+
+        if (!parseResult.success) {
+          logger.warn({ error: parseResult.error }, 'Classify batch validation failed');
+          if (!Array.isArray(parseResult.raw)) { failed += batch.length; continue; }
+        }
+        const results = parseResult.success ? parseResult.data : parseResult.raw;
 
         if (Array.isArray(results)) {
           for (const r of results) {
@@ -814,38 +854,44 @@ export async function classifyUntaggedChats() {
   }
 }
 
-// Check if today's analysis was missed (e.g. after server restart) and run catch-up
+// Check if today's (and yesterday's) analysis was missed and run catch-up
 async function checkMissedAnalysis() {
   try {
-    // Get today's date in Almaty timezone (UTC+5)
-    const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
+    const now = new Date(Date.now() + 5 * 60 * 60 * 1000); // Almaty UTC+5
     const today = now.toISOString().slice(0, 10);
-    const almatyHour = now.getUTCHours(); // Already shifted by +5
+    const almatyHour = now.getUTCHours();
 
-    // Only check if we're past the scheduled hour
-    if (almatyHour < DAILY_ANALYSIS_HOUR) return;
+    // Build list of dates to check: yesterday (always) + today (if past scheduled hour)
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = yesterday.toISOString().slice(0, 10);
 
-    // Check if analysis ran today
-    const { data } = await supabase
-      .from('chat_ai')
-      .select('analysis_date')
-      .eq('analysis_date', today)
-      .limit(1);
-
-    if (data && data.length > 0) {
-      logger.info({ today }, 'Daily analysis already ran today, skipping catch-up');
-      return;
+    const datesToCheck = [yesterdayStr]; // always check yesterday
+    if (almatyHour >= DAILY_ANALYSIS_HOUR) {
+      datesToCheck.push(today);
     }
 
-    logger.info({ today }, 'Missed daily analysis detected, running catch-up');
-    try {
-      const result = await runDailyAnalysis(today);
-      logger.info({ result, today }, 'Catch-up daily analysis completed');
-      if (result?.success) {
-        await sendDailySummary(result);
+    for (const date of datesToCheck) {
+      const { data } = await supabase
+        .from('chat_ai')
+        .select('analysis_date')
+        .eq('analysis_date', date)
+        .limit(1);
+
+      if (data && data.length > 0) {
+        continue; // already analyzed
       }
-    } catch (err) {
-      logger.error({ err, today }, 'Catch-up daily analysis failed');
+
+      logger.info({ date }, 'Missed daily analysis detected, running catch-up');
+      try {
+        const result = await runDailyAnalysis(date);
+        logger.info({ result, date }, 'Catch-up daily analysis completed');
+        if (result?.success) {
+          await sendDailySummary(result);
+        }
+      } catch (err) {
+        logger.error({ err, date }, 'Catch-up daily analysis failed');
+      }
     }
   } catch (err) {
     logger.error({ err }, 'Failed to check missed analysis');
@@ -999,8 +1045,14 @@ export async function reclassifyStuckContacts() {
         }
 
         const data = await response.json();
-        const raw = (data.content?.[0]?.text || '').replace(/```json\s*|```\s*/g, '').trim();
-        const results = JSON.parse(raw);
+        const rawText = data.content?.[0]?.text || '';
+        const reclassifyResult = parseAIResponse(rawText, ClassifyBatchSchema);
+
+        if (!reclassifyResult.success) {
+          logger.warn({ error: reclassifyResult.error }, 'Reclassify batch validation failed');
+          if (!Array.isArray(reclassifyResult.raw)) { failed += batch.length; continue; }
+        }
+        const results = reclassifyResult.success ? reclassifyResult.data : reclassifyResult.raw;
 
         if (Array.isArray(results)) {
           for (const r of results) {

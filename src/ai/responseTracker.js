@@ -22,38 +22,41 @@ export async function trackResponseTime(sessionId, remoteJid, dialogSessionId, f
       return;
     }
 
-    const { data: pending, error } = await supabase
+    // Fetch ALL pending customer messages (not just latest) to avoid orphaned records
+    const { data: pendingRows, error } = await supabase
       .from('manager_analytics')
       .select('id, customer_message_at')
       .eq('session_id', sessionId)
       .eq('remote_jid', remoteJid)
       .is('manager_response_at', null)
-      .order('customer_message_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .order('customer_message_at', { ascending: true })
+      .limit(50);
 
     if (error) {
-      logger.error({ err: error, sessionId, remoteJid }, 'Failed to find pending response');
+      logger.error({ err: error, sessionId, remoteJid }, 'Failed to find pending responses');
       return;
     }
 
-    if (!pending) {
+    if (!pendingRows?.length) {
       return;
     }
 
-    const customerTime = new Date(pending.customer_message_at);
-    const responseSeconds = Math.round((msgTime.getTime() - customerTime.getTime()) / 1000);
+    // Update all pending records with response time
+    for (const pending of pendingRows) {
+      const customerTime = new Date(pending.customer_message_at);
+      const responseSeconds = Math.round((msgTime.getTime() - customerTime.getTime()) / 1000);
 
-    const { error: updateError } = await supabase
-      .from('manager_analytics')
-      .update({
-        manager_response_at: msgTime.toISOString(),
-        response_time_seconds: Math.max(0, responseSeconds),
-      })
-      .eq('id', pending.id);
+      const { error: updateError } = await supabase
+        .from('manager_analytics')
+        .update({
+          manager_response_at: msgTime.toISOString(),
+          response_time_seconds: Math.max(0, responseSeconds),
+        })
+        .eq('id', pending.id);
 
-    if (updateError) {
-      logger.error({ err: updateError, sessionId, remoteJid }, 'Failed to save manager response time');
+      if (updateError) {
+        logger.error({ err: updateError, sessionId, remoteJid, pendingId: pending.id }, 'Failed to save manager response time');
+      }
     }
   } catch (error) {
     logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error tracking response time');

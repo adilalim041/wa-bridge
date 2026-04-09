@@ -29,8 +29,8 @@ export class RateLimiter {
     this.perJid = new Map();
     this.global = [];
     this.windowMs = 60_000;
-    this.maxPerJid = 10;
-    this.maxGlobal = 30;
+    this.maxPerJid = 8;     // 8 per contact per minute (was 10)
+    this.maxGlobal = 15;    // 15 global per minute per session (was 30) — safer for 8 accounts on shared IP
   }
 
   prune(now = Date.now()) {
