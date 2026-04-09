@@ -124,4 +124,22 @@ export async function releaseAllLocks() {
   }
 }
 
+// Clear all stale locks on startup (single-instance deployment like Railway)
+export async function clearStaleLocks() {
+  try {
+    const { error } = await supabase
+      .from('session_lock')
+      .delete()
+      .neq('instance_id', INSTANCE_ID);
+
+    if (error) {
+      console.error('Failed to clear stale locks:', error.message);
+    } else {
+      console.log(`Cleared stale locks from previous instances (current: ${INSTANCE_ID.slice(0, 8)})`);
+    }
+  } catch (error) {
+    console.error('Failed to clear stale locks:', error.message);
+  }
+}
+
 export { INSTANCE_ID };
