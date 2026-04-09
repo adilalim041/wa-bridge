@@ -1477,11 +1477,17 @@ export function setupRoutes(app) {
     const { sessionId } = req.params;
 
     try {
-      const { data, error } = await supabase
+      let query = supabase
         .from('contacts_crm')
         .select('*')
-        .eq('session_id', sessionId)
         .order('updated_at', { ascending: false });
+
+      // Support __all__ to fetch contacts across all sessions
+      if (sessionId && sessionId !== '__all__') {
+        query = query.eq('session_id', sessionId);
+      }
+
+      const { data, error } = await query;
 
       if (error) {
         logger.error({ err: error, sessionId }, 'Failed to fetch contacts list');
