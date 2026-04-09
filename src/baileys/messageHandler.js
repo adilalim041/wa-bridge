@@ -463,9 +463,9 @@ export async function handleMessage(message, sock, sessionId) {
       );
 
       if (dialogSessionId) {
-        // Retry linking up to 2 times — orphaned messages break AI analysis
+        // Retry linking up to 3 attempts — orphaned messages break AI analysis
         let linked = false;
-        for (let linkAttempt = 0; linkAttempt < 2 && !linked; linkAttempt++) {
+        for (let linkAttempt = 0; linkAttempt < 3 && !linked; linkAttempt++) {
           const { error: linkError } = await supabase
             .from('messages')
             .update({ dialog_session_id: dialogSessionId })

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../config.js';
 
@@ -17,7 +18,9 @@ export function setupWebSocket(server) {
     if (API_KEY) {
       const url = new URL(req.url, 'http://localhost');
       const clientKey = url.searchParams.get('apiKey');
-      if (!clientKey || clientKey !== API_KEY) {
+      const isValid = clientKey && clientKey.length === API_KEY.length &&
+        crypto.timingSafeEqual(Buffer.from(clientKey), Buffer.from(API_KEY));
+      if (!isValid) {
         logger.warn('WebSocket connection rejected: invalid API key');
         ws.close(4001, 'Unauthorized');
         return;
