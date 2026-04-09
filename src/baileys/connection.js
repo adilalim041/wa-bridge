@@ -60,6 +60,38 @@ function shouldPrintQrToTerminal() {
   return activeSessions.size <= 1;
 }
 
+// Per-session unique browser fingerprint — looks like different real devices
+// Stable: same sessionId always gets same fingerprint (no change on reconnect)
+const BROWSER_POOL = [
+  ['Chrome', 'Desktop', '125.0.6422'],
+  ['Chrome', 'Desktop', '124.0.6367'],
+  ['Chrome', 'Desktop', '126.0.6478'],
+  ['Edge', 'Desktop', '125.0.2535'],
+  ['Edge', 'Desktop', '124.0.2478'],
+  ['Opera', 'Desktop', '111.0.5168'],
+  ['Chrome', 'Desktop', '123.0.6312'],
+  ['Edge', 'Desktop', '126.0.2592'],
+  ['Chrome', 'Desktop', '122.0.6261'],
+  ['Opera', 'Desktop', '110.0.5130'],
+];
+
+const sessionBrowserMap = new Map();
+
+function getSessionBrowser(sessionId) {
+  if (sessionBrowserMap.has(sessionId)) return sessionBrowserMap.get(sessionId);
+
+  // Deterministic hash of sessionId → index in pool
+  let hash = 0;
+  for (let i = 0; i < sessionId.length; i++) {
+    hash = ((hash << 5) - hash + sessionId.charCodeAt(i)) | 0;
+  }
+  const index = Math.abs(hash) % BROWSER_POOL.length;
+  const browser = BROWSER_POOL[index];
+  sessionBrowserMap.set(sessionId, browser);
+  console.log(`[${sessionId}] Browser fingerprint: ${browser.join(' / ')}`);
+  return browser;
+}
+
 const MAX_RECONNECT_ATTEMPTS = 25; // Hard limit — stop hammering WhatsApp after this
 
 function getReconnectDelay(sessionId) {
@@ -151,10 +183,14 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
     console.log(`[${sessionId}] Failed to fetch WA version, using fallback: ${waVersion.join('.')}`);
   }
 
+  // Per-session browser fingerprint — stable across reconnects, unique per account
+  // Avoids all 8 accounts having identical device signature from same IP
+  const browserFingerprint = getSessionBrowser(sessionId);
+
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['Chrome', 'Desktop', '125.0.6422'],  // Fixed fingerprint — random browser on every reconnect looks suspicious to WhatsApp
+    browser: browserFingerprint,
     version: waVersion,
     keepAliveIntervalMs: 15000,    // Ping WhatsApp every 15s (default 30s is too slow, causes timeout disconnects)
     connectTimeoutMs: 60000,       // 60s connect timeout (default ~20s is too short for Railway)
