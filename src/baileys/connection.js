@@ -350,15 +350,13 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         return;
       }
 
-      // connectionReplaced: another linked device took over the slot
-      // WhatsApp supports up to 4 linked devices — this means a 5th device pushed us out,
-      // or a temporary conflict. Reconnect after 30s (not aggressive, not permanent stop).
+      // connectionReplaced (440): Known Baileys v7 false positive — fires randomly
+      // without actual device replacement. WhatsApp supports 4 linked devices.
+      // See: https://github.com/WhiskeySockets/Baileys/issues/2140
+      // Treatment: silent reconnect in 5s, same as restartRequired. No alarm.
       if (statusCode === DisconnectReason.connectionReplaced) {
-        logger.warn({ sessionId, statusCode }, 'Connection replaced — reconnecting in 30s');
-        sendTelegramAlert(
-          `⚠️ WA Bridge [${sessionId}]: Connection replaced by another device. Auto-reconnecting in 30s...`
-        ).catch(() => {});
-        scheduleReconnect(sessionId, 30000, () =>
+        logger.info({ sessionId, statusCode }, 'Connection replaced (likely Baileys false positive) — reconnecting in 5s');
+        scheduleReconnect(sessionId, 5000, () =>
           startConnection({ sessionId, onSocket, _prevSock: sock }).catch((err) => {
             logger.error({ err, sessionId }, 'Failed to reconnect after connectionReplaced');
           })
