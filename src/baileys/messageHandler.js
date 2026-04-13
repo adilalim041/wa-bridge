@@ -120,8 +120,8 @@ async function isChatHidden(sessionId, remoteJid) {
     hiddenCacheTimestamps.set(cacheKey, Date.now());
     return isHidden;
   } catch (error) {
-    logger.error({ err: error, sessionId, remoteJid }, 'Failed to resolve hidden chat state — defaulting to hidden (fail-safe)');
-    return true; // Fail-safe: treat as hidden on DB error to prevent data leakage
+    logger.error({ err: error, sessionId, remoteJid }, 'Failed to resolve hidden chat state — defaulting to NOT hidden (save messages)');
+    return false; // Default to saving messages — losing data is worse than showing a hidden chat
   }
 }
 
