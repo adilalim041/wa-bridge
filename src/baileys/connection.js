@@ -350,13 +350,19 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         return;
       }
 
-      // connectionReplaced: account logged in on another device — DO NOT auto-reconnect
+      // connectionReplaced: another linked device took over the slot
+      // WhatsApp supports up to 4 linked devices — this means a 5th device pushed us out,
+      // or a temporary conflict. Reconnect after 30s (not aggressive, not permanent stop).
       if (statusCode === DisconnectReason.connectionReplaced) {
-        resetReconnectAttempts(sessionId);
+        logger.warn({ sessionId, statusCode }, 'Connection replaced — reconnecting in 30s');
         sendTelegramAlert(
-          `⚠️ WA Bridge [${sessionId}]: Connection replaced — account logged in elsewhere! Auto-reconnect STOPPED. Scan new QR when ready.`
+          `⚠️ WA Bridge [${sessionId}]: Connection replaced by another device. Auto-reconnecting in 30s...`
         ).catch(() => {});
-        logger.warn({ sessionId, statusCode }, 'Connection replaced by another device — stopping reconnect');
+        scheduleReconnect(sessionId, 30000, () =>
+          startConnection({ sessionId, onSocket, _prevSock: sock }).catch((err) => {
+            logger.error({ err, sessionId }, 'Failed to reconnect after connectionReplaced');
+          })
+        );
         return;
       }
 
