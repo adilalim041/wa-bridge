@@ -76,19 +76,30 @@ const BROWSER_POOL = [
 ];
 
 const sessionBrowserMap = new Map();
+const usedBrowserIndices = new Set();
 
 function getSessionBrowser(sessionId) {
   if (sessionBrowserMap.has(sessionId)) return sessionBrowserMap.get(sessionId);
 
-  // Deterministic hash of sessionId → index in pool
-  let hash = 0;
+  // Deterministic hash with better distribution (FNV-1a inspired)
+  let hash = 2166136261;
   for (let i = 0; i < sessionId.length; i++) {
-    hash = ((hash << 5) - hash + sessionId.charCodeAt(i)) | 0;
+    hash ^= sessionId.charCodeAt(i);
+    hash = (hash * 16777619) >>> 0;
   }
-  const index = Math.abs(hash) % BROWSER_POOL.length;
+  let index = hash % BROWSER_POOL.length;
+
+  // Collision avoidance: if index already taken, find next free slot
+  const startIndex = index;
+  while (usedBrowserIndices.has(index)) {
+    index = (index + 1) % BROWSER_POOL.length;
+    if (index === startIndex) break; // All slots taken (>10 sessions)
+  }
+  usedBrowserIndices.add(index);
+
   const browser = BROWSER_POOL[index];
   sessionBrowserMap.set(sessionId, browser);
-  console.log(`[${sessionId}] Browser fingerprint: ${browser.join(' / ')}`);
+  console.log(`[${sessionId}] Browser fingerprint: ${browser.join(' / ')} (slot ${index})`);
   return browser;
 }
 

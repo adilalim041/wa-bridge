@@ -7,7 +7,22 @@ const LOCK_TIMEOUT = 60 * 1000;
 
 const heartbeatTimers = new Map();
 
+const LOCK_ACQUIRE_TIMEOUT = 10000; // 10s — don't hang startup if Supabase is slow
+
 export async function acquireLock(sessionId) {
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Lock acquisition timed out after ${LOCK_ACQUIRE_TIMEOUT}ms`)), LOCK_ACQUIRE_TIMEOUT)
+  );
+
+  try {
+    return await Promise.race([_acquireLockImpl(sessionId), timeoutPromise]);
+  } catch (error) {
+    console.error(`Failed to acquire lock for ${sessionId}:`, error.message);
+    return false;
+  }
+}
+
+async function _acquireLockImpl(sessionId) {
   try {
     // Check if lock exists and is still alive
     const { data: existing } = await supabase

@@ -703,29 +703,41 @@ export async function classifyUntaggedChats() {
     let taggedUnknown = 0;
     let firstError = null;
 
-    // Batch-load messages for all chats (avoid N+1 queries)
-    const jids = needsClassify.map((c) => c.remote_jid);
-    const msgsByJid = new Map();
-    for (let b = 0; b < jids.length; b += 100) {
-      const batchJids = jids.slice(b, b + 100);
-      const { data: batchMsgs } = await supabase
-        .from('messages')
-        .select('remote_jid, body, from_me, message_type, timestamp')
-        .in('remote_jid', batchJids)
-        .order('timestamp', { ascending: false })
-        .limit(batchJids.length * 10);
+    // Batch-load messages per session+jid (avoid cross-session mixing)
+    // Key = "session_id::remote_jid" to keep messages isolated per account
+    const msgsByKey = new Map();
+    // Group chats by session to batch queries efficiently
+    const chatsBySession = new Map();
+    for (const c of needsClassify) {
+      if (!chatsBySession.has(c.session_id)) chatsBySession.set(c.session_id, []);
+      chatsBySession.get(c.session_id).push(c.remote_jid);
+    }
 
-      for (const m of batchMsgs || []) {
-        if (!msgsByJid.has(m.remote_jid)) msgsByJid.set(m.remote_jid, []);
-        const arr = msgsByJid.get(m.remote_jid);
-        if (arr.length < 10) arr.push(m);
+    for (const [sid, jids] of chatsBySession) {
+      for (let b = 0; b < jids.length; b += 100) {
+        const batchJids = jids.slice(b, b + 100);
+        const { data: batchMsgs } = await supabase
+          .from('messages')
+          .select('remote_jid, body, from_me, message_type, timestamp')
+          .eq('session_id', sid)
+          .in('remote_jid', batchJids)
+          .order('timestamp', { ascending: false })
+          .limit(batchJids.length * 10);
+
+        for (const m of batchMsgs || []) {
+          const key = `${sid}::${m.remote_jid}`;
+          if (!msgsByKey.has(key)) msgsByKey.set(key, []);
+          const arr = msgsByKey.get(key);
+          if (arr.length < 10) arr.push(m);
+        }
       }
     }
 
     // Prepare chats with their messages
     const prepared = [];
     for (const chat of needsClassify) {
-      const msgs = msgsByJid.get(chat.remote_jid) || [];
+      const key = `${chat.session_id}::${chat.remote_jid}`;
+      const msgs = msgsByKey.get(key) || [];
 
       // Chats with <2 messages → tag as "неизвестно" directly
       if (msgs.length < 2) {
@@ -976,29 +988,39 @@ export async function reclassifyStuckContacts() {
 
     logger.info({ stuckCount: unique.length }, 'reclassifyStuckContacts: starting');
 
-    // Load messages for each stuck contact
-    const jids = unique.map((r) => r.remote_jid);
-    const msgsByJid = new Map();
-    for (let b = 0; b < jids.length; b += 100) {
-      const batchJids = jids.slice(b, b + 100);
-      const { data: batchMsgs } = await supabase
-        .from('messages')
-        .select('remote_jid, body, from_me, message_type, timestamp')
-        .in('remote_jid', batchJids)
-        .order('timestamp', { ascending: false })
-        .limit(batchJids.length * 10);
+    // Load messages per session+jid (avoid cross-session mixing)
+    const msgsByKey = new Map();
+    const rowsBySession = new Map();
+    for (const r of unique) {
+      if (!rowsBySession.has(r.session_id)) rowsBySession.set(r.session_id, []);
+      rowsBySession.get(r.session_id).push(r.remote_jid);
+    }
 
-      for (const m of batchMsgs || []) {
-        if (!msgsByJid.has(m.remote_jid)) msgsByJid.set(m.remote_jid, []);
-        const arr = msgsByJid.get(m.remote_jid);
-        if (arr.length < 10) arr.push(m);
+    for (const [sid, jids] of rowsBySession) {
+      for (let b = 0; b < jids.length; b += 100) {
+        const batchJids = jids.slice(b, b + 100);
+        const { data: batchMsgs } = await supabase
+          .from('messages')
+          .select('remote_jid, body, from_me, message_type, timestamp')
+          .eq('session_id', sid)
+          .in('remote_jid', batchJids)
+          .order('timestamp', { ascending: false })
+          .limit(batchJids.length * 10);
+
+        for (const m of batchMsgs || []) {
+          const key = `${sid}::${m.remote_jid}`;
+          if (!msgsByKey.has(key)) msgsByKey.set(key, []);
+          const arr = msgsByKey.get(key);
+          if (arr.length < 10) arr.push(m);
+        }
       }
     }
 
     // Prepare chat texts for classification
     const prepared = [];
     for (const row of unique) {
-      const msgs = msgsByJid.get(row.remote_jid) || [];
+      const key = `${row.session_id}::${row.remote_jid}`;
+      const msgs = msgsByKey.get(key) || [];
       if (msgs.length < 2) continue; // Not enough data to reclassify
 
       let text = '';
