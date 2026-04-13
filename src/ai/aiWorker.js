@@ -127,7 +127,8 @@ async function callClaude(messages) {
           'Content-Type': 'application/json',
           'x-api-key': ANTHROPIC_API_KEY,
           'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'prompt-caching-2024-07-31',
+          // prompt-caching-2024-07-31 beta header removed — causes 400 error
+          // cache_control field in system prompt works with standard API now
         },
         body: JSON.stringify({
           model: AI_MODEL,
