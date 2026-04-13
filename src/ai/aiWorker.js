@@ -133,7 +133,7 @@ async function callClaude(messages) {
         body: JSON.stringify({
           model: AI_MODEL,
           max_tokens: 1024,
-          system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+          system: SYSTEM_PROMPT,
           messages: [{ role: 'user', content: messages }],
         }),
       });
