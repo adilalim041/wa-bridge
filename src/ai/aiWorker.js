@@ -887,7 +887,7 @@ async function checkMissedAnalysis() {
       try {
         const result = await runDailyAnalysis(date);
         logger.info({ result, date }, 'Catch-up daily analysis completed');
-        if (result?.success) {
+        if (result?.success && (result.processed > 0 || result.failed === 0)) {
           await sendDailySummary(result);
         }
       } catch (err) {
@@ -920,8 +920,8 @@ function scheduleDailyRun() {
     try {
       const result = await runDailyAnalysis();
       logger.info(result, 'Scheduled daily analysis finished');
-      // Send daily summary to Telegram after analysis completes
-      if (result?.success) {
+      // Send daily summary only if analysis actually processed dialogs (skip if API is down)
+      if (result?.success && (result.processed > 0 || result.failed === 0)) {
         await sendDailySummary(result);
       }
     } catch (error) {
