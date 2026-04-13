@@ -415,10 +415,19 @@ export async function handleMessage(message, sock, sessionId) {
       }
     } else {
       chatType = 'personal';
-      chatDisplayName =
-        (fromMe ? resolveContactName(sock, remoteJid) : pushName) ||
-        resolveContactName(sock, remoteJid) ||
-        (await getContactName(remoteJid));
+      if (fromMe) {
+        // Outgoing message: use contact's name from Baileys cache or DB, NOT sender's pushName
+        chatDisplayName =
+          resolveContactName(sock, remoteJid) ||
+          (await getContactName(remoteJid)) ||
+          null; // Will show phone number in UI (better than manager's own name)
+      } else {
+        // Incoming message: use sender's pushName (their WhatsApp profile name)
+        chatDisplayName =
+          pushName ||
+          resolveContactName(sock, remoteJid) ||
+          (await getContactName(remoteJid));
+      }
       phoneNumber = remoteJid;
     }
 
@@ -513,8 +522,13 @@ export async function handleMessage(message, sock, sessionId) {
       if (sender && pushName) {
         await saveContact(sender, pushName);
       }
-    } else {
+    } else if (!fromMe) {
+      // Only save contact name from incoming messages (sender's pushName)
+      // Don't save manager's pushName as the contact's name
       await saveContact(remoteJid, chatDisplayName || pushName);
+    } else if (chatDisplayName) {
+      // Outgoing: only update contact if we already know their name
+      await saveContact(remoteJid, chatDisplayName);
     }
 
     const preview = body.length > 50 ? `${body.substring(0, 50)}...` : body;
