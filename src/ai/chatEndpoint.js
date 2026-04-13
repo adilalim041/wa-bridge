@@ -657,7 +657,7 @@ export async function handleAIChat(conversationHistory) {
       if (!response.ok) {
         const errorText = await response.text();
         logger.error({ status: response.status, body: errorText }, 'Claude chat API error');
-        return { error: `Claude API error: ${response.status}` };
+        return { error: `Claude API error: ${response.status}`, details: errorText.slice(0, 500) };
       }
 
       const data = await response.json();
