@@ -674,7 +674,7 @@ export async function classifyUntaggedChats() {
   try {
     const { data: chats, error: chatsErr } = await supabase
       .from('chats')
-      .select('session_id, remote_jid, tags')
+      .select('session_id, remote_jid, tags, tag_confirmed')
       .order('updated_at', { ascending: false })
       .limit(500);
 
@@ -682,8 +682,10 @@ export async function classifyUntaggedChats() {
     if (!chats?.length) return { success: true, classified: 0, message: 'No chats found' };
 
     // Find chats: no AI tag at all, OR tagged "неизвестно" (re-check if enough messages now)
+    // NEVER re-classify manually confirmed tags
     const RECHECK_MSG_THRESHOLD = 10;
     const needsClassify = chats.filter((c) => {
+      if (c.tag_confirmed) return false; // User confirmed this tag — don't touch
       const tags = Array.isArray(c.tags) ? c.tags : [];
       const hasAiTag = tags.some((t) => AI_AUTO_TAGS.has(t));
       if (!hasAiTag) return true;
