@@ -38,7 +38,8 @@ async function bootstrap() {
   await loadPhoneRegistry();
   await clearStaleLocks(); // Clear locks from previous instance (Railway redeploy)
   await sessionManager.startAll();
-  startAIWorker();
+  // AI worker disabled — analysis runs via Claude Code scheduled task (Max subscription)
+  // startAIWorker();
   startNotificationChecker();
   startSummaryScheduler();
   startTelegramPolling();
