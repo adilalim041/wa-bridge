@@ -1,9 +1,12 @@
 import { config } from './config.js';
+import { supabase } from './storage/supabase.js';
 
 const TELEGRAM_BOT_TOKEN = config.telegramBotToken;
 const TELEGRAM_CHAT_ID = config.telegramChatId;
 
 const healthIntervals = new Map();
+const zombieCheckIntervals = new Map();
+const ZOMBIE_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours no messages = zombie
 const lastConnectedAt = new Map();
 const alertSent = new Map();
 
@@ -117,6 +120,48 @@ export function updateConnectionStatus(sessionId, connected) {
   }
 }
 
+// Zombie connection detection: session reports "connected" but no messages arrive
+// This happens when WhatsApp silently drops the connection without sending a disconnect event
+let sessionManagerRef = null;
+export function setSessionManagerRef(sm) { sessionManagerRef = sm; }
+
+async function checkZombieConnection(sessionId) {
+  try {
+    // Only check if session reports as connected
+    const state = sessionManagerRef?.getSessionState?.(sessionId);
+    if (!state?.connected) return;
+
+    // Check last message timestamp from DB
+    const { data } = await supabase
+      .from('messages')
+      .select('timestamp')
+      .eq('session_id', sessionId)
+      .order('timestamp', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!data?.timestamp) return;
+
+    const lastMsgAge = Date.now() - new Date(data.timestamp).getTime();
+    if (lastMsgAge > ZOMBIE_THRESHOLD_MS) {
+      const hours = Math.round(lastMsgAge / 3600000);
+      sendTelegramAlert(
+        `🧟 Zombie detected [${sessionId}]: Connected but no messages for ${hours}h. Auto-restarting...`
+      ).catch(() => {});
+
+      // Force restart
+      if (sessionManagerRef?.stopSession && sessionManagerRef?.startSession) {
+        await sessionManagerRef.stopSession(sessionId);
+        await new Promise((r) => setTimeout(r, 3000));
+        await sessionManagerRef.startSession(sessionId);
+        sendTelegramAlert(`✅ [${sessionId}]: Session restarted after zombie detection.`).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error(`Zombie check failed for ${sessionId}:`, err.message);
+  }
+}
+
 export function startHealthMonitor(sessionId) {
   const CHECK_INTERVAL = 5 * 60 * 1000;
 
@@ -145,6 +190,14 @@ export function startHealthMonitor(sessionId) {
   }, CHECK_INTERVAL);
 
   healthIntervals.set(sessionId, timer);
+
+  // Zombie check every 2 hours
+  if (!zombieCheckIntervals.has(sessionId)) {
+    const zombieTimer = setInterval(() => checkZombieConnection(sessionId), 2 * 60 * 60 * 1000);
+    zombieCheckIntervals.set(sessionId, zombieTimer);
+    // First check after 30 min (give session time to receive messages)
+    setTimeout(() => checkZombieConnection(sessionId), 30 * 60 * 1000);
+  }
 }
 
 export function stopHealthMonitor(sessionId) {
@@ -153,6 +206,11 @@ export function stopHealthMonitor(sessionId) {
     if (timer) {
       clearInterval(timer);
       healthIntervals.delete(sessionId);
+    }
+    const zTimer = zombieCheckIntervals.get(sessionId);
+    if (zTimer) {
+      clearInterval(zTimer);
+      zombieCheckIntervals.delete(sessionId);
     }
     lastConnectedAt.delete(sessionId);
     alertSent.delete(sessionId);
@@ -166,6 +224,10 @@ export function stopHealthMonitor(sessionId) {
     clearInterval(timer);
   }
   healthIntervals.clear();
+  for (const timer of zombieCheckIntervals.values()) {
+    clearInterval(timer);
+  }
+  zombieCheckIntervals.clear();
   lastConnectedAt.clear();
   alertSent.clear();
   lastAlertTime.clear();

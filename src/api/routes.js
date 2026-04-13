@@ -738,6 +738,28 @@ export function setupRoutes(app) {
     return res.json({ success: true, sessionId });
   });
 
+  // Force-restart a session (kills socket, reconnects fresh)
+  router.post('/sessions/:sessionId/restart', async (req, res) => {
+    const { sessionId } = req.params;
+    const { data: config } = await supabase
+      .from('session_config')
+      .select('session_id')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    if (!config) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    logger.info({ sessionId }, 'Force-restarting session');
+    await sessionManager.stopSession(sessionId);
+    // Small delay to ensure clean disconnect
+    await new Promise((r) => setTimeout(r, 2000));
+    await sessionManager.startSession(sessionId);
+    const state = sessionManager.getSessionState(sessionId);
+    return res.json({ success: true, sessionId, connected: state.connected, hasQR: Boolean(state.qr) });
+  });
+
   router.get('/sessions/:sessionId/status', async (req, res) => {
     const { sessionId } = req.params;
     const { data: config } = await supabase

@@ -2,7 +2,7 @@ import { startServer } from './api/server.js';
 import { sessionManager } from './baileys/sessionManager.js';
 import { logger } from './config.js';
 import { stopWebSocket } from './api/websocket.js';
-import { stopHealthMonitor, startSummaryScheduler, stopSummaryScheduler, startTelegramPolling, stopTelegramPolling } from './monitor.js';
+import { stopHealthMonitor, startSummaryScheduler, stopSummaryScheduler, startTelegramPolling, stopTelegramPolling, setSessionManagerRef } from './monitor.js';
 import { stopVersionChecker } from './versionChecker.js';
 import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
 import { loadPhoneRegistry } from './baileys/messageHandler.js';
@@ -34,6 +34,7 @@ function startKeepAlive() {
 async function bootstrap() {
   const serverState = startServer();
   server = serverState.server;
+  setSessionManagerRef(sessionManager); // Enable zombie detection in monitor
   await loadPhoneRegistry();
   await clearStaleLocks(); // Clear locks from previous instance (Railway redeploy)
   await sessionManager.startAll();
