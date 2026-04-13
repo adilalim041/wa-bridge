@@ -18,23 +18,26 @@ const disconnectLog = new Map(); // sessionId -> [{at, duration}] for morning su
 
 // Ban detection tracking
 const dailyDisconnects = new Map(); // sessionId -> { count, loggedOut, connectionReplaced, date }
-const BAN_ALERT_THRESHOLD = 3; // alert if >3 loggedOut/connectionReplaced per day
+const BAN_ALERT_THRESHOLD = 5; // alert if >5 loggedOut per day
 
 export function trackDisconnectEvent(sessionId, statusCode) {
   const today = new Date().toISOString().slice(0, 10);
   let entry = dailyDisconnects.get(sessionId);
   if (!entry || entry.date !== today) {
-    entry = { count: 0, loggedOut: 0, connectionReplaced: 0, date: today };
+    entry = { count: 0, loggedOut: 0, connectionReplaced: 0, alerted: false, date: today };
   }
   entry.count++;
-  if (statusCode === 401 || statusCode === 515) entry.loggedOut++; // DisconnectReason.loggedOut
-  if (statusCode === 440) entry.connectionReplaced++; // DisconnectReason.connectionReplaced
+  // Only loggedOut (401) is a real ban indicator
+  // connectionReplaced (440) is a known Baileys v7 false positive — do NOT count
+  if (statusCode === 401 || statusCode === 515) entry.loggedOut++;
+  if (statusCode === 440) entry.connectionReplaced++; // track but don't alert
   dailyDisconnects.set(sessionId, entry);
 
-  const critical = entry.loggedOut + entry.connectionReplaced;
-  if (critical >= BAN_ALERT_THRESHOLD) {
+  // Alert only for real loggedOut events, and only ONCE per day
+  if (entry.loggedOut >= BAN_ALERT_THRESHOLD && !entry.alerted) {
+    entry.alerted = true;
     sendTelegramAlert(
-      `🛑 Ban risk [${sessionId}]: ${critical} critical disconnects today (${entry.loggedOut} loggedOut, ${entry.connectionReplaced} replaced). Check account immediately!`
+      `🛑 Ban risk [${sessionId}]: ${entry.loggedOut} loggedOut events today. Check account!`
     ).catch(() => {});
   }
 }
