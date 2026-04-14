@@ -38,8 +38,12 @@ async function bootstrap() {
   await loadPhoneRegistry();
   await clearStaleLocks(); // Clear locks from previous instance (Railway redeploy)
   await sessionManager.startAll();
-  // AI worker disabled — analysis runs via Claude Code scheduled task (Max subscription)
-  // startAIWorker();
+  if (process.env.ANTHROPIC_API_KEY) {
+    startAIWorker();
+    logger.info('AI worker enabled (ANTHROPIC_API_KEY found)');
+  } else {
+    logger.info('AI worker disabled (no ANTHROPIC_API_KEY — using external Claude Code scheduled task)');
+  }
   startNotificationChecker();
   startSummaryScheduler();
   startTelegramPolling();
