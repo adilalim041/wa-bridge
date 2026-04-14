@@ -4,9 +4,10 @@ import { KNOWLEDGE_BASE } from './knowledgeBase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
+const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
 function getSystemPrompt() {
-  return `Ты — Omoikiri.AI, интеллектуальный ассистент компании Omoikiri Kazakhstan (японская кухонная сантехника: мойки, смесители, аксессуары).
+  return `Ты — ${BRAND}.AI, интеллектуальный ассистент компании ${BRAND} Kazakhstan (японская кухонная сантехника: мойки, смесители, аксессуары).
 Шоурумы в Астане и Алматы. Ты помогаешь руководителю контролировать менеджеров и анализировать продажи.
 
 Текущая дата и время: ${new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Almaty', dateStyle: 'full', timeStyle: 'short' })}

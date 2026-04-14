@@ -6,6 +6,7 @@ import { DailyAnalysisSchema, ClassifyBatchSchema, parseAIResponse } from './sch
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
+const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 const MAX_CONTEXT_MESSAGES = 30;  // messages from target day
 const PREV_DAY_CONTEXT = 10;      // extra messages from before target day for context
 const DAILY_ANALYSIS_HOUR = Number(process.env.DAILY_ANALYSIS_HOUR || 23); // 23:00 default
@@ -17,7 +18,7 @@ let isRunning = false;
 let runningStartedAt = null;
 const MAX_RUNNING_MS = 2 * 60 * 60 * 1000; // 2 hours hard timeout
 
-const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Kazakhstan (японская кухонная сантехника: мойки, смесители).
+const SYSTEM_PROMPT = `Ты — AI-аналитик компании ${BRAND} Kazakhstan (японская кухонная сантехника: мойки, смесители).
 Ты анализируешь переписки менеджеров с клиентами в WhatsApp.
 
 Проанализируй диалог и верни ТОЛЬКО JSON (без markdown, без пояснений):
@@ -64,7 +65,7 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании Omoikiri Ka
 Правила для customer_type:
 - end_client = клиент (покупает для себя, дизайнер интерьера, подрядчик, строитель — все кто покупают или подбирают продукцию)
 - partner = партнёр (представитель магазина, оптовик, дилер)
-- colleague = сотрудник (коллега, сотрудник компании Omoikiri, внутренняя переписка)
+- colleague = сотрудник (коллега, сотрудник компании ${BRAND}, внутренняя переписка)
 - unknown = неизвестно (недостаточно данных, личная переписка, спам, нерелевантное обращение)
 
 Правила для consultation_quality:
@@ -621,14 +622,14 @@ export async function backfillAutoTags() {
 // Lightweight batched classify: 10 chats per API call using Haiku
 const CLASSIFY_MODEL = 'claude-haiku-4-5-20251001';
 const CLASSIFY_BATCH_SIZE = 10;
-const CLASSIFY_PROMPT = `Ты классифицируешь собеседников в WhatsApp-чатах компании Omoikiri (японская кухонная сантехника: мойки, смесители).
+const CLASSIFY_PROMPT = `Ты классифицируешь собеседников в WhatsApp-чатах компании ${BRAND} (японская кухонная сантехника: мойки, смесители).
 Для КАЖДОГО чата определи тип собеседника И этап сделки. Верни ТОЛЬКО JSON-массив:
 [{"id": 1, "customer_type": "тип", "deal_stage": "этап"}, ...]
 
 Возможные типы:
 - end_client = клиент (покупает для себя, дизайнер, подрядчик, строитель — все кто покупают или подбирают продукцию)
 - partner = партнёр (магазин, оптовик, дилер)
-- colleague = сотрудник (коллега, сотрудник компании Omoikiri)
+- colleague = сотрудник (коллега, сотрудник компании ${BRAND})
 - unknown = неизвестно (недостаточно данных, личное, спам)
 
 Возможные этапы сделки (определяй по САМОМУ ПРОДВИНУТОМУ моменту в переписке):
