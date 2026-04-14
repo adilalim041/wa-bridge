@@ -14,6 +14,8 @@ import { supabase } from '../storage/supabase.js';
 import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages } from '../storage/queries.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 
+const BRAND = process.env.BRAND_NAME || 'Omoikiri';
+
 const CYRILLIC_MAP = {
   а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
   з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o',
@@ -2162,7 +2164,7 @@ export function setupRoutes(app) {
       return res.json({ success: false, message: 'Telegram not configured' });
     }
     try {
-      await sendTelegramMessage('<b>Тест уведомлений Omoikiri.AI</b>\n\nУведомления работают!');
+      await sendTelegramMessage(`<b>Тест уведомлений ${BRAND}.AI</b>\n\nУведомления работают!`);
       res.json({ success: true });
     } catch (err) {
       logger.error({ err }, 'Test notification failed');
