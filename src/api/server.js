@@ -86,7 +86,12 @@ export function startServer() {
     logger.info('API key authentication enabled');
 
     // Mount BAZA CRM routes (handles its own auth via bazaAuth middleware)
-    app.use('/baza/api', bazaRouter);
+    if (process.env.ENABLE_BAZA === 'true') {
+        app.use('/baza/api', bazaRouter);
+        logger.info('BAZA CRM mounted at /baza/api');
+    } else {
+        logger.info('BAZA CRM disabled (set ENABLE_BAZA=true to enable)');
+    }
 
     setupRoutes(app);
     setupWebSocket(httpServer);
