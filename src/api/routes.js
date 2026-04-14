@@ -270,6 +270,12 @@ export function setupRoutes(app) {
   });
 
   router.post('/ai/chat', async (req, res) => {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({
+        error: 'AI chat is disabled — set ANTHROPIC_API_KEY env var to enable.',
+      });
+    }
+
     const inputMessages = Array.isArray(req.body?.messages) ? req.body.messages : null;
 
     if (!inputMessages || inputMessages.length === 0) {
