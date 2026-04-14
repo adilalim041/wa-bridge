@@ -4,10 +4,12 @@ import { supabase } from '../storage/supabase.js';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
+const BUSINESS_DESC = process.env.BUSINESS_DESCRIPTION || 'японская кухонная сантехника: мойки, смесители, аксессуары';
+const BUSINESS_COUNTRY = process.env.BUSINESS_COUNTRY || 'Kazakhstan';
 
 function getSystemPrompt() {
-  return `Ты — ${BRAND}.AI, интеллектуальный ассистент компании ${BRAND} Kazakhstan (японская кухонная сантехника: мойки, смесители, аксессуары).
-Шоурумы в Астане и Алматы. Ты помогаешь руководителю контролировать менеджеров и анализировать продажи.
+  return `Ты — ${BRAND}.AI, интеллектуальный ассистент компании ${BRAND} ${BUSINESS_COUNTRY} (${BUSINESS_DESC}).
+Ты помогаешь руководителю контролировать менеджеров и анализировать продажи.
 
 Текущая дата и время: ${new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Almaty', dateStyle: 'full', timeStyle: 'short' })}
 Часовой пояс: Алматы (UTC+5)
