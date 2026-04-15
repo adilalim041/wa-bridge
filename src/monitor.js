@@ -190,13 +190,16 @@ export function startHealthMonitor(sessionId) {
   alertSent.set(sessionId, false);
 
   const timer = setInterval(() => {
-    const lastSeen = lastConnectedAt.get(sessionId);
-    if (!lastSeen) {
-      return;
+    // Downtime = how long the session has been in disconnected state.
+    // If not in disconnectedAt, session is currently connected → no downtime.
+    // (Previously used lastConnectedAt which only updates on new 'open' events,
+    //  causing false alerts for stably-connected sessions after 15+ minutes.)
+    const dcStart = disconnectedAt.get(sessionId);
+    if (!dcStart) {
+      return; // Session is connected, nothing to alert about
     }
 
-    const downtime = Date.now() - lastSeen;
-
+    const downtime = Date.now() - dcStart;
     const lastAlert = lastAlertTime.get(sessionId) || 0;
     if (downtime > DOWNTIME_THRESHOLD && !alertSent.get(sessionId) && (Date.now() - lastAlert > ALERT_COOLDOWN)) {
       alertSent.set(sessionId, true);
