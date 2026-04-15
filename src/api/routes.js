@@ -434,10 +434,10 @@ export function setupRoutes(app) {
         .slice(0, 5)
         .map(([flag, data]) => ({ flag, count: data.count, chats: data.chats }));
 
-      // Action required chats
+      // Action required chats (show up to 50 — counter was showing total but list only 5)
       const actionChats = ai
         .filter((r) => r.action_required)
-        .slice(0, 5)
+        .slice(0, 50)
         .map((r) => ({
           sessionId: r.session_id,
           remoteJid: r.remote_jid,
