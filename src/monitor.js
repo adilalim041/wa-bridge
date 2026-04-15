@@ -19,6 +19,10 @@ const disconnectLog = new Map(); // sessionId -> [{at, duration}] for morning su
 // Ban detection tracking
 const dailyDisconnects = new Map(); // sessionId -> { count, loggedOut, connectionReplaced, date }
 const BAN_ALERT_THRESHOLD = 5; // alert if >5 loggedOut per day
+const CASCADE_BAN_WINDOW_MS = 15 * 60 * 1000; // 15 min sliding window
+const CASCADE_BAN_THRESHOLD = 3; // 3 loggedOut events in window = cascade ban
+const recentLoggedOuts = []; // Array of { sessionId, at } for cascade detection
+let cascadeShutdownTriggered = false;
 
 export function trackDisconnectEvent(sessionId, statusCode) {
   const today = new Date().toISOString().slice(0, 10);
@@ -29,16 +33,45 @@ export function trackDisconnectEvent(sessionId, statusCode) {
   entry.count++;
   // Only loggedOut (401) is a real ban indicator
   // connectionReplaced (440) is a known Baileys v7 false positive — do NOT count
-  if (statusCode === 401 || statusCode === 515) entry.loggedOut++;
+  const isLoggedOut = statusCode === 401 || statusCode === 515;
+  if (isLoggedOut) entry.loggedOut++;
   if (statusCode === 440) entry.connectionReplaced++; // track but don't alert
   dailyDisconnects.set(sessionId, entry);
 
-  // Alert only for real loggedOut events, and only ONCE per day
+  // Alert only for real loggedOut events, and only ONCE per day per session
   if (entry.loggedOut >= BAN_ALERT_THRESHOLD && !entry.alerted) {
     entry.alerted = true;
     sendTelegramAlert(
       `🛑 Ban risk [${sessionId}]: ${entry.loggedOut} loggedOut events today. Check account!`
     ).catch(() => {});
+  }
+
+  // Cascade ban detection: 3+ sessions getting loggedOut in 15 min = shutdown ALL
+  if (isLoggedOut) {
+    const now = Date.now();
+    // Add this event and clean old ones
+    recentLoggedOuts.push({ sessionId, at: now });
+    while (recentLoggedOuts.length && now - recentLoggedOuts[0].at > CASCADE_BAN_WINDOW_MS) {
+      recentLoggedOuts.shift();
+    }
+
+    // Count UNIQUE sessions in window
+    const uniqueSessions = new Set(recentLoggedOuts.map((e) => e.sessionId));
+    if (uniqueSessions.size >= CASCADE_BAN_THRESHOLD && !cascadeShutdownTriggered) {
+      cascadeShutdownTriggered = true;
+      const sessionList = Array.from(uniqueSessions).join(', ');
+      sendTelegramAlert(
+        `🚨 CASCADE BAN DETECTED: ${uniqueSessions.size} sessions banned in 15 min (${sessionList}).\n\nShutting down ALL sessions to protect remaining accounts. Check Railway logs + manually review before restarting.`
+      ).catch(() => {});
+      console.error('CASCADE BAN — shutting down all sessions:', sessionList);
+
+      // Shutdown all sessions via sessionManager (no restart)
+      if (sessionManagerRef?.stopAll) {
+        sessionManagerRef.stopAll().catch((err) => {
+          console.error('Cascade shutdown failed:', err.message);
+        });
+      }
+    }
   }
 }
 
