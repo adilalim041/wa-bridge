@@ -10,8 +10,8 @@ const ZOMBIE_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours no messages = zombie
 const lastConnectedAt = new Map();
 const alertSent = new Map();
 
-const DOWNTIME_THRESHOLD = 5 * 60 * 1000; // 5 minutes — enterprise threshold
-const ALERT_COOLDOWN = 30 * 60 * 1000; // 30 minutes between alerts per session
+const DOWNTIME_THRESHOLD = 15 * 60 * 1000; // 15 minutes — don't alarm for quick reconnects
+const ALERT_COOLDOWN = 2 * 60 * 60 * 1000; // 2 hours between alerts per session
 const lastAlertTime = new Map(); // sessionId -> timestamp of last alert
 const disconnectedAt = new Map(); // sessionId -> timestamp when disconnect started
 const disconnectLog = new Map(); // sessionId -> [{at, duration}] for morning summary
@@ -128,8 +128,21 @@ export function updateConnectionStatus(sessionId, connected) {
 let sessionManagerRef = null;
 export function setSessionManagerRef(sm) { sessionManagerRef = sm; }
 
+// Track last restart per session to prevent restart loops
+const lastZombieRestart = new Map();
+const MIN_RESTART_INTERVAL = 6 * 60 * 60 * 1000; // 6h minimum between restarts
+
 async function checkZombieConnection(sessionId) {
   try {
+    // Only check during working hours (10:00-20:00 Almaty) — nights have no messages normally
+    const now = new Date();
+    const almatyHour = (now.getUTCHours() + 5) % 24;
+    if (almatyHour < 10 || almatyHour >= 20) return;
+
+    // Rate-limit restarts: max once per 6 hours per session
+    const lastRestart = lastZombieRestart.get(sessionId) || 0;
+    if (Date.now() - lastRestart < MIN_RESTART_INTERVAL) return;
+
     // Only check if session reports as connected
     const state = sessionManagerRef?.getSessionState?.(sessionId);
     if (!state?.connected) return;
@@ -148,8 +161,9 @@ async function checkZombieConnection(sessionId) {
     const lastMsgAge = Date.now() - new Date(data.timestamp).getTime();
     if (lastMsgAge > ZOMBIE_THRESHOLD_MS) {
       const hours = Math.round(lastMsgAge / 3600000);
+      lastZombieRestart.set(sessionId, Date.now());
       sendTelegramAlert(
-        `🧟 Zombie detected [${sessionId}]: Connected but no messages for ${hours}h. Auto-restarting...`
+        `🧟 Zombie detected [${sessionId}]: ${hours}h without messages during work hours. Restarting...`
       ).catch(() => {});
 
       // Force restart
@@ -157,7 +171,7 @@ async function checkZombieConnection(sessionId) {
         await sessionManagerRef.stopSession(sessionId);
         await new Promise((r) => setTimeout(r, 3000));
         await sessionManagerRef.startSession(sessionId);
-        sendTelegramAlert(`✅ [${sessionId}]: Session restarted after zombie detection.`).catch(() => {});
+        // No "restarted" alert — reduces notification spam
       }
     }
   } catch (err) {
