@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.8",
-    "baileys": "github:WhiskeySockets/Baileys#master",
+    "baileys": "github:WhiskeySockets/Baileys#8e5093c198de5c5c0230a76e8a7224f6006ebb2e",
     "cloudinary": "^2.9.0",
     "dotenv": "^16.5.0",
     "express": "^4.21.2",
