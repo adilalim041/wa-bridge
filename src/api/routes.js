@@ -16,6 +16,45 @@ import { sendTelegramMessage, isTelegramConfigured } from '../notifications/tele
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
+// ---------------------------------------------------------------------------
+// In-process cache for /analytics/summary
+// ---------------------------------------------------------------------------
+const analyticsCache = new Map(); // key → { data, expiresAt }
+const ANALYTICS_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+
+function makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days) {
+  return `${sessionId || '_all'}|${dateFrom || ''}|${dateTo || ''}|${days}`;
+}
+
+function getAnalyticsCache(key) {
+  const entry = analyticsCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    analyticsCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setAnalyticsCache(key, data) {
+  analyticsCache.set(key, { data, expiresAt: Date.now() + ANALYTICS_CACHE_TTL_MS });
+}
+
+function invalidateAnalyticsCache() {
+  analyticsCache.clear();
+}
+
+// Allowed values for validation
+const VALID_TEMPERATURES = new Set(['hot', 'warm', 'cold', 'dead']);
+const VALID_DEAL_STAGES = new Set([
+  'first_contact', 'consultation', 'model_selection', 'price_negotiation',
+  'payment', 'delivery', 'completed', 'refused', 'needs_review',
+]);
+const VALID_MANAGER_ISSUES = new Set([
+  'slow_first_response', 'no_followup', 'poor_consultation', 'no_photos',
+  'no_showroom_invite', 'no_upsell', 'rude_tone', 'formal_tone', 'no_alternative',
+]);
+
 const CYRILLIC_MAP = {
   а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
   з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o',
@@ -313,6 +352,14 @@ export function setupRoutes(app) {
     const dateTo = req.query.date_to || req.query.date || null;     // YYYY-MM-DD (same as from for single day)
     const days = Math.min(Number(req.query.days) || 7, 90);
 
+    // Serve from cache if available
+    const cacheKey = makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days);
+    const cached = getAnalyticsCache(cacheKey);
+    if (cached) {
+      logger.debug({ cacheKey }, 'analytics/summary: cache hit');
+      return res.json(cached);
+    }
+
     // Date range or days-based
     const rangeStart = dateFrom ? `${dateFrom}T00:00:00+05:00` : null;
     const rangeEnd = dateTo ? `${dateTo}T23:59:59+05:00` : null;
@@ -507,7 +554,7 @@ export function setupRoutes(app) {
         .map(([date, messages]) => ({ date, messages }))
         .sort((a, b) => a.date.localeCompare(b.date));
 
-      return res.json({
+      const result = {
         period: { days, since, dateFrom: dateFrom || null, dateTo: dateTo || null },
         kpi: {
           avgResponseTime,
@@ -525,10 +572,215 @@ export function setupRoutes(app) {
         customerTypes,
         managerIssues,
         followupStats,
-      });
+      };
+
+      setAnalyticsCache(cacheKey, result);
+      return res.json(result);
     } catch (error) {
       logger.error({ err: error }, 'Analytics summary failed');
       return res.status(500).json({ error: 'Failed to fetch analytics' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /analytics/chats-by-filter — filtered chat list for drilldown
+  // ---------------------------------------------------------------------------
+  router.get('/analytics/chats-by-filter', async (req, res) => {
+    const { type, value, session_id, date_from, date_to } = req.query;
+    const days = Math.min(Number(req.query.days) || 7, 90);
+
+    const VALID_TYPES = new Set(['risk', 'issue', 'action_required', 'temperature', 'followup']);
+    if (!type || !VALID_TYPES.has(type)) {
+      return res.status(400).json({ error: `type must be one of: ${[...VALID_TYPES].join(', ')}` });
+    }
+    if (type !== 'action_required' && !value) {
+      return res.status(400).json({ error: 'value is required for this filter type' });
+    }
+
+    try {
+      // Build date range for analysis_date
+      let sinceDateStr;
+      if (date_from) {
+        sinceDateStr = date_from;
+      } else {
+        const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000 + 5 * 3600000);
+        sinceDateStr = sinceDate.toISOString().slice(0, 10);
+      }
+
+      // Build chat_ai query
+      let aiQuery = supabase
+        .from('chat_ai')
+        .select('id, session_id, remote_jid, dialog_session_id, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score')
+        .gte('analysis_date', sinceDateStr)
+        .limit(100);
+
+      if (date_to) {
+        aiQuery = aiQuery.lte('analysis_date', date_to);
+      }
+      if (session_id) {
+        aiQuery = aiQuery.eq('session_id', session_id);
+      }
+
+      // Type-specific filter
+      if (type === 'risk') {
+        aiQuery = aiQuery.contains('risk_flags', [value]);
+      } else if (type === 'issue') {
+        aiQuery = aiQuery.contains('manager_issues', [value]);
+      } else if (type === 'action_required') {
+        aiQuery = aiQuery.eq('action_required', true);
+      } else if (type === 'temperature') {
+        aiQuery = aiQuery.eq('lead_temperature', value);
+      } else if (type === 'followup') {
+        aiQuery = aiQuery.eq('followup_status', value);
+      }
+
+      const { data: aiRows, error: aiError } = await aiQuery;
+      if (aiError) {
+        logger.error({ err: aiError }, 'chats-by-filter: chat_ai query failed');
+        return res.status(500).json({ error: 'Failed to query AI data' });
+      }
+
+      if (!aiRows || aiRows.length === 0) {
+        return res.json({ total: 0, filter: { type, value: value || null }, chats: [] });
+      }
+
+      // Collect unique (session_id, remote_jid) pairs for chats lookup
+      const jidSet = [...new Set(aiRows.map((r) => `${r.session_id}:::${r.remote_jid}`))];
+      const sessionIds = [...new Set(aiRows.map((r) => r.session_id))];
+
+      // Fetch chat metadata (display_name, last_message_at)
+      const { data: chatsData } = await supabase
+        .from('chats')
+        .select('session_id, remote_jid, display_name, last_message_at')
+        .in('session_id', sessionIds);
+
+      const chatsMap = {};
+      for (const c of chatsData ?? []) {
+        chatsMap[`${c.session_id}:::${c.remote_jid}`] = c;
+      }
+
+      // Fetch session display names
+      const { data: sessionsData } = await supabase
+        .from('session_config')
+        .select('session_id, display_name')
+        .in('session_id', sessionIds);
+
+      const sessionsMap = {};
+      for (const s of sessionsData ?? []) {
+        sessionsMap[s.session_id] = s.display_name || s.session_id;
+      }
+
+      // Build result list — filter out garbage JIDs
+      const chats = aiRows
+        .filter((r) => !isGarbageJid(r.remote_jid))
+        .map((r) => {
+          const key = `${r.session_id}:::${r.remote_jid}`;
+          const chat = chatsMap[key] || {};
+          const digits = r.remote_jid.replace(/\D/g, '');
+          return {
+            sessionId: r.session_id,
+            sessionDisplayName: sessionsMap[r.session_id] || r.session_id,
+            remoteJid: r.remote_jid,
+            displayName: chat.display_name || null,
+            phone: isRealPhoneJid(r.remote_jid) ? digits : null,
+            lastTimestamp: chat.last_message_at || null,
+            summary: r.summary_ru || null,
+            action: r.action_suggestion || null,
+            temperature: r.lead_temperature || null,
+            dealStage: r.deal_stage || null,
+            sentiment: r.sentiment || null,
+            issues: r.manager_issues || [],
+            consultationScore: r.consultation_score || null,
+            chatAiId: r.id,
+          };
+        });
+
+      return res.json({ total: chats.length, filter: { type, value: value || null }, chats });
+    } catch (error) {
+      logger.error({ err: error }, 'chats-by-filter failed');
+      return res.status(500).json({ error: 'Failed to fetch filtered chats' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // PATCH /chat_ai/:id — manual correction of AI analysis fields
+  // ---------------------------------------------------------------------------
+  router.patch('/chat_ai/:id', async (req, res) => {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string') {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+
+    const ALLOWED_FIELDS = new Set([
+      'action_required', 'manager_issues', 'risk_flags',
+      'lead_temperature', 'deal_stage', 'summary_ru', 'action_suggestion',
+    ]);
+
+    // Strip unknown fields
+    const updates = {};
+    for (const [key, val] of Object.entries(req.body || {})) {
+      if (ALLOWED_FIELDS.has(key)) {
+        updates[key] = val;
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided' });
+    }
+
+    // Validate individual fields
+    if ('lead_temperature' in updates && !VALID_TEMPERATURES.has(updates.lead_temperature)) {
+      return res.status(400).json({
+        error: `lead_temperature must be one of: ${[...VALID_TEMPERATURES].join(', ')}`,
+      });
+    }
+    if ('deal_stage' in updates && !VALID_DEAL_STAGES.has(updates.deal_stage)) {
+      return res.status(400).json({
+        error: `deal_stage must be one of: ${[...VALID_DEAL_STAGES].join(', ')}`,
+      });
+    }
+    if ('manager_issues' in updates) {
+      if (!Array.isArray(updates.manager_issues)) {
+        return res.status(400).json({ error: 'manager_issues must be an array' });
+      }
+      const invalid = updates.manager_issues.filter((i) => !VALID_MANAGER_ISSUES.has(i));
+      if (invalid.length > 0) {
+        return res.status(400).json({
+          error: `Invalid manager_issues values: ${invalid.join(', ')}. Valid: ${[...VALID_MANAGER_ISSUES].join(', ')}`,
+        });
+      }
+    }
+    if ('risk_flags' in updates && !Array.isArray(updates.risk_flags)) {
+      return res.status(400).json({ error: 'risk_flags must be an array' });
+    }
+    if ('action_required' in updates && typeof updates.action_required !== 'boolean') {
+      return res.status(400).json({ error: 'action_required must be a boolean' });
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('chat_ai')
+        .update(updates)
+        .eq('id', id)
+        .select()
+        .single();
+
+      if (error) {
+        if (error.code === 'PGRST116') {
+          return res.status(404).json({ error: 'chat_ai record not found' });
+        }
+        logger.error({ err: error, id }, 'PATCH chat_ai failed');
+        return res.status(500).json({ error: 'Update failed' });
+      }
+
+      // Invalidate analytics cache — the updated record may affect summary counts
+      invalidateAnalyticsCache();
+
+      logger.info({ id, fields: Object.keys(updates) }, 'chat_ai manually updated');
+      return res.json({ ok: true, record: data });
+    } catch (error) {
+      logger.error({ err: error, id }, 'PATCH chat_ai unexpected error');
+      return res.status(500).json({ error: 'Update failed' });
     }
   });
 
