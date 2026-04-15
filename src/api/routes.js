@@ -730,13 +730,13 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'No valid fields provided' });
     }
 
-    // Validate individual fields
-    if ('lead_temperature' in updates && !VALID_TEMPERATURES.has(updates.lead_temperature)) {
+    // Validate individual fields (null/undefined = clear, which is valid)
+    if ('lead_temperature' in updates && updates.lead_temperature !== null && !VALID_TEMPERATURES.has(updates.lead_temperature)) {
       return res.status(400).json({
-        error: `lead_temperature must be one of: ${[...VALID_TEMPERATURES].join(', ')}`,
+        error: `lead_temperature must be one of: ${[...VALID_TEMPERATURES].join(', ')} or null`,
       });
     }
-    if ('deal_stage' in updates && !VALID_DEAL_STAGES.has(updates.deal_stage)) {
+    if ('deal_stage' in updates && updates.deal_stage !== null && !VALID_DEAL_STAGES.has(updates.deal_stage)) {
       return res.status(400).json({
         error: `deal_stage must be one of: ${[...VALID_DEAL_STAGES].join(', ')}`,
       });
