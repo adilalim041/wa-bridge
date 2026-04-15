@@ -648,10 +648,10 @@ export function setupRoutes(app) {
       const jidSet = [...new Set(aiRows.map((r) => `${r.session_id}:::${r.remote_jid}`))];
       const sessionIds = [...new Set(aiRows.map((r) => r.session_id))];
 
-      // Fetch chat metadata (display_name, last_message_at)
+      // Fetch chat metadata (display_name, last_message_at, tags)
       const { data: chatsData } = await supabase
         .from('chats')
-        .select('session_id, remote_jid, display_name, last_message_at')
+        .select('session_id, remote_jid, display_name, last_message_at, tags, tag_confirmed')
         .in('session_id', sessionIds);
 
       const chatsMap = {};
@@ -692,6 +692,8 @@ export function setupRoutes(app) {
             issues: r.manager_issues || [],
             consultationScore: r.consultation_score || null,
             chatAiId: r.id,
+            tags: chat.tags || [],
+            tagConfirmed: chat.tag_confirmed || false,
           };
         });
 
