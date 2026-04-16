@@ -11,7 +11,7 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi } from '../storage/queries.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
@@ -42,6 +42,26 @@ function setAnalyticsCache(key, data) {
 
 function invalidateAnalyticsCache() {
   analyticsCache.clear();
+}
+
+// Serialize a calls DB row into the API response shape
+function formatCall(row) {
+  return {
+    id: row.id,
+    callId: row.call_id,
+    sessionId: row.session_id,
+    remoteJid: row.remote_jid,
+    fromMe: row.from_me,
+    isVideo: row.is_video,
+    isGroup: row.is_group,
+    status: row.status,
+    offeredAt: row.offered_at,
+    answeredAt: row.answered_at ?? null,
+    endedAt: row.ended_at ?? null,
+    durationSec: row.duration_sec ?? null,
+    missed: row.missed,
+    createdAt: row.created_at,
+  };
 }
 
 // Allowed values for validation
@@ -783,6 +803,64 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, id }, 'PATCH chat_ai unexpected error');
       return res.status(500).json({ error: 'Update failed' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Calls API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * GET /sessions/:sessionId/calls?limit=100&offset=0
+   * Returns all calls for a session, newest first.
+   */
+  router.get('/sessions/:sessionId/calls', async (req, res) => {
+    const { sessionId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const offset = parseInt(req.query.offset, 10) || 0;
+
+    try {
+      const calls = await getCallsBySession(sessionId, { limit, offset });
+      return res.json({ calls: calls.map(formatCall) });
+    } catch (err) {
+      logger.error({ err, sessionId }, 'GET /sessions/:sessionId/calls failed');
+      return res.status(500).json({ error: 'Failed to fetch calls' });
+    }
+  });
+
+  /**
+   * GET /sessions/:sessionId/chats/:phone/calls
+   * Returns calls for a specific chat (by phone number / remoteJid).
+   */
+  router.get('/sessions/:sessionId/chats/:phone/calls', async (req, res) => {
+    const { sessionId, phone } = req.params;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+
+    try {
+      const calls = await getCallsByChat(sessionId, phone, { limit });
+      return res.json({ calls: calls.map(formatCall) });
+    } catch (err) {
+      logger.error({ err, sessionId, phone }, 'GET /sessions/:sessionId/chats/:phone/calls failed');
+      return res.status(500).json({ error: 'Failed to fetch calls' });
+    }
+  });
+
+  /**
+   * GET /analytics/calls-kpi?days=7
+   * Returns call KPIs: total, missed, answer rate, avg duration — per session and overall.
+   */
+  router.get('/analytics/calls-kpi', async (req, res) => {
+    const days = Math.min(parseInt(req.query.days, 10) || 7, 90);
+
+    try {
+      const kpi = await getCallsKpi(days);
+      if (!kpi) {
+        return res.status(500).json({ error: 'Failed to compute calls KPI' });
+      }
+      return res.json(kpi);
+    } catch (err) {
+      logger.error({ err, days }, 'GET /analytics/calls-kpi failed');
+      return res.status(500).json({ error: 'Failed to compute calls KPI' });
     }
   });
 

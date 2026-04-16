@@ -115,6 +115,30 @@ export function emitSessionStatus(sessionId, status) {
   }
 }
 
+export function emitCallEvent(sessionId, callData) {
+  if (!wss) {
+    return;
+  }
+
+  const payload = JSON.stringify({
+    type: 'call_event',
+    sessionId,
+    call: callData,
+  });
+
+  for (const ws of wss.clients) {
+    if (ws.readyState !== WebSocket.OPEN) {
+      continue;
+    }
+
+    if (ws.subscribedSessions && !ws.subscribedSessions.has(sessionId)) {
+      continue;
+    }
+
+    ws.send(payload);
+  }
+}
+
 export function stopWebSocket() {
   if (heartbeatInterval) {
     clearInterval(heartbeatInterval);

@@ -333,6 +333,230 @@ export async function getLinkedSessions(remoteJid) {
 }
 
 // Get messages from ALL sessions for one contact, sorted chronologically
+// ---------------------------------------------------------------------------
+// Calls
+// ---------------------------------------------------------------------------
+
+/**
+ * UPSERT a call record.
+ * On conflict (call_id, session_id):
+ *   - Updates only non-null incoming fields.
+ *   - For 'terminate' status: calculates duration_sec when answered_at exists.
+ * Returns the final DB row, or null on error.
+ */
+export async function upsertCall({
+  callId,
+  sessionId,
+  remoteJid,
+  fromMe,
+  isVideo,
+  isGroup,
+  status,
+  offeredAt,
+  answeredAt,
+  endedAt,
+  durationSec,
+  missed,
+  rawData,
+  terminateAt, // special flag: compute duration on terminate
+}) {
+  try {
+    const now = new Date().toISOString();
+
+    // For terminate: fetch existing row to compute duration if answered
+    if (terminateAt) {
+      const { data: existing } = await supabase
+        .from('calls')
+        .select('answered_at')
+        .eq('call_id', callId)
+        .eq('session_id', sessionId)
+        .maybeSingle();
+
+      if (existing?.answered_at) {
+        const answeredMs = new Date(existing.answered_at).getTime();
+        const endedMs = new Date(terminateAt).getTime();
+        durationSec = Math.max(0, Math.round((endedMs - answeredMs) / 1000));
+        missed = false;
+      } else {
+        // Call was never answered — caller hung up before pickup
+        missed = true;
+      }
+      endedAt = terminateAt;
+    }
+
+    // Build update object — only include defined fields
+    const row = {
+      call_id: callId,
+      session_id: sessionId,
+      remote_jid: remoteJid,
+      from_me: fromMe,
+      is_video: isVideo,
+      is_group: isGroup,
+      status,
+      updated_at: now,
+    };
+
+    if (offeredAt !== undefined) row.offered_at = offeredAt;
+    if (answeredAt !== undefined) row.answered_at = answeredAt;
+    if (endedAt !== undefined) row.ended_at = endedAt;
+    if (durationSec !== undefined) row.duration_sec = durationSec;
+    if (missed !== undefined) row.missed = missed;
+    if (rawData !== undefined) row.raw_data = rawData;
+
+    const { data, error } = await supabase
+      .from('calls')
+      .upsert(row, {
+        onConflict: 'call_id,session_id',
+        ignoreDuplicates: false,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error({ err: error, callId, sessionId, status }, 'Failed to upsert call');
+      return null;
+    }
+
+    return data;
+  } catch (err) {
+    logger.error({ err, callId, sessionId }, 'Unexpected error in upsertCall');
+    return null;
+  }
+}
+
+export async function getCallsBySession(sessionId, { limit = 100, offset = 0 } = {}) {
+  try {
+    const { data, error } = await supabase
+      .from('calls')
+      .select('*')
+      .eq('session_id', sessionId)
+      .order('offered_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      logger.error({ err: error, sessionId }, 'Failed to fetch calls by session');
+      return [];
+    }
+
+    return data ?? [];
+  } catch (err) {
+    logger.error({ err, sessionId }, 'Unexpected error in getCallsBySession');
+    return [];
+  }
+}
+
+export async function getCallsByChat(sessionId, remoteJid, { limit = 50 } = {}) {
+  try {
+    const { data, error } = await supabase
+      .from('calls')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('remote_jid', remoteJid)
+      .order('offered_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Failed to fetch calls by chat');
+      return [];
+    }
+
+    return data ?? [];
+  } catch (err) {
+    logger.error({ err, sessionId, remoteJid }, 'Unexpected error in getCallsByChat');
+    return [];
+  }
+}
+
+export async function getMissedCallsCount(sessionId, remoteJid) {
+  try {
+    const { count, error } = await supabase
+      .from('calls')
+      .select('*', { count: 'exact', head: true })
+      .eq('session_id', sessionId)
+      .eq('remote_jid', remoteJid)
+      .eq('missed', true);
+
+    if (error) {
+      logger.error({ err: error, sessionId, remoteJid }, 'Failed to count missed calls');
+      return 0;
+    }
+
+    return count ?? 0;
+  } catch (err) {
+    logger.error({ err, sessionId, remoteJid }, 'Unexpected error in getMissedCallsCount');
+    return 0;
+  }
+}
+
+export async function getCallsKpi(days = 7) {
+  try {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabase
+      .from('calls')
+      .select('session_id, status, missed, duration_sec, from_me')
+      .gte('offered_at', since);
+
+    if (error) {
+      logger.error({ err: error, days }, 'Failed to fetch calls for KPI');
+      return null;
+    }
+
+    // Aggregate per session
+    const sessionMap = new Map();
+
+    for (const row of data ?? []) {
+      if (!sessionMap.has(row.session_id)) {
+        sessionMap.set(row.session_id, {
+          sessionId: row.session_id,
+          total: 0,
+          missed: 0,
+          answered: 0,
+          totalDurationSec: 0,
+          answeredCount: 0,
+        });
+      }
+      const s = sessionMap.get(row.session_id);
+      s.total++;
+      if (row.missed) s.missed++;
+      if (row.status === 'accept' || row.duration_sec > 0) {
+        s.answered++;
+        if (row.duration_sec > 0) {
+          s.totalDurationSec += row.duration_sec;
+          s.answeredCount++;
+        }
+      }
+    }
+
+    const sessions = Array.from(sessionMap.values()).map((s) => ({
+      sessionId: s.sessionId,
+      total: s.total,
+      missed: s.missed,
+      answered: s.answered,
+      answerRate: s.total > 0 ? Math.round((s.answered / s.total) * 100) : 0,
+      avgDurationSec: s.answeredCount > 0 ? Math.round(s.totalDurationSec / s.answeredCount) : 0,
+    }));
+
+    // Overall totals
+    const totals = sessions.reduce(
+      (acc, s) => {
+        acc.total += s.total;
+        acc.missed += s.missed;
+        acc.answered += s.answered;
+        return acc;
+      },
+      { total: 0, missed: 0, answered: 0 }
+    );
+
+    totals.answerRate = totals.total > 0 ? Math.round((totals.answered / totals.total) * 100) : 0;
+
+    return { days, since, totals, sessions };
+  } catch (err) {
+    logger.error({ err, days }, 'Unexpected error in getCallsKpi');
+    return null;
+  }
+}
+
 export async function getUnifiedMessages(remoteJid, limit = 50, offset = 0) {
   // Reject LID/group jids
   const digits = (remoteJid || '').replace(/@.*$/, '').replace(/\D/g, '');

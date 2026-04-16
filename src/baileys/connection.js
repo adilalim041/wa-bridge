@@ -9,6 +9,7 @@ import { useSupabaseAuthState } from '../storage/authState.js';
 import { emitNewMessage, emitSessionStatus } from '../api/websocket.js';
 import { setCurrentVersion, startVersionChecker } from '../versionChecker.js';
 import { handleMessage, registerSessionPhone, loadPhoneRegistry } from './messageHandler.js';
+import { handleCallEvent } from './callHandler.js';
 
 const DEFAULT_STATE = {
   qr: null,
@@ -171,7 +172,7 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
 
   // Clean up old socket listeners to prevent accumulation on reconnect
   if (_prevSock?.ev) {
-    for (const event of ['connection.update', 'creds.update', 'messages.upsert', 'messaging-history.set', 'messages.update']) {
+    for (const event of ['connection.update', 'creds.update', 'messages.upsert', 'messaging-history.set', 'messages.update', 'call']) {
       _prevSock.ev.removeAllListeners(event);
     }
     // Close underlying WebSocket to prevent lingering connections
@@ -511,6 +512,13 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
       } catch (err) {
         logger.error({ err, sessionId, messageId: key?.id }, 'Failed to process message update');
       }
+    }
+  });
+
+  // Call events — track voice/video calls (status: offer, accept, reject, timeout, terminate)
+  sock.ev.on('call', async (events) => {
+    for (const event of events) {
+      await handleCallEvent(sessionId, event);
     }
   });
 
