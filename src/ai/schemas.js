@@ -1,5 +1,76 @@
 import { z } from 'zod';
 
+// === Tool input schemas for chatEndpoint.js ===
+// Validated BEFORE any DB call — defense against hallucinated limits, injection via IDs,
+// and resource exhaustion from unbounded parameters.
+
+const sessionIdField = z.string().min(1).max(50).optional();
+const remoteJidField = z.string().min(1).max(100);
+
+export const toolInputSchemas = {
+  get_chats: z.object({
+    session_id: sessionIdField,
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+    name_search: z.string().max(100).optional(),
+  }),
+
+  get_messages: z.object({
+    session_id: sessionIdField,
+    remote_jid: remoteJidField,
+    limit: z.coerce.number().int().min(1).max(200).default(30),
+  }),
+
+  get_ai_analysis: z.object({
+    session_id: sessionIdField,
+    remote_jid: z.string().max(100).optional(),
+    lead_temperature: z.enum(['hot', 'warm', 'cold', 'dead']).optional(),
+    sentiment: z.enum(['positive', 'neutral', 'negative', 'aggressive']).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  }),
+
+  get_manager_analytics: z.object({
+    session_id: sessionIdField,
+    days: z.coerce.number().int().min(1).max(365).default(7),
+  }),
+
+  get_contacts: z.object({
+    session_id: sessionIdField,
+    role: z.string().max(50).optional(),
+  }),
+
+  find_problems: z.object({
+    session_id: sessionIdField,
+    hours_no_response: z.coerce.number().int().min(1).max(720).default(2),
+  }),
+
+  update_deal_stage: z.object({
+    session_id: sessionIdField,
+    remote_jid: remoteJidField,
+    deal_stage: z.enum([
+      'needs_review', 'first_contact', 'consultation', 'model_selection',
+      'price_negotiation', 'payment', 'delivery', 'completed', 'refused',
+    ]),
+  }),
+
+  update_tags: z.object({
+    session_id: sessionIdField,
+    remote_jid: remoteJidField,
+    tags: z.array(z.string().max(50)).max(10),
+  }),
+
+  create_task: z.object({
+    session_id: sessionIdField,
+    remote_jid: z.string().max(100).optional(),
+    title: z.string().min(1).max(200),
+    due_date: z.string().min(1).max(50),
+    description: z.string().max(2000).optional(),
+    task_type: z.enum(['follow_up', 'call_back', 'send_quote', 'send_catalog', 'visit_showroom', 'custom']).optional(),
+    priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+    deal_value: z.coerce.number().min(0).max(1_000_000_000).optional(),
+    notes: z.string().max(2000).optional(),
+  }),
+};
+
 // === Daily analysis response schema ===
 // Validates the JSON returned by Claude when analyzing a dialog
 
