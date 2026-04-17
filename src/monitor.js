@@ -65,12 +65,24 @@ export function trackDisconnectEvent(sessionId, statusCode) {
       ).catch(() => {});
       console.error('CASCADE BAN — shutting down all sessions:', sessionList);
 
-      // Shutdown all sessions via sessionManager (no restart)
-      if (sessionManagerRef?.stopAll) {
-        sessionManagerRef.stopAll().catch((err) => {
-          console.error('Cascade shutdown failed:', err.message);
-        });
-      }
+      // Shutdown all sessions, then exit so Railway respawns with a new egress IP.
+      // Staying alive after cascade keeps the banned IP — defeats the whole point.
+      const shutdownPromise = sessionManagerRef?.stopAll
+        ? sessionManagerRef.stopAll().catch((err) => {
+            console.error('Cascade shutdown failed:', err.message);
+          })
+        : Promise.resolve();
+
+      // Hard timeout: don't block exit forever if stopAll hangs.
+      const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 30000));
+
+      Promise.race([shutdownPromise, timeoutPromise]).finally(() => {
+        // 5s buffer for Telegram alert + logs to flush before exit
+        setTimeout(() => {
+          console.error('[CASCADE] Exiting process (code 1) to force new Railway IP on restart');
+          process.exit(1);
+        }, 5000);
+      });
     }
   }
 }
