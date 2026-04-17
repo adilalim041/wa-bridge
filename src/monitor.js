@@ -65,6 +65,20 @@ export function trackDisconnectEvent(sessionId, statusCode) {
       ).catch(() => {});
       console.error('CASCADE BAN — shutting down all sessions:', sessionList);
 
+      // Safety net (W2 anti-ban #5, 2026-04-17): in normal operation the
+      // process.exit(1) below fires within ~35s and this setTimeout is moot
+      // (Node kills all timers on exit). But if stopAll *and* the 30s timeout
+      // promise both hang AND process.exit is somehow interrupted (e.g. by an
+      // unhandled promise rejection in a handler that swallows the exit),
+      // the process would be stuck with cascadeShutdownTriggered=true forever
+      // and unable to detect subsequent cascades. Reset after 30 min clears
+      // that edge case.
+      setTimeout(() => {
+        cascadeShutdownTriggered = false;
+        recentLoggedOuts.length = 0;
+        console.warn('[CASCADE] Safety net: flag reset after 30min — process still alive, cascade detection re-armed');
+      }, 30 * 60 * 1000).unref?.(); // .unref() lets Node exit naturally if nothing else holds the loop
+
       // Shutdown all sessions, then exit so Railway respawns with a new egress IP.
       // Staying alive after cascade keeps the banned IP — defeats the whole point.
       const shutdownPromise = sessionManagerRef?.stopAll

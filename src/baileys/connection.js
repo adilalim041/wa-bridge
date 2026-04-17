@@ -62,17 +62,62 @@ function shouldPrintQrToTerminal() {
 }
 
 // Per-session unique browser fingerprint — looks like different real devices
-// Stable: same sessionId always gets same fingerprint (no change on reconnect)
+// Stable: same sessionId always gets same fingerprint (no change on reconnect).
+// Expanded 2026-04-17 from 10 → 40 entries (W2 anti-ban #1). Rationale: with
+// 10 slots and 6 sessions, ~random FNV hash has ~85% chance of at least one
+// collision — we fall back to linear-probe which eats diversity. At 40 slots
+// collision probability drops below 40%, and fingerprint variance is much
+// higher. Versions are realistic for Chrome/Edge/Firefox/Safari/Opera/Brave
+// as of early 2026 — the goal is plausible user-agents across the 6 sessions.
 const BROWSER_POOL = [
+  // Chrome stable channel variants
+  ['Chrome', 'Desktop', '131.0.6778'],
+  ['Chrome', 'Desktop', '130.0.6723'],
+  ['Chrome', 'Desktop', '129.0.6668'],
+  ['Chrome', 'Desktop', '128.0.6613'],
+  ['Chrome', 'Desktop', '127.0.6533'],
+  ['Chrome', 'Desktop', '126.0.6478'],
   ['Chrome', 'Desktop', '125.0.6422'],
   ['Chrome', 'Desktop', '124.0.6367'],
-  ['Chrome', 'Desktop', '126.0.6478'],
-  ['Edge', 'Desktop', '125.0.2535'],
-  ['Edge', 'Desktop', '124.0.2478'],
-  ['Opera', 'Desktop', '111.0.5168'],
-  ['Chrome', 'Desktop', '123.0.6312'],
+  // Edge
+  ['Edge', 'Desktop', '131.0.2903'],
+  ['Edge', 'Desktop', '130.0.2849'],
+  ['Edge', 'Desktop', '129.0.2792'],
+  ['Edge', 'Desktop', '128.0.2739'],
+  ['Edge', 'Desktop', '127.0.2651'],
   ['Edge', 'Desktop', '126.0.2592'],
+  ['Edge', 'Desktop', '125.0.2535'],
+  // Firefox (was absent — adds a whole new vendor signature)
+  ['Firefox', 'Desktop', '133.0'],
+  ['Firefox', 'Desktop', '132.0.2'],
+  ['Firefox', 'Desktop', '131.0.3'],
+  ['Firefox', 'Desktop', '130.0.1'],
+  ['Firefox', 'Desktop', '129.0'],
+  // Safari (macOS only — different platform fingerprint)
+  ['Safari', 'Desktop', '18.2'],
+  ['Safari', 'Desktop', '18.1'],
+  ['Safari', 'Desktop', '17.6'],
+  ['Safari', 'Desktop', '17.5'],
+  // Opera
+  ['Opera', 'Desktop', '115.0.5322'],
+  ['Opera', 'Desktop', '114.0.5282'],
+  ['Opera', 'Desktop', '113.0.5230'],
+  ['Opera', 'Desktop', '112.0.5197'],
+  ['Opera', 'Desktop', '111.0.5168'],
+  // Brave (Chromium fork, distinct UA)
+  ['Brave', 'Desktop', '1.72.122'],
+  ['Brave', 'Desktop', '1.71.118'],
+  ['Brave', 'Desktop', '1.70.126'],
+  // Vivaldi
+  ['Vivaldi', 'Desktop', '7.0.3495'],
+  ['Vivaldi', 'Desktop', '6.9.3447'],
+  // Chromium open builds
+  ['Chromium', 'Desktop', '131.0.6778'],
+  ['Chromium', 'Desktop', '130.0.6723'],
+  // Older but still-alive Chrome (covers "office PC hasn't updated" profile)
+  ['Chrome', 'Desktop', '123.0.6312'],
   ['Chrome', 'Desktop', '122.0.6261'],
+  ['Edge', 'Desktop', '124.0.2478'],
   ['Opera', 'Desktop', '110.0.5130'],
 ];
 
@@ -128,10 +173,15 @@ function getReconnectDelay(sessionId) {
     baseDelay = 10 * 60 * 1000; // 10 min
   }
 
-  // Add 0-10% jitter to prevent thundering herd with multiple sessions
-  const jitter = Math.random() * baseDelay * 0.1;
+  // 2026-04-17 (W2 anti-ban #2): ±25% symmetric jitter (was 0-10% one-sided).
+  // With 6 sessions losing connection at the same time (e.g. Railway restart or
+  // cascade ban), a narrow jitter band meant they all retried within ~100ms of
+  // each other — visible as a cluster to Meta. Widening to ±25% spreads retries
+  // across a 50% of-base window, which looks like independent reconnection
+  // attempts from 6 different phones with 6 different network conditions.
+  const jitterFactor = 0.75 + Math.random() * 0.5; // 0.75..1.25
 
-  return Math.round(baseDelay + jitter);
+  return Math.round(baseDelay * jitterFactor);
 }
 
 function resetReconnectAttempts(sessionId) {
