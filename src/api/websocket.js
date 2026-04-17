@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../config.js';
+import { verifySupabaseJwt, isJwtAuthAvailable } from './jwtAuth.js';
 
 let wss = null;
 let heartbeatInterval = null;
@@ -13,17 +14,41 @@ export function setupWebSocket(server) {
   wss = new WebSocketServer({ server, path: '/ws' });
   const API_KEY = process.env.API_KEY;
 
-  wss.on('connection', (ws, req) => {
-    // Authenticate via query param: /ws?apiKey=...
-    if (API_KEY) {
-      const url = new URL(req.url, 'http://localhost');
-      const clientKey = url.searchParams.get('apiKey');
-      const isValid = clientKey && clientKey.length === API_KEY.length &&
-        crypto.timingSafeEqual(Buffer.from(clientKey), Buffer.from(API_KEY));
-      if (!isValid) {
-        logger.warn('WebSocket connection rejected: invalid API key');
+  // Phase A: WebSocket accepts ?access_token=<jwt> OR ?apiKey=<key> (backward compat).
+  // Browsers cannot send custom headers on WebSocket upgrade — query params are the
+  // only option. Both paths are fail-closed: if neither succeeds, connection is rejected.
+  wss.on('connection', async (ws, req) => {
+    const url = new URL(req.url, 'http://localhost');
+
+    // ── Attempt 1: JWT via ?access_token= ──────────────────────────────────
+    const accessToken = url.searchParams.get('access_token');
+    if (accessToken) {
+      if (!isJwtAuthAvailable()) {
+        logger.warn('WebSocket rejected: access_token provided but JWT not configured');
         ws.close(4001, 'Unauthorized');
         return;
+      }
+      try {
+        const user = await verifySupabaseJwt(accessToken);
+        ws.user = user;
+        logger.debug({ userId: user.userId }, 'ws jwt auth ok');
+        // Fall through to the rest of the connection handler
+      } catch (err) {
+        logger.warn({ err: err.message }, 'WebSocket rejected: jwt verify failed');
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+    } else {
+      // ── Attempt 2: legacy ?apiKey= ────────────────────────────────────────
+      if (API_KEY) {
+        const clientKey = url.searchParams.get('apiKey');
+        const isValid = clientKey && clientKey.length === API_KEY.length &&
+          crypto.timingSafeEqual(Buffer.from(clientKey), Buffer.from(API_KEY));
+        if (!isValid) {
+          logger.warn('WebSocket connection rejected: invalid API key');
+          ws.close(4001, 'Unauthorized');
+          return;
+        }
       }
     }
 
