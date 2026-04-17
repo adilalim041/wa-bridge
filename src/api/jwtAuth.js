@@ -17,7 +17,7 @@
  *   SUPABASE_JWT_SECRET   — optional, enables HS256 fallback
  */
 
-import { createRemoteJWKSet, jwtVerify, createSecretKey } from 'jose';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { logger } from '../config.js';
 
 // ── JWKS setup ────────────────────────────────────────────────────────────────
@@ -46,8 +46,9 @@ if (SUPABASE_URL) {
 // ── HS256 fallback setup ──────────────────────────────────────────────────────
 
 // Only materialised when the env var is present — no object creation overhead otherwise.
+// jose accepts a Uint8Array directly for symmetric algorithms (HS256/HS384/HS512).
 const HS256_SECRET = process.env.SUPABASE_JWT_SECRET
-    ? createSecretKey(Buffer.from(process.env.SUPABASE_JWT_SECRET, 'utf-8'))
+    ? new TextEncoder().encode(process.env.SUPABASE_JWT_SECRET)
     : null;
 
 if (HS256_SECRET) {
