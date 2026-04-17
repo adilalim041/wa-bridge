@@ -1,7 +1,6 @@
-import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { fetchLatestBaileysVersion, makeWASocket, DisconnectReason } from 'baileys';
-import { logger } from '../config.js';
+import { logger, baileysLogger } from '../config.js';
 import { sendTelegramAlert, startHealthMonitor, updateConnectionStatus, trackDisconnectEvent, checkMassDisconnect } from '../monitor.js';
 import { logAudit } from '../storage/auditLog.js';
 import { supabase } from '../storage/supabase.js';
@@ -251,7 +250,14 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
 
   const sock = makeWASocket({
     auth: state,
-    logger: pino({ level: 'silent' }),
+    // W3 observability, 2026-04-17: upgraded from pino({ level: 'silent' }) to
+    // a shared warn-level logger (see config.baileysLogger). 'silent' hid WA
+    // protocol warnings like "rate limited", "key rotation failed", "decrypt
+    // failed" — all leading indicators of ban or connection quality issues.
+    // At 'warn' level Baileys produces ~1-5 lines per session per hour in
+    // healthy operation, which is well within Railway's log budget. Child
+    // logger tags lines with sessionId for correlation with our own logs.
+    logger: baileysLogger.child({ sessionId }),
     browser: browserFingerprint,
     version: waVersion,
     keepAliveIntervalMs: 15000,    // Ping WhatsApp every 15s (default 30s is too slow, causes timeout disconnects)

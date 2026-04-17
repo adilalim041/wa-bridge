@@ -8,10 +8,22 @@ import { setupRoutes } from './routes.js';
 import { setupWebSocket } from './websocket.js';
 import bazaRouter from '../baza/router.js';
 import { verifySupabaseJwt, isJwtAuthAvailable } from './jwtAuth.js';
+import { requestLogger } from './middleware/requestLogger.js';
+import { expressErrorHandler, installGlobalHandlers } from '../observability/sentry.js';
 
 export function startServer() {
+    // W3 observability: catch unhandledRejection / uncaughtException globally
+    // so they're captured with a stack rather than silently swallowed by Node.
+    installGlobalHandlers();
+
     const app = express();
     const httpServer = createServer(app);
+
+    // Request correlation middleware — MOUNTED FIRST so req.id/req.log exist
+    // before any other middleware (including helmet, rate-limit, auth) can
+    // crash and want to log. Every subsequent log line in the request chain
+    // carries reqId via pino child logger.
+    app.use(requestLogger);
 
     // Security headers
     app.use(helmet({
@@ -102,17 +114,21 @@ export function startServer() {
         if (authHeader && authHeader.startsWith('Bearer ')) {
             if (!JWT_AVAILABLE) {
                 // JWT configured on client but server has no SUPABASE_URL — fail loudly
+                req.log.warn('jwt_auth_not_configured');
                 return res.status(401).json({ error: 'JWT auth not configured on server' });
             }
             const token = authHeader.slice(7); // strip "Bearer "
             try {
                 const user = await verifySupabaseJwt(token);
                 req.user = user;
-                logger.debug({ userId: user.userId }, 'jwt auth ok');
+                // Enrich request logger with userId — every subsequent log line
+                // for this request will carry it. Useful for per-user audit trails.
+                req.log = req.log.child({ userId: user.userId });
+                req.log.debug('jwt_auth_ok');
                 return next();
             } catch (err) {
                 // Never log the token itself
-                logger.warn({ err: err.message }, 'jwt verify failed');
+                req.log.warn({ err: err.message }, 'jwt_verify_failed');
                 return res.status(401).json({ error: 'Invalid or expired JWT' });
             }
         }
@@ -142,6 +158,12 @@ export function startServer() {
 
     setupRoutes(app);
     setupWebSocket(httpServer);
+
+    // Error-capture middleware — MUST be last. Express delegates to it only
+    // when a route/middleware calls next(err) or throws in an async handler.
+    // Our handler logs the error with request context, then delegates to
+    // Express's default 500 response (we don't override the response shape).
+    app.use(expressErrorHandler);
 
     httpServer.listen(config.port, () => {
         logger.info(`API server listening on port ${config.port}`);
