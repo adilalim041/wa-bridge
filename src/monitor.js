@@ -218,20 +218,41 @@ async function checkZombieConnection(sessionId) {
     if (!data?.timestamp) return;
 
     const lastMsgAge = Date.now() - new Date(data.timestamp).getTime();
-    if (lastMsgAge > ZOMBIE_THRESHOLD_MS) {
-      const hours = Math.round(lastMsgAge / 3600000);
-      lastZombieRestart.set(sessionId, Date.now());
-      sendTelegramAlert(
-        `🧟 Zombie detected [${sessionId}]: ${hours}h without messages during work hours. Restarting...`
-      ).catch(() => {});
+    if (lastMsgAge <= ZOMBIE_THRESHOLD_MS) return;
 
-      // Force restart
-      if (sessionManagerRef?.stopSession && sessionManagerRef?.startSession) {
-        await sessionManagerRef.stopSession(sessionId);
-        await new Promise((r) => setTimeout(r, 3000));
-        await sessionManagerRef.startSession(sessionId);
-        // No "restarted" alert — reduces notification spam
-      }
+    // ── Stage 2 (2026-04-18): WebSocket health check ──────────────────────────
+    // Long silence alone is not enough to restart. If the underlying WA socket
+    // is still OPEN, Baileys is exchanging keepalive frames every 15s and WA
+    // considers us alive — the number is simply quiet, not a zombie. Restart
+    // here would be pointless churn (extra reconnect = minor ban-risk signal
+    // + noise alerts for legitimately low-traffic numbers like almaty-nurbolat).
+    //
+    // Real zombies have state.connected === true (because no 'close' event
+    // fired) but the WebSocket has silently dropped — sock.ws.readyState will
+    // be 2 (CLOSING) or 3 (CLOSED). Only those get restarted.
+    const sock = sessionManagerRef?.getSession?.(sessionId)?.sock;
+    const wsReadyState = sock?.ws?.readyState;
+    const WS_OPEN = 1;
+    if (wsReadyState === WS_OPEN) {
+      const hours = Math.round(lastMsgAge / 3600000);
+      console.log(
+        `[${sessionId}] Quiet but healthy: ${hours}h no messages, ws.readyState=OPEN. Skipping restart.`
+      );
+      return;
+    }
+
+    // WebSocket is not OPEN — this is a real zombie, restart it
+    const hours = Math.round(lastMsgAge / 3600000);
+    lastZombieRestart.set(sessionId, Date.now());
+    sendTelegramAlert(
+      `🧟 Zombie detected [${sessionId}]: ${hours}h without messages + ws.readyState=${wsReadyState ?? 'unknown'}. Restarting...`
+    ).catch(() => {});
+
+    if (sessionManagerRef?.stopSession && sessionManagerRef?.startSession) {
+      await sessionManagerRef.stopSession(sessionId);
+      await new Promise((r) => setTimeout(r, 3000));
+      await sessionManagerRef.startSession(sessionId);
+      // No "restarted" alert — reduces notification spam
     }
   } catch (err) {
     console.error(`Zombie check failed for ${sessionId}:`, err.message);
