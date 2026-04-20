@@ -1406,7 +1406,7 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone is required' });
     }
 
-    const VALID_TAGS = ['клиент', 'сотрудник', 'партнёр', 'неизвестно'];
+    const VALID_TAGS = ['клиент', 'сотрудник', 'партнёр', 'неизвестно', 'спам'];
 
     const payload = { tagConfirmed: true };
     if (tag) {
