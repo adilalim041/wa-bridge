@@ -11,8 +11,11 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow, getChatTags, getChatTagsByJids, upsertChatTags } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow, getChatTags, getChatTagsByJids, upsertChatTags, insertManagerReport, listManagerReports, markChatAiReportSent, getChatAiById, getActiveSessions } from '../storage/queries.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
+import { generateCoachingComment } from '../ai/coachingGenerator.js';
+import { uploadReportPdf } from '../reports/uploadPdfToCloudinary.js';
+import { resolveSender } from '../reports/routing.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -614,7 +617,7 @@ export function setupRoutes(app) {
       // Build chat_ai query
       let aiQuery = supabase
         .from('chat_ai')
-        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score')
+        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score, report_sent_at')
         .gte('analysis_date', sinceDateStr)
         .limit(100);
 
@@ -707,6 +710,8 @@ export function setupRoutes(app) {
             chatAiId: r.id,
             tags: tagEntry.tags,
             tagConfirmed: tagEntry.tagConfirmed,
+            reportSentAt: r.report_sent_at || null,
+            report_sent_at: r.report_sent_at || null,
           };
         });
 
@@ -2521,6 +2526,370 @@ export function setupRoutes(app) {
   <ul>${items || '<li>No sessions configured yet.</li>'}</ul>
 </body>
 </html>`);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Wave 8 — Manager PDF Reports
+  // ---------------------------------------------------------------------------
+
+  /**
+   * POST /reports/preview
+   * Body: { chatAiId: string }
+   *
+   * Returns the data needed for the PDF preview:
+   *   - chatAi record
+   *   - last 50 messages of the dialog
+   *   - clientName (from contacts_crm or chats)
+   *   - coachingComment (AI-generated, Russian, 3-5 sentences)
+   *   - availableTargets: active sessions the report can be sent to
+   */
+  router.post('/reports/preview', async (req, res) => {
+    const { chatAiId } = req.body || {};
+
+    if (!chatAiId || typeof chatAiId !== 'string') {
+      return res.status(400).json({ error: 'chatAiId is required' });
+    }
+
+    try {
+      // 1. Load chat_ai record
+      const chatAi = await getChatAiById(chatAiId);
+      if (!chatAi) {
+        return res.status(404).json({ error: 'chat_ai record not found' });
+      }
+
+      // 2. Load last 50 messages for this dialog session
+      let messages = [];
+      if (chatAi.dialog_session_id) {
+        const { data: msgs, error: msgsErr } = await supabase
+          .from('messages')
+          .select('body, from_me, timestamp, message_type, media_url')
+          .eq('dialog_session_id', chatAi.dialog_session_id)
+          .order('timestamp', { ascending: true })
+          .limit(50);
+
+        if (msgsErr) {
+          logger.warn({ err: msgsErr, chatAiId }, 'reports/preview: failed to load messages');
+        } else {
+          messages = msgs ?? [];
+        }
+      }
+
+      // 3. Resolve client display name
+      // Try contacts_crm first, then chats.display_name
+      let clientName = 'Клиент';
+      const remoteJid = chatAi.remote_jid;
+
+      if (remoteJid) {
+        const { data: crm } = await supabase
+          .from('contacts_crm')
+          .select('first_name, last_name')
+          .eq('remote_jid', remoteJid)
+          .maybeSingle();
+
+        if (crm?.first_name) {
+          clientName = [crm.first_name, crm.last_name].filter(Boolean).join(' ');
+        } else {
+          const { data: chat } = await supabase
+            .from('chats')
+            .select('display_name')
+            .eq('remote_jid', remoteJid)
+            .limit(1)
+            .maybeSingle();
+          if (chat?.display_name) clientName = chat.display_name;
+        }
+      }
+
+      // 4. Generate coaching comment (non-throwing — falls back on Claude failure)
+      const coachingComment = await generateCoachingComment({ messages, chatAi, clientName });
+
+      // 5. Load active sessions for target dropdown
+      const activeSessions = await getActiveSessions();
+
+      // 6. Build available targets (all active sessions)
+      const availableTargets = activeSessions.map((s) => ({
+        sessionId: s.session_id,
+        displayName: s.display_name || s.session_id,
+      }));
+
+      return res.json({
+        chatAi,
+        messages,
+        clientName,
+        coachingComment,
+        availableTargets,
+      });
+    } catch (err) {
+      logger.error({ err, chatAiId }, 'reports/preview failed');
+      return res.status(500).json({ error: 'Failed to generate report preview' });
+    }
+  });
+
+  /**
+   * POST /reports/send
+   * Body: {
+   *   chatAiId: string,
+   *   targetSessionId: string,
+   *   pdfBase64: string,
+   *   filename: string,
+   *   coachingComment: string
+   * }
+   *
+   * Uploads PDF to Cloudinary, sends via Baileys, records in manager_reports,
+   * marks chat_ai.report_sent_at.
+   */
+  router.post('/reports/send', async (req, res) => {
+    const {
+      chatAiId,
+      targetSessionId,
+      pdfBase64,
+      filename,
+      coachingComment,
+    } = req.body || {};
+
+    // Input validation
+    if (!chatAiId || typeof chatAiId !== 'string') {
+      return res.status(400).json({ error: 'chatAiId is required' });
+    }
+    if (!targetSessionId || typeof targetSessionId !== 'string') {
+      return res.status(400).json({ error: 'targetSessionId is required' });
+    }
+    if (!pdfBase64 || typeof pdfBase64 !== 'string') {
+      return res.status(400).json({ error: 'pdfBase64 is required' });
+    }
+    if (!filename || typeof filename !== 'string') {
+      return res.status(400).json({ error: 'filename is required' });
+    }
+    // Enforce reasonable PDF size: 10MB base64 ≈ 7.5MB decoded
+    if (pdfBase64.length > 14_000_000) {
+      return res.status(400).json({ error: 'pdfBase64 too large (max ~10MB)' });
+    }
+
+    try {
+      // Load active sessions
+      const activeSessions = await getActiveSessions();
+      const activeSet = new Set(activeSessions.map((s) => s.session_id));
+
+      // Validate target is an active session
+      if (!activeSet.has(targetSessionId)) {
+        return res.status(409).json({
+          error: `Target session "${targetSessionId}" is not active. Choose an active session.`,
+        });
+      }
+
+      // Idempotency: check for recent duplicate (within 60 seconds)
+      const since60s = new Date(Date.now() - 60_000).toISOString();
+      const { data: existingReport } = await supabase
+        .from('manager_reports')
+        .select('id')
+        .eq('chat_ai_id', chatAiId)
+        .eq('target_session_id', targetSessionId)
+        .eq('status', 'sent')
+        .gte('sent_at', since60s)
+        .maybeSingle();
+
+      if (existingReport) {
+        return res.status(409).json({
+          error: 'Report already sent in the last 60 seconds (duplicate request blocked)',
+          existingReportId: existingReport.id,
+        });
+      }
+
+      // Load chat_ai for dialog_session_id + remote_jid
+      const chatAi = await getChatAiById(chatAiId);
+      if (!chatAi) {
+        return res.status(404).json({ error: 'chat_ai record not found' });
+      }
+
+      // Resolve sender session
+      let senderSessionId;
+      try {
+        senderSessionId = resolveSender(targetSessionId, activeSessions);
+      } catch (routingErr) {
+        return res.status(409).json({ error: routingErr.message });
+      }
+
+      // Get target phone number from session_config
+      const targetConfig = activeSessions.find((s) => s.session_id === targetSessionId);
+      if (!targetConfig?.phone_number) {
+        return res.status(409).json({
+          error: `Cannot find phone number for session "${targetSessionId}". Make sure the session is connected and phone_number is set in session_config.`,
+        });
+      }
+
+      const targetJid = `${targetConfig.phone_number}@s.whatsapp.net`;
+
+      // Get sender socket
+      const senderEntry = sessionManager.getSession(senderSessionId);
+      const senderSock = senderEntry?.sock;
+      if (!senderSock) {
+        return res.status(409).json({
+          error: `Sender session "${senderSessionId}" is configured but socket is not available. Wait for it to connect.`,
+        });
+      }
+
+      // Upload PDF to Cloudinary
+      let pdfUrl;
+      const safeFilename = filename.slice(0, 200).replace(/[^a-zA-Z0-9._-]/g, '_');
+
+      try {
+        const uploadResult = await uploadReportPdf(pdfBase64, safeFilename);
+        pdfUrl = uploadResult.url;
+      } catch (uploadErr) {
+        logger.error({ err: uploadErr, chatAiId }, 'reports/send: Cloudinary upload failed');
+
+        // Record failed attempt for audit
+        await insertManagerReport({
+          chat_ai_id: chatAiId,
+          dialog_session_id: chatAi.dialog_session_id ?? null,
+          client_remote_jid: chatAi.remote_jid ?? 'unknown',
+          target_session_id: targetSessionId,
+          sender_session_id: senderSessionId,
+          coaching_comment: coachingComment ?? null,
+          filename: safeFilename,
+          status: 'failed',
+          error_message: `Cloudinary upload failed: ${uploadErr.message}`,
+        });
+
+        return res.status(502).json({ error: 'Failed to upload PDF to Cloudinary. Report not sent.' });
+      }
+
+      // Send via Baileys
+      let baileysMessageId = null;
+
+      try {
+        const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+        const sent = await senderSock.sendMessage(targetJid, {
+          document: pdfBuffer,
+          fileName: safeFilename.endsWith('.pdf') ? safeFilename : `${safeFilename}.pdf`,
+          mimetype: 'application/pdf',
+          caption: coachingComment ?? '',
+        });
+        baileysMessageId = sent?.key?.id ?? null;
+      } catch (sendErr) {
+        logger.error({ err: sendErr, chatAiId, targetJid }, 'reports/send: Baileys sendMessage failed');
+
+        // Record failed attempt
+        await insertManagerReport({
+          chat_ai_id: chatAiId,
+          dialog_session_id: chatAi.dialog_session_id ?? null,
+          client_remote_jid: chatAi.remote_jid ?? 'unknown',
+          target_session_id: targetSessionId,
+          sender_session_id: senderSessionId,
+          coaching_comment: coachingComment ?? null,
+          pdf_cloudinary_url: pdfUrl,
+          filename: safeFilename,
+          status: 'failed',
+          error_message: `WhatsApp send failed: ${sendErr.message}`,
+        });
+
+        return res.status(502).json({ error: 'PDF uploaded but WhatsApp delivery failed. Check session connectivity.' });
+      }
+
+      // Record successful send
+      const reportId = await insertManagerReport({
+        chat_ai_id: chatAiId,
+        dialog_session_id: chatAi.dialog_session_id ?? null,
+        client_remote_jid: chatAi.remote_jid ?? 'unknown',
+        target_session_id: targetSessionId,
+        sender_session_id: senderSessionId,
+        coaching_comment: coachingComment ?? null,
+        pdf_cloudinary_url: pdfUrl,
+        filename: safeFilename,
+        baileys_message_id: baileysMessageId,
+        status: 'sent',
+      });
+
+      // Mark chat_ai as reported (enables "dead" badge in UI)
+      await markChatAiReportSent(chatAiId);
+
+      // Invalidate analytics cache so dashboard reflects the change
+      invalidateAnalyticsCache();
+
+      logger.info(
+        { chatAiId, targetSessionId, senderSessionId, reportId, baileysMessageId },
+        'reports/send: report sent successfully'
+      );
+
+      return res.json({
+        success: true,
+        messageId: baileysMessageId,
+        reportId,
+        pdfUrl,
+      });
+    } catch (err) {
+      logger.error({ err, chatAiId }, 'reports/send: unexpected error');
+      return res.status(500).json({ error: 'Failed to send report' });
+    }
+  });
+
+  /**
+   * GET /reports
+   * Query: ?session_id=X&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&limit=100
+   *
+   * Returns the audit journal of sent reports with resolved display names.
+   */
+  router.get('/reports', async (req, res) => {
+    const sessionId = req.query.session_id || null;
+    const dateFrom = req.query.date_from || null;
+    const dateTo = req.query.date_to || null;
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+
+    try {
+      const rows = await listManagerReports({ sessionId, dateFrom, dateTo, limit });
+
+      // Resolve session display names for target and sender
+      const allSessionIds = [...new Set([
+        ...rows.map((r) => r.target_session_id),
+        ...rows.map((r) => r.sender_session_id),
+      ].filter(Boolean))];
+
+      let sessionNameMap = {};
+      if (allSessionIds.length > 0) {
+        const { data: configs } = await supabase
+          .from('session_config')
+          .select('session_id, display_name')
+          .in('session_id', allSessionIds);
+        for (const c of configs ?? []) {
+          sessionNameMap[c.session_id] = c.display_name || c.session_id;
+        }
+      }
+
+      // Resolve client display names
+      const clientJids = [...new Set(rows.map((r) => r.client_remote_jid).filter(Boolean))];
+      let clientNameMap = {};
+      if (clientJids.length > 0) {
+        const { data: chats } = await supabase
+          .from('chats')
+          .select('remote_jid, display_name')
+          .in('remote_jid', clientJids);
+        for (const c of chats ?? []) {
+          clientNameMap[c.remote_jid] = c.display_name || c.remote_jid;
+        }
+      }
+
+      const reports = rows.map((r) => ({
+        id: r.id,
+        chatAiId: r.chat_ai_id,
+        clientName: clientNameMap[r.client_remote_jid] || r.client_remote_jid,
+        clientPhone: r.client_remote_jid,
+        targetSessionId: r.target_session_id,
+        targetDisplayName: sessionNameMap[r.target_session_id] || r.target_session_id,
+        senderSessionId: r.sender_session_id,
+        senderDisplayName: sessionNameMap[r.sender_session_id] || r.sender_session_id,
+        coachingComment: r.coaching_comment,
+        pdfUrl: r.pdf_cloudinary_url,
+        filename: r.filename,
+        baileysMessageId: r.baileys_message_id,
+        status: r.status,
+        errorMessage: r.error_message,
+        sentAt: r.sent_at,
+      }));
+
+      return res.json({ total: reports.length, reports });
+    } catch (err) {
+      logger.error({ err }, 'GET /reports failed');
+      return res.status(500).json({ error: 'Failed to fetch reports' });
+    }
   });
 
   app.use('/', router);

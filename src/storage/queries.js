@@ -923,3 +923,161 @@ async function applyChatTagsOverlay(chatList) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 8 — Manager Reports
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a new manager_reports row and return its id.
+ * @param {object} row  Matches the manager_reports table columns (snake_case).
+ * @returns {Promise<string|null>} UUID of the inserted row, or null on error.
+ */
+export async function insertManagerReport(row) {
+  try {
+    const { data, error } = await supabase
+      .from('manager_reports')
+      .insert(row)
+      .select('id')
+      .single();
+
+    if (error) {
+      logger.error({ err: error, row }, 'insertManagerReport: failed to insert');
+      return null;
+    }
+
+    return data.id;
+  } catch (err) {
+    logger.error({ err }, 'insertManagerReport: unexpected error');
+    return null;
+  }
+}
+
+/**
+ * List manager reports with optional filters.
+ * Returns plain rows — formatting to camelCase is caller's responsibility.
+ *
+ * @param {object} opts
+ * @param {string} [opts.sessionId]   Filter by target_session_id.
+ * @param {string} [opts.dateFrom]    ISO date string (inclusive).
+ * @param {string} [opts.dateTo]      ISO date string (inclusive).
+ * @param {number} [opts.limit=100]   Max rows.
+ * @returns {Promise<Array>}
+ */
+export async function listManagerReports({ sessionId, dateFrom, dateTo, limit = 100 } = {}) {
+  try {
+    const safeLimit = Math.min(Number(limit) || 100, 500);
+
+    let query = supabase
+      .from('manager_reports')
+      .select('*')
+      .order('sent_at', { ascending: false })
+      .limit(safeLimit);
+
+    if (sessionId) {
+      query = query.eq('target_session_id', sessionId);
+    }
+    if (dateFrom) {
+      query = query.gte('sent_at', `${dateFrom}T00:00:00+00:00`);
+    }
+    if (dateTo) {
+      query = query.lte('sent_at', `${dateTo}T23:59:59+00:00`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error({ err: error }, 'listManagerReports: query failed');
+      return [];
+    }
+
+    return data ?? [];
+  } catch (err) {
+    logger.error({ err }, 'listManagerReports: unexpected error');
+    return [];
+  }
+}
+
+/**
+ * Mark a chat_ai record as having a report sent.
+ * @param {string} chatAiId   UUID of the chat_ai row.
+ * @param {string} [sentAt]   ISO timestamp (defaults to now()).
+ */
+export async function markChatAiReportSent(chatAiId, sentAt) {
+  try {
+    const ts = sentAt ?? new Date().toISOString();
+    const { error } = await supabase
+      .from('chat_ai')
+      .update({ report_sent_at: ts })
+      .eq('id', chatAiId);
+
+    if (error) {
+      logger.error({ err: error, chatAiId }, 'markChatAiReportSent: update failed');
+    }
+  } catch (err) {
+    logger.error({ err, chatAiId }, 'markChatAiReportSent: unexpected error');
+  }
+}
+
+/**
+ * Fetch a single chat_ai row by id.
+ * @param {string} chatAiId
+ * @returns {Promise<object|null>}
+ */
+export async function getChatAiById(chatAiId) {
+  try {
+    const { data, error } = await supabase
+      .from('chat_ai')
+      .select('*')
+      .eq('id', chatAiId)
+      .maybeSingle();
+
+    if (error) {
+      logger.error({ err: error, chatAiId }, 'getChatAiById: query failed');
+      return null;
+    }
+
+    return data ?? null;
+  } catch (err) {
+    logger.error({ err, chatAiId }, 'getChatAiById: unexpected error');
+    return null;
+  }
+}
+
+/**
+ * Return all active sessions from session_config.
+ * Falls back to all rows if is_active column doesn't exist (schema mismatch guard).
+ * @returns {Promise<Array<{session_id: string, display_name: string, phone_number: string}>>}
+ */
+export async function getActiveSessions() {
+  try {
+    const { data, error } = await supabase
+      .from('session_config')
+      .select('session_id, display_name, phone_number')
+      .eq('is_active', true)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      // If is_active column is missing — fall back to all rows
+      if (error.code === 'PGRST116' || error.message?.includes('is_active')) {
+        logger.warn('getActiveSessions: is_active column not found — fetching all rows');
+        const { data: all, error: allErr } = await supabase
+          .from('session_config')
+          .select('session_id, display_name, phone_number')
+          .order('created_at', { ascending: true });
+        if (allErr) {
+          logger.error({ err: allErr }, 'getActiveSessions: fallback query also failed');
+          return [];
+        }
+        return all ?? [];
+      }
+      logger.error({ err: error }, 'getActiveSessions: query failed');
+      return [];
+    }
+
+    return data ?? [];
+  } catch (err) {
+    logger.error({ err }, 'getActiveSessions: unexpected error');
+    return [];
+  }
+}
