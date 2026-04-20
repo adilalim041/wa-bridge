@@ -8,6 +8,7 @@ import { setupRoutes } from './routes.js';
 import { setupWebSocket } from './websocket.js';
 import bazaRouter from '../baza/router.js';
 import { verifySupabaseJwt, isJwtAuthAvailable } from './jwtAuth.js';
+import { getUserClient } from '../storage/supabase.js';
 import { requestLogger } from './middleware/requestLogger.js';
 import { expressErrorHandler, installGlobalHandlers } from '../observability/sentry.js';
 
@@ -121,6 +122,11 @@ export function startServer() {
             try {
                 const user = await verifySupabaseJwt(token);
                 req.user = user;
+                // W1.1 Phase 1: attach a request-scoped Supabase client that
+                // carries the verified JWT, so Phase 2 endpoints can query
+                // through PostgREST under the user's identity (RLS-aware).
+                // null when anon key missing — callers fall back to serviceClient.
+                req.userClient = getUserClient(token);
                 // Enrich request logger with userId — every subsequent log line
                 // for this request will carry it. Useful for per-user audit trails.
                 req.log = req.log.child({ userId: user.userId });

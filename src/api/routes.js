@@ -1033,6 +1033,18 @@ export function setupRoutes(app) {
     }
   });
 
+  // W1.1 Phase 1: auth plumbing probe.
+  // Confirms the JWT path sets req.user and req.userClient correctly.
+  // Used as smoke-test after deploy + Phase 2 migration-in-progress checks.
+  router.get('/health/auth', async (req, res) => {
+    res.json({
+      authenticated: Boolean(req.user),
+      user: req.user ? { id: req.user.userId, email: req.user.email, role: req.user.role } : null,
+      hasUserClient: Boolean(req.userClient),
+      authMode: req.user ? 'jwt' : 'api_key',
+    });
+  });
+
   router.get('/health', async (_req, res) => {
     const { data: configs } = await supabase
       .from('session_config')
