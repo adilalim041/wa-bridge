@@ -573,8 +573,17 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
 
   // Call events — track voice/video calls (status: offer, accept, reject, timeout, terminate)
   sock.ev.on('call', async (events) => {
+    // Loud diagnostic (2026-04-20): the 'calls' table has shown 0 rows for days.
+    // Either Baileys isn't emitting or handleCallEvent is failing silently. This
+    // console.log bypasses pino levels so it always appears in Railway logs.
+    console.log(`[${sessionId}] [CALL RAW] got ${events?.length ?? 0} call event(s):`,
+      JSON.stringify(events, null, 2));
     for (const event of events) {
-      await handleCallEvent(sessionId, event);
+      try {
+        await handleCallEvent(sessionId, event);
+      } catch (err) {
+        console.error(`[${sessionId}] [CALL RAW] handler threw:`, err?.message, err?.stack);
+      }
     }
   });
 
