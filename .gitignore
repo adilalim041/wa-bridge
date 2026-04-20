@@ -63,3 +63,5 @@ tests/red-team/results-*.json
 /*_analyze.cjs
 /_diag*.mjs
 /_reclassify*.mjs
+/_verify*.mjs
+/_smoke*.mjs

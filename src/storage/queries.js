@@ -405,11 +405,11 @@ export async function getChatTags(remoteJid) {
   }
 }
 
-export async function getChatTagsByJids(remoteJids = []) {
+export async function getChatTagsByJids(remoteJids = [], db = supabase) {
   const uniqueJids = [...new Set((remoteJids || []).filter(Boolean))];
   if (!uniqueJids.length) return {};
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('chat_tags')
       .select('remote_jid, tags, tag_confirmed')
       .in('remote_jid', uniqueJids);
@@ -761,10 +761,12 @@ export async function getContacts(sessionId) {
 }
 
 // In-memory cache for getChatsWithLastMessage — 10s TTL, reduces DB load at 8 sessions
+// TODO(SaaS): multi-tenant caching must key on (sessionId, userId), not sessionId alone
 const chatsCache = new Map(); // sessionId -> { data, timestamp }
 const CHATS_CACHE_TTL = 10_000; // 10 seconds
 
-export async function getChatsWithLastMessage(sessionId) {
+export async function getChatsWithLastMessage(sessionId, db = supabase) {
+  // W1.1 Phase 2: thread dbClient through all Supabase calls
   // Check cache first
   const cached = chatsCache.get(sessionId);
   if (cached && Date.now() - cached.timestamp < CHATS_CACHE_TTL) {
@@ -774,7 +776,7 @@ export async function getChatsWithLastMessage(sessionId) {
   const queryStart = Date.now();
   try {
     // Try optimized RPC first (single SQL query with LATERAL JOINs)
-    const { data: rpcData, error: rpcError } = await supabase
+    const { data: rpcData, error: rpcError } = await db
       .rpc('get_chats_with_last_message', {
         p_session_id: sessionId,
         p_limit: 2000,
@@ -816,7 +818,7 @@ export async function getChatsWithLastMessage(sessionId) {
         crmAvatarUrl: row.crm_avatar_url || null,
       }));
       // W7A overlay: phone-level chat_tags wins over legacy chats.tags
-      await applyChatTagsOverlay(result);
+      await applyChatTagsOverlay(result, db);
       const elapsed = Date.now() - queryStart;
       if (elapsed > 2000) logger.warn({ sessionId, elapsed }, 'Slow getChatsWithLastMessage query');
       chatsCache.set(sessionId, { data: result, timestamp: Date.now() });
@@ -828,7 +830,7 @@ export async function getChatsWithLastMessage(sessionId) {
       logger.warn({ err: rpcError.message }, 'RPC not available, using fallback queries');
     }
 
-    const { data: chatList, error: chatError } = await supabase
+    const { data: chatList, error: chatError } = await db
       .from('chats')
       .select('*')
       .eq('session_id', sessionId)
@@ -853,7 +855,7 @@ export async function getChatsWithLastMessage(sessionId) {
 
     const jids = cleanChats.map((c) => c.remote_jid);
 
-    const { data: crmContacts } = await supabase
+    const { data: crmContacts } = await db
       .from('contacts_crm')
       .select('remote_jid, first_name, last_name, role, avatar_url')
       .eq('session_id', sessionId)
@@ -875,14 +877,14 @@ export async function getChatsWithLastMessage(sessionId) {
             { data: messages, error },
             { count, error: unreadError },
           ] = await Promise.all([
-            supabase
+            db
               .from('messages')
               .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
               .eq('session_id', sessionId)
               .eq('remote_jid', chat.remote_jid)
               .order('timestamp', { ascending: false })
               .limit(1),
-            supabase
+            db
               .from('messages')
               .select('*', { count: 'exact', head: true })
               .eq('session_id', sessionId)
@@ -936,7 +938,7 @@ export async function getChatsWithLastMessage(sessionId) {
     }
 
     // W7A overlay: phone-level chat_tags wins over legacy chats.tags
-    await applyChatTagsOverlay(result);
+    await applyChatTagsOverlay(result, db);
     return result;
   } catch (error) {
     logger.error({ err: error, sessionId }, 'Unexpected error while fetching chats');
@@ -947,10 +949,10 @@ export async function getChatsWithLastMessage(sessionId) {
 // Overlay chat_tags (phone-level) onto a chat list result. Mutates in place.
 // If a remote_jid has an entry in chat_tags, its tags replace the legacy
 // `chats.tags` value. If not, the legacy value stays (for graceful migration).
-async function applyChatTagsOverlay(chatList) {
+async function applyChatTagsOverlay(chatList, db = supabase) {
   if (!Array.isArray(chatList) || chatList.length === 0) return;
   const jids = chatList.map((c) => c.remoteJid).filter(Boolean);
-  const tagMap = await getChatTagsByJids(jids);
+  const tagMap = await getChatTagsByJids(jids, db);
   for (const chat of chatList) {
     const entry = tagMap[chat.remoteJid];
     if (entry) {
