@@ -1,5 +1,5 @@
 import { logger } from '../config.js';
-import { upsertCall } from '../storage/queries.js';
+import { upsertCall, formatCallRow } from '../storage/queries.js';
 import { emitCallEvent } from '../api/websocket.js';
 
 /**
@@ -100,9 +100,13 @@ export async function handleCallEvent(sessionId, event) {
       'call event processed'
     );
 
-    // Emit over WebSocket so dashboard can update in real-time
+    // Emit over WebSocket so dashboard can update in real-time.
+    // IMPORTANT: frontend reads camelCase fields (remoteJid / fromMe / durationSec…),
+    // so we MUST format the raw DB row the same way the REST endpoint does via
+    // formatCallRow. Without this, the frontend's liveCall effect never matches
+    // the open chat (remoteJid is undefined) and the bubble never renders.
     if (saved) {
-      emitCallEvent(sessionId, saved);
+      emitCallEvent(sessionId, formatCallRow(saved));
     }
   } catch (err) {
     logger.error({ err, sessionId, callId: event?.id, status: event?.status }, 'handleCallEvent failed');

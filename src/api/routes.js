@@ -11,7 +11,7 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow } from '../storage/queries.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
@@ -44,25 +44,9 @@ function invalidateAnalyticsCache() {
   analyticsCache.clear();
 }
 
-// Serialize a calls DB row into the API response shape
-function formatCall(row) {
-  return {
-    id: row.id,
-    callId: row.call_id,
-    sessionId: row.session_id,
-    remoteJid: row.remote_jid,
-    fromMe: row.from_me,
-    isVideo: row.is_video,
-    isGroup: row.is_group,
-    status: row.status,
-    offeredAt: row.offered_at,
-    answeredAt: row.answered_at ?? null,
-    endedAt: row.ended_at ?? null,
-    durationSec: row.duration_sec ?? null,
-    missed: row.missed,
-    createdAt: row.created_at,
-  };
-}
+// Call-row serialization is shared with the WebSocket emit path — see
+// formatCallRow in src/storage/queries.js. Keep the REST response and the
+// real-time event shape in sync via that single source of truth.
 
 // Allowed values for validation
 const VALID_TEMPERATURES = new Set(['hot', 'warm', 'cold', 'dead']);
@@ -821,7 +805,7 @@ export function setupRoutes(app) {
 
     try {
       const calls = await getCallsBySession(sessionId, { limit, offset });
-      return res.json({ calls: calls.map(formatCall) });
+      return res.json({ calls: calls.map(formatCallRow) });
     } catch (err) {
       logger.error({ err, sessionId }, 'GET /sessions/:sessionId/calls failed');
       return res.status(500).json({ error: 'Failed to fetch calls' });
@@ -838,7 +822,7 @@ export function setupRoutes(app) {
 
     try {
       const calls = await getCallsByChat(sessionId, phone, { limit });
-      return res.json({ calls: calls.map(formatCall) });
+      return res.json({ calls: calls.map(formatCallRow) });
     } catch (err) {
       logger.error({ err, sessionId, phone }, 'GET /sessions/:sessionId/chats/:phone/calls failed');
       return res.status(500).json({ error: 'Failed to fetch calls' });

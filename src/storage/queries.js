@@ -344,6 +344,32 @@ export async function getLinkedSessions(remoteJid) {
  *   - For 'terminate' status: calculates duration_sec when answered_at exists.
  * Returns the final DB row, or null on error.
  */
+/**
+ * Convert raw DB call row (snake_case) to the API/frontend shape (camelCase).
+ * Shared between REST endpoints and real-time WebSocket emits — both MUST
+ * emit the same shape or the frontend breaks silently. A previous mismatch
+ * caused real-time call events to never render in-chat (2026-04-20 bug).
+ */
+export function formatCallRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    callId: row.call_id,
+    sessionId: row.session_id,
+    remoteJid: row.remote_jid,
+    fromMe: row.from_me,
+    isVideo: row.is_video,
+    isGroup: row.is_group,
+    status: row.status,
+    offeredAt: row.offered_at,
+    answeredAt: row.answered_at ?? null,
+    endedAt: row.ended_at ?? null,
+    durationSec: row.duration_sec ?? null,
+    missed: row.missed,
+    createdAt: row.created_at,
+  };
+}
+
 export async function upsertCall({
   callId,
   sessionId,
