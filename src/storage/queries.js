@@ -12,6 +12,31 @@ const failoverQueue = [];
 let flushTimer = null;
 let alertSent = false;
 
+// --- Heartbeat telemetry (read by heartbeat.js, written here) ---
+// lastMessageProcessedAt: ISO string of the most recent successful saveMessage call.
+// null until the first message is processed in this process lifetime.
+let _lastMessageProcessedAt = null;
+
+/** Called internally by saveMessage on every successful DB upsert. */
+function _touchLastMessageProcessed() {
+  _lastMessageProcessedAt = new Date().toISOString();
+}
+
+/** Returns ISO string of last successful message save, or null if none yet. */
+export function getLastMessageProcessedAt() {
+  return _lastMessageProcessedAt;
+}
+
+/**
+ * Supabase health indicator derived from the failover queue depth.
+ * Returns true when the queue is empty (Supabase is responding normally).
+ * Returns false when messages have accumulated (recent Supabase failures).
+ * Does NOT make a new DB roundtrip — reads in-memory state only.
+ */
+export function getSupabaseOk() {
+  return failoverQueue.length === 0;
+}
+
 // Load backed-up queue on startup
 try {
   if (existsSync(QUEUE_BACKUP_PATH)) {
@@ -118,6 +143,7 @@ export async function saveMessage(data) {
       });
 
       if (!error) {
+        _touchLastMessageProcessed();
         return;
       }
 

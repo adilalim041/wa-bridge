@@ -8,6 +8,7 @@ import { startAIWorker, stopAIWorker } from './ai/aiWorker.js';
 import { loadPhoneRegistry } from './baileys/messageHandler.js';
 import { startNotificationChecker, stopNotificationChecker } from './notifications/notificationService.js';
 import { clearStaleLocks } from './storage/sessionLock.js';
+import { startVaultHeartbeat, stopVaultHeartbeat } from './heartbeat.js';
 
 let server;
 let keepAliveTimer;
@@ -48,6 +49,7 @@ async function bootstrap() {
   startSummaryScheduler();
   startTelegramPolling();
   startKeepAlive();
+  startVaultHeartbeat();
 
   // Refresh phone registry every 60s to pick up new sessions
   phoneRefreshTimer = setInterval(async () => {
@@ -72,6 +74,7 @@ async function shutdown(signal) {
   stopTelegramPolling();
   stopVersionChecker();
   stopWebSocket();
+  stopVaultHeartbeat();
 
   // Hard timeout: force exit after 15s if graceful shutdown hangs
   const forceExitTimer = setTimeout(() => {
