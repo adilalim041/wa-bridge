@@ -1,6 +1,7 @@
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { sendTelegramMessage, isTelegramConfigured } from './telegramBot.js';
+import { getChatTagsByJids } from '../storage/queries.js';
 
 let lastOverdueHash = '';
 let lastUnansweredHash = '';
@@ -251,22 +252,25 @@ async function createFollowUpTasks() {
 
     if (!unanswered.length) return;
 
-    // Check which chats have tag "клиент"
+    // Check which chats have tag "клиент" — tags live in chat_tags (phone-level, W7A)
     const jids = unanswered.map(u => u.remote_jid);
-    const { data: chats } = await supabase
-      .from('chats')
-      .select('remote_jid, session_id, tags, display_name')
-      .in('remote_jid', jids);
+    const [{ data: chats }, tagsMap] = await Promise.all([
+      supabase
+        .from('chats')
+        .select('remote_jid, session_id, display_name')
+        .in('remote_jid', jids),
+      getChatTagsByJids(jids),
+    ]);
 
     const chatMap = new Map();
     for (const c of chats || []) {
       chatMap.set(`${c.session_id}:${c.remote_jid}`, c);
     }
 
-    // Filter to only "клиент" tags
+    // Filter to only "клиент" tags (phone-level; same for every session)
     const clientUnanswered = unanswered.filter(msg => {
-      const chat = chatMap.get(`${msg.session_id}:${msg.remote_jid}`);
-      return chat && Array.isArray(chat.tags) && chat.tags.includes('клиент');
+      const entry = tagsMap[msg.remote_jid];
+      return entry && Array.isArray(entry.tags) && entry.tags.includes('клиент');
     });
 
     if (!clientUnanswered.length) return;

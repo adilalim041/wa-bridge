@@ -297,16 +297,20 @@ export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0) 
 // Find all sessions where this contact exists
 export async function getLinkedSessions(remoteJid) {
   try {
-    const { data, error } = await supabase
-      .from('chats')
-      .select('session_id, display_name, last_message_at, tags')
-      .eq('remote_jid', remoteJid);
+    const [chatsRes, tagsRes] = await Promise.all([
+      supabase
+        .from('chats')
+        .select('session_id, display_name, last_message_at')
+        .eq('remote_jid', remoteJid),
+      getChatTags(remoteJid),
+    ]);
 
-    if (error) {
-      logger.error({ err: error, remoteJid }, 'Failed to fetch linked sessions');
+    if (chatsRes.error) {
+      logger.error({ err: chatsRes.error, remoteJid }, 'Failed to fetch linked sessions');
       return [];
     }
 
+    const data = chatsRes.data;
     if (!data?.length) return [];
 
     // Enrich with session display names
@@ -319,12 +323,15 @@ export async function getLinkedSessions(remoteJid) {
     const configMap = {};
     for (const c of configs || []) configMap[c.session_id] = c.display_name;
 
+    // Tags are phone-level (W7A) — same for every session this contact appears in
+    const sharedTags = tagsRes.tags || [];
+
     return data.map((c) => ({
       sessionId: c.session_id,
       sessionName: configMap[c.session_id] || c.session_id,
       lastMessageAt: c.last_message_at,
       contactName: c.display_name,
-      tags: c.tags || [],
+      tags: sharedTags,
     }));
   } catch (error) {
     logger.error({ err: error, remoteJid }, 'Unexpected error in getLinkedSessions');
@@ -332,7 +339,88 @@ export async function getLinkedSessions(remoteJid) {
   }
 }
 
-// Get messages from ALL sessions for one contact, sorted chronologically
+// ---------------------------------------------------------------------------
+// Chat tags (Wave 7A — phone-level, session-independent)
+// ---------------------------------------------------------------------------
+// Tags follow the PERSON, not the (session, person) pair. If Adil tags Bulat
+// as "сотрудник" in session omoikiri-main, Bulat's chat in almaty-nurbolat
+// inherits the same tag. Backed by the `chat_tags` table (see
+// sql/wave7_enrichment.sql). Reads/writes here are session-agnostic.
+
+export async function getChatTags(remoteJid) {
+  if (!remoteJid) return { tags: [], tagConfirmed: false };
+  try {
+    const { data, error } = await supabase
+      .from('chat_tags')
+      .select('tags, tag_confirmed')
+      .eq('remote_jid', remoteJid)
+      .maybeSingle();
+    if (error) {
+      logger.error({ err: error, remoteJid }, 'Failed to fetch chat_tags');
+      return { tags: [], tagConfirmed: false };
+    }
+    return {
+      tags: Array.isArray(data?.tags) ? data.tags : [],
+      tagConfirmed: Boolean(data?.tag_confirmed),
+    };
+  } catch (err) {
+    logger.error({ err, remoteJid }, 'Unexpected error in getChatTags');
+    return { tags: [], tagConfirmed: false };
+  }
+}
+
+export async function getChatTagsByJids(remoteJids = []) {
+  const uniqueJids = [...new Set((remoteJids || []).filter(Boolean))];
+  if (!uniqueJids.length) return {};
+  try {
+    const { data, error } = await supabase
+      .from('chat_tags')
+      .select('remote_jid, tags, tag_confirmed')
+      .in('remote_jid', uniqueJids);
+    if (error) {
+      logger.error({ err: error, count: uniqueJids.length }, 'Failed to batch-fetch chat_tags');
+      return {};
+    }
+    const map = {};
+    for (const row of data || []) {
+      map[row.remote_jid] = {
+        tags: Array.isArray(row.tags) ? row.tags : [],
+        tagConfirmed: Boolean(row.tag_confirmed),
+      };
+    }
+    return map;
+  } catch (err) {
+    logger.error({ err }, 'Unexpected error in getChatTagsByJids');
+    return {};
+  }
+}
+
+export async function upsertChatTags(remoteJid, { tags, tagConfirmed } = {}) {
+  if (!remoteJid) return false;
+  const cleanTags = Array.isArray(tags)
+    ? [...new Set(tags.map((t) => t?.toString().trim().toLowerCase()).filter(Boolean))].slice(0, 10)
+    : undefined;
+  const payload = {
+    remote_jid: remoteJid,
+    updated_at: new Date().toISOString(),
+  };
+  if (cleanTags !== undefined) payload.tags = cleanTags;
+  if (typeof tagConfirmed === 'boolean') payload.tag_confirmed = tagConfirmed;
+  try {
+    const { error } = await supabase
+      .from('chat_tags')
+      .upsert(payload, { onConflict: 'remote_jid' });
+    if (error) {
+      logger.error({ err: error, remoteJid }, 'Failed to upsert chat_tags');
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.error({ err, remoteJid }, 'Unexpected error in upsertChatTags');
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Calls
 // ---------------------------------------------------------------------------
@@ -691,6 +779,8 @@ export async function getChatsWithLastMessage(sessionId) {
         crmRole: row.crm_role || null,
         crmAvatarUrl: row.crm_avatar_url || null,
       }));
+      // W7A overlay: phone-level chat_tags wins over legacy chats.tags
+      await applyChatTagsOverlay(result);
       const elapsed = Date.now() - queryStart;
       if (elapsed > 2000) logger.warn({ sessionId, elapsed }, 'Slow getChatsWithLastMessage query');
       chatsCache.set(sessionId, { data: result, timestamp: Date.now() });
@@ -786,6 +876,7 @@ export async function getChatsWithLastMessage(sessionId) {
             phoneNumber: chat.phone_number || chat.remote_jid,
             isMuted: chat.is_muted || false,
             mutedUntil: chat.muted_until || null,
+            // legacy tags field — will be overwritten by applyChatTagsOverlay below
             tags: chat.tags || [],
             tagConfirmed: chat.tag_confirmed || false,
             lastMessage: lastMessage?.body || null,
@@ -808,9 +899,27 @@ export async function getChatsWithLastMessage(sessionId) {
       result.push(...batchResults);
     }
 
+    // W7A overlay: phone-level chat_tags wins over legacy chats.tags
+    await applyChatTagsOverlay(result);
     return result;
   } catch (error) {
     logger.error({ err: error, sessionId }, 'Unexpected error while fetching chats');
     return [];
+  }
+}
+
+// Overlay chat_tags (phone-level) onto a chat list result. Mutates in place.
+// If a remote_jid has an entry in chat_tags, its tags replace the legacy
+// `chats.tags` value. If not, the legacy value stays (for graceful migration).
+async function applyChatTagsOverlay(chatList) {
+  if (!Array.isArray(chatList) || chatList.length === 0) return;
+  const jids = chatList.map((c) => c.remoteJid).filter(Boolean);
+  const tagMap = await getChatTagsByJids(jids);
+  for (const chat of chatList) {
+    const entry = tagMap[chat.remoteJid];
+    if (entry) {
+      chat.tags = entry.tags;
+      chat.tagConfirmed = entry.tagConfirmed;
+    }
   }
 }

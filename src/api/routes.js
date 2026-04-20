@@ -11,7 +11,7 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow, getChatTags, getChatTagsByJids, upsertChatTags } from '../storage/queries.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
@@ -614,7 +614,7 @@ export function setupRoutes(app) {
       // Build chat_ai query
       let aiQuery = supabase
         .from('chat_ai')
-        .select('id, session_id, remote_jid, dialog_session_id, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score')
+        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score')
         .gte('analysis_date', sinceDateStr)
         .limit(100);
 
@@ -652,16 +652,20 @@ export function setupRoutes(app) {
       const jidSet = [...new Set(aiRows.map((r) => `${r.session_id}:::${r.remote_jid}`))];
       const sessionIds = [...new Set(aiRows.map((r) => r.session_id))];
 
-      // Fetch chat metadata (display_name, last_message_at, tags)
+      // Fetch chat metadata (display_name, last_message_at) — tags live in chat_tags now
       const { data: chatsData } = await supabase
         .from('chats')
-        .select('session_id, remote_jid, display_name, last_message_at, tags, tag_confirmed')
+        .select('session_id, remote_jid, display_name, last_message_at')
         .in('session_id', sessionIds);
 
       const chatsMap = {};
       for (const c of chatsData ?? []) {
         chatsMap[`${c.session_id}:::${c.remote_jid}`] = c;
       }
+
+      // W7A: phone-level tags
+      const uniqueJids = [...new Set(aiRows.map((r) => r.remote_jid))];
+      const tagsMap = await getChatTagsByJids(uniqueJids);
 
       // Fetch session display names
       const { data: sessionsData } = await supabase
@@ -681,6 +685,7 @@ export function setupRoutes(app) {
           const key = `${r.session_id}:::${r.remote_jid}`;
           const chat = chatsMap[key] || {};
           const digits = r.remote_jid.replace(/\D/g, '');
+          const tagEntry = tagsMap[r.remote_jid] || { tags: [], tagConfirmed: false };
           return {
             sessionId: r.session_id,
             sessionDisplayName: sessionsMap[r.session_id] || r.session_id,
@@ -694,10 +699,14 @@ export function setupRoutes(app) {
             dealStage: r.deal_stage || null,
             sentiment: r.sentiment || null,
             issues: r.manager_issues || [],
+            riskFlags: r.risk_flags || [],
+            actionRequired: r.action_required,
+            followupStatus: r.followup_status || null,
+            analysisDate: r.analysis_date || null,
             consultationScore: r.consultation_score || null,
             chatAiId: r.id,
-            tags: chat.tags || [],
-            tagConfirmed: chat.tag_confirmed || false,
+            tags: tagEntry.tags,
+            tagConfirmed: tagEntry.tagConfirmed,
           };
         });
 
@@ -1264,6 +1273,9 @@ export function setupRoutes(app) {
     }
   });
 
+  // W7A: tags are now phone-level (chat_tags table). The :sessionId param is
+  // accepted for backward compat with the old URL shape but ignored — tags
+  // apply to the contact across ALL sessions.
   router.post('/sessions/:sessionId/chats/:phone/tags', async (req, res) => {
     const { sessionId } = req.params;
     const remoteJid = normalizeChatId(req.params.phone);
@@ -1273,43 +1285,18 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone and tags array are required' });
     }
 
-    const cleanTags = [...new Set(
-      inputTags
-        .map((tag) => tag?.toString().trim().toLowerCase())
-        .filter(Boolean)
-    )].slice(0, 10);
-
-    try {
-      const { error } = await supabase
-        .from('chats')
-        .upsert(
-          {
-            session_id: sessionId,
-            remote_jid: remoteJid,
-            tags: cleanTags,
-            tag_confirmed: true, // manual tag update = confirmed
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'session_id,remote_jid' }
-        );
-
-      if (error) {
-        logger.error({ err: error, sessionId, remoteJid }, 'Failed to update tags');
-        return res.status(500).json({ error: 'Failed to update tags' });
-      }
-
-      return res.json({ success: true, tags: cleanTags });
-    } catch (error) {
-      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error updating tags');
+    const ok = await upsertChatTags(remoteJid, { tags: inputTags, tagConfirmed: true });
+    if (!ok) {
       return res.status(500).json({ error: 'Failed to update tags' });
     }
+    const { tags, tagConfirmed } = await getChatTags(remoteJid);
+    return res.json({ success: true, tags, tagConfirmed, sessionId });
   });
 
-  // Confirm (or change + confirm) a chat tag
+  // Confirm (or change + confirm) a chat tag — phone-level
   router.post('/sessions/:sessionId/chats/:phone/confirm-tag', async (req, res) => {
-    const { sessionId } = req.params;
     const remoteJid = normalizeChatId(req.params.phone);
-    const { tag } = req.body; // optional — if provided, change the tag AND confirm
+    const { tag } = req.body;
 
     if (!remoteJid) {
       return res.status(400).json({ error: 'phone is required' });
@@ -1317,32 +1304,19 @@ export function setupRoutes(app) {
 
     const VALID_TAGS = ['клиент', 'сотрудник', 'партнёр', 'неизвестно'];
 
-    try {
-      const updates = { tag_confirmed: true, updated_at: new Date().toISOString() };
-      if (tag) {
-        if (!VALID_TAGS.includes(tag)) {
-          return res.status(400).json({ error: 'Invalid tag. Must be one of: ' + VALID_TAGS.join(', ') });
-        }
-        // Replace ALL tags with just this one confirmed tag
-        updates.tags = [tag];
+    const payload = { tagConfirmed: true };
+    if (tag) {
+      if (!VALID_TAGS.includes(tag)) {
+        return res.status(400).json({ error: 'Invalid tag. Must be one of: ' + VALID_TAGS.join(', ') });
       }
+      payload.tags = [tag];
+    }
 
-      const { error } = await supabase
-        .from('chats')
-        .update(updates)
-        .eq('session_id', sessionId)
-        .eq('remote_jid', remoteJid);
-
-      if (error) {
-        logger.error({ err: error, sessionId, remoteJid }, 'Failed to confirm tag');
-        return res.status(500).json({ error: 'Failed to confirm tag' });
-      }
-
-      return res.json({ success: true });
-    } catch (error) {
-      logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error confirming tag');
+    const ok = await upsertChatTags(remoteJid, payload);
+    if (!ok) {
       return res.status(500).json({ error: 'Failed to confirm tag' });
     }
+    return res.json({ success: true });
   });
 
   // Full-text message search across all chats
@@ -1890,12 +1864,15 @@ export function setupRoutes(app) {
         crmMap.set(c.remote_jid, c);
       }
 
-      // Fetch chat display names
-      let chatQuery = supabase.from('chats').select('session_id, remote_jid, display_name, tags, last_message_body, last_message_timestamp');
+      // Fetch chat display names (tags now live in chat_tags — W7A)
+      let chatQuery = supabase.from('chats').select('session_id, remote_jid, display_name, last_message_body, last_message_timestamp');
       if (sessionId && sessionId !== '__all__') {
         chatQuery = chatQuery.eq('session_id', sessionId);
       }
-      const { data: chatRows } = await chatQuery;
+      const [{ data: chatRows }, funnelTagsMap] = await Promise.all([
+        chatQuery,
+        getChatTagsByJids(jids),
+      ]);
       const chatMap = new Map();
       for (const c of chatRows || []) {
         if (!chatMap.has(c.remote_jid)) chatMap.set(c.remote_jid, c);
@@ -1954,7 +1931,7 @@ export function setupRoutes(app) {
           city: crm?.city,
           company: crm?.company,
           dealValue: crm?.deal_value || null,
-          tags: chat?.tags || [],
+          tags: (funnelTagsMap[jid]?.tags) || [],
           stageSource: ai.stage_source || null,
         });
       }

@@ -2,6 +2,7 @@ import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
 import { sendDailySummary, notifyHotLead } from '../notifications/notificationService.js';
 import { DailyAnalysisSchema, ClassifyBatchSchema, parseAIResponse } from './schemas.js';
+import { getChatTags, getChatTagsByJids, upsertChatTags } from '../storage/queries.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -414,35 +415,32 @@ async function applyAutoTag(sessionId, remoteJid, customerType) {
   if (!newTag) return;
 
   try {
+    // W7A: tags live in chat_tags (phone-level). Check confirmation there.
+    const { tagConfirmed } = await getChatTags(remoteJid);
+    if (tagConfirmed) return;
+
+    // Pull display_name/push_name from chats for name-based employee detection.
+    // This is the only reason we still touch `chats` here.
     const { data: chat } = await supabase
       .from('chats')
-      .select('tags, ai_tag, display_name, push_name, tag_confirmed')
+      .select('display_name, push_name')
       .eq('session_id', sessionId)
       .eq('remote_jid', remoteJid)
       .maybeSingle();
 
-    // Don't override manually confirmed tags
-    if (chat?.tag_confirmed) return;
-
-    const existingTags = Array.isArray(chat?.tags) ? chat.tags : [];
-
-    // Name-based employee detection
     const chatName = (chat?.display_name || chat?.push_name || '').toUpperCase();
-    const isEmployee = EMPLOYEE_PATTERNS.some((p) => chatName.toUpperCase().includes(p.toUpperCase()));
+    const isEmployee = EMPLOYEE_PATTERNS.some((p) => chatName.includes(p.toUpperCase()));
 
-    // Determine final tag: employee detection overrides AI classification
-    let finalTag = newTag;
-    if (isEmployee) {
-      finalTag = 'сотрудник';
-    }
+    // Employee detection overrides AI classification
+    const finalTag = isEmployee ? 'сотрудник' : newTag;
 
-    // Replace all tags with just the single simplified tag
-    const merged = [finalTag];
+    await upsertChatTags(remoteJid, { tags: [finalTag], tagConfirmed: false });
 
+    // Keep ai_tag audit column on chats for debugging/history of classifier decisions.
     await supabase
       .from('chats')
       .upsert(
-        { session_id: sessionId, remote_jid: remoteJid, tags: merged, ai_tag: newTag, tag_confirmed: false, updated_at: new Date().toISOString() },
+        { session_id: sessionId, remote_jid: remoteJid, ai_tag: newTag, updated_at: new Date().toISOString() },
         { onConflict: 'session_id,remote_jid' }
       );
   } catch (err) {
@@ -704,12 +702,22 @@ export async function classifyUntaggedChats() {
   try {
     const { data: chats, error: chatsErr } = await supabase
       .from('chats')
-      .select('session_id, remote_jid, tags, tag_confirmed')
+      .select('session_id, remote_jid')
       .order('updated_at', { ascending: false })
       .limit(500);
 
     if (chatsErr) return { success: false, error: chatsErr.message, classified: 0 };
     if (!chats?.length) return { success: true, classified: 0, message: 'No chats found' };
+
+    // W7A: tags now live in chat_tags (phone-level). Batch-load once,
+    // then attach to each chat before filtering.
+    const uniqueJids = [...new Set(chats.map((c) => c.remote_jid).filter(Boolean))];
+    const tagMap = await getChatTagsByJids(uniqueJids);
+    for (const c of chats) {
+      const entry = tagMap[c.remote_jid];
+      c.tags = entry?.tags || [];
+      c.tag_confirmed = Boolean(entry?.tagConfirmed);
+    }
 
     // Find chats: no AI tag at all, OR tagged "неизвестно" (re-check if enough messages now)
     // NEVER re-classify manually confirmed tags
