@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CUSTOMER_TYPES } from './tagConstants.js';
 
 // === Tool input schemas for chatEndpoint.js ===
 // Validated BEFORE any DB call — defense against hallucinated limits, injection via IDs,
@@ -87,7 +88,7 @@ export const DailyAnalysisSchema = z.object({
     'designer_partner', 'showroom_visit', 'incoming_call', 'unknown',
   ]).catch('unknown'),
 
-  customer_type: z.enum(['end_client', 'partner', 'colleague', 'unknown']).catch('unknown'),
+  customer_type: z.enum(CUSTOMER_TYPES).catch('unknown'),
 
   dialog_topic: z.enum([
     'sink_sale', 'faucet_sale', 'complaint', 'service',
@@ -132,7 +133,7 @@ export const DailyAnalysisSchema = z.object({
 
 export const ClassifyItemSchema = z.object({
   id: z.number(),
-  customer_type: z.enum(['end_client', 'partner', 'colleague', 'unknown']),
+  customer_type: z.enum(CUSTOMER_TYPES),
   deal_stage: z.enum([
     'needs_review', 'first_contact', 'consultation', 'model_selection',
     'price_negotiation', 'payment', 'delivery', 'completed', 'refused',

@@ -34,3 +34,32 @@ bazav2/
 
 # Stray agent-office folder (lives at Desktop level, not inside this repo)
 shared/
+
+# Red-team test artifacts (raw AI responses — may contain test payload echoes)
+tests/red-team/results-*.json
+
+# Ad-hoc WhatsApp dump / classification artifacts (customer data — never commit)
+/*_dump.*
+/*_dialogs.json
+/*_msgs/
+/*_msgs_*.json
+/*_analysis*.json
+/*_analyses*.json
+/*_chunk_*.json
+/*_records.json
+/*_pending.json
+/*_existing.json
+/*_unanalyzed.json
+/*_analyzed.json
+/*_to_analyze.json
+/*_compact.json
+/*_top20.json
+/*_sessions.json
+/*_post_resp.json
+/*_all_dialogs.*
+/*_text/
+/tmp_*/
+/*_fetch.cjs
+/*_analyze.cjs
+/_diag*.mjs
+/_reclassify*.mjs

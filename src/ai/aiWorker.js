@@ -3,6 +3,11 @@ import { supabase } from '../storage/supabase.js';
 import { sendDailySummary, notifyHotLead } from '../notifications/notificationService.js';
 import { DailyAnalysisSchema, ClassifyBatchSchema, parseAIResponse } from './schemas.js';
 import { getChatTags, getChatTagsByJids, upsertChatTags } from '../storage/queries.js';
+import {
+  CUSTOMER_TYPE_PROMPT_LIST,
+  AI_AUTO_TAGS,
+  resolveTag,
+} from './tagConstants.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -54,7 +59,7 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании ${BRAND} ${
   "intent": "одно из: price_inquiry, complaint, availability, measurement_request, delivery, consultation, collaboration, small_talk, spam, other",
   "lead_temperature": "одно из: hot, warm, cold, dead",
   "lead_source": "одно из: instagram_ad, google_ad, word_of_mouth, repeat_client, designer_partner, showroom_visit, incoming_call, unknown",
-  "customer_type": "одно из: end_client, partner, colleague, spam, unknown",
+  "customer_type": "одно из: ${CUSTOMER_TYPE_PROMPT_LIST}",
   "dialog_topic": "одно из: sink_sale, faucet_sale, complaint, service, consultation, partnership, other",
   "deal_stage": "одно из: needs_review, first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused",
   "sentiment": "одно из: positive, neutral, negative, aggressive",
@@ -408,23 +413,16 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
   }
 }
 
-// Map AI customer_type → tag name (Russian)
-const CUSTOMER_TYPE_TAG = {
-  end_client: 'клиент',
-  designer: 'клиент',       // designers are clients too
-  partner: 'партнёр',
-  contractor: 'клиент',     // contractors are clients too
-  colleague: 'сотрудник',
-  personal: 'неизвестно',   // personal → unknown
-  spam: 'спам',             // spam gets its own tag now
-  unknown: 'неизвестно',
-};
-
-const AI_AUTO_TAGS = new Set(Object.values(CUSTOMER_TYPE_TAG));
-
 async function applyAutoTag(sessionId, remoteJid, customerType) {
-  const newTag = CUSTOMER_TYPE_TAG[customerType];
-  if (!newTag) return;
+  // resolveTag handles canonical + legacy customer_type values (see tagConstants.js).
+  const newTag = resolveTag(customerType);
+  if (!newTag) {
+    logger.warn(
+      { sessionId, remoteJid, customerType },
+      'applyAutoTag: unmapped customer_type — update tagConstants.js'
+    );
+    return;
+  }
 
   try {
     // W7A: tags live in chat_tags (phone-level). Check confirmation there.
@@ -890,7 +888,7 @@ export async function classifyUntaggedChats() {
         if (Array.isArray(results)) {
           for (const r of results) {
             const idx = (r.id || 1) - 1;
-            if (idx >= 0 && idx < batch.length && r.customer_type && CUSTOMER_TYPE_TAG[r.customer_type]) {
+            if (idx >= 0 && idx < batch.length && r.customer_type && resolveTag(r.customer_type)) {
               const c = batch[idx].chat;
               await applyAutoTag(c.session_id, c.remote_jid, r.customer_type);
               classified++;
@@ -1183,7 +1181,7 @@ export async function reclassifyStuckContacts() {
                 reclassified++;
               }
               // Also update customer_type if returned
-              if (r.customer_type && CUSTOMER_TYPE_TAG[r.customer_type]) {
+              if (r.customer_type && resolveTag(r.customer_type)) {
                 await applyAutoTag(item.session_id, item.remote_jid, r.customer_type);
               }
             }
