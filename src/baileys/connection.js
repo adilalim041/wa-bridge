@@ -580,7 +580,7 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
       JSON.stringify(events, null, 2));
     for (const event of events) {
       try {
-        await handleCallEvent(sessionId, event);
+        await handleCallEvent(sessionId, event, sock);
       } catch (err) {
         console.error(`[${sessionId}] [CALL RAW] handler threw:`, err?.message, err?.stack);
       }

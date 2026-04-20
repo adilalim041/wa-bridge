@@ -131,7 +131,7 @@ export function invalidateHiddenCache(sessionId, remoteJid) {
   hiddenCacheTimestamps.delete(cacheKey);
 }
 
-async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
+export async function normalizeRemoteJid(remoteJid = '', sock = null, sessionId = '') {
   if (remoteJid.endsWith('@lid')) {
     // Tier 1: Use Baileys' built-in LIDMappingStore (in-memory cache + DB)
     if (sock?.signalRepository?.lidMapping) {

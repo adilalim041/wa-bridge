@@ -1,19 +1,7 @@
 import { logger } from '../config.js';
 import { upsertCall, formatCallRow } from '../storage/queries.js';
 import { emitCallEvent } from '../api/websocket.js';
-
-/**
- * Normalize a WhatsApp JID to a bare phone number (or group ID).
- * Strips @s.whatsapp.net, @g.us, @lid, and device suffix (e.g. :5).
- */
-function normalizeJid(raw) {
-  if (!raw) return raw;
-  return raw
-    .replace(/@s\.whatsapp\.net$/i, '')
-    .replace(/@g\.us$/i, '')
-    .replace(/@lid$/i, '')
-    .replace(/:\d+$/, '');
-}
+import { normalizeRemoteJid } from './messageHandler.js';
 
 /**
  * Handle a single Baileys call event and persist it to Supabase.
@@ -21,8 +9,9 @@ function normalizeJid(raw) {
  * @param {string} sessionId
  * @param {object} event - Baileys call event object
  *   Fields: id, from, status, date, isVideo, isGroup, offline
+ * @param {object} [sock] - live Baileys socket (needed for @lid → phone mapping)
  */
-export async function handleCallEvent(sessionId, event) {
+export async function handleCallEvent(sessionId, event, sock = null) {
   try {
     const { id: callId, from, status, date, isVideo = false, isGroup = false, offline = false } = event;
 
@@ -31,7 +20,14 @@ export async function handleCallEvent(sessionId, event) {
       return;
     }
 
-    const remoteJid = normalizeJid(from);
+    // Use the same normalizer as messages so calls.remote_jid matches chats.remote_jid.
+    // This resolves @lid JIDs to real phone numbers via signalRepository.lidMapping,
+    // which is exactly what WhatsApp sends for non-contact callers on Baileys v7.
+    const remoteJid = await normalizeRemoteJid(from, sock, sessionId);
+    if (!remoteJid) {
+      console.warn(`[${sessionId}] [CALL] unresolvable JID, skipping. from=${from} callId=${callId} status=${status}`);
+      return;
+    }
 
     // Outgoing calls: Baileys marks offline=true for events we initiated
     const fromMe = Boolean(offline);
