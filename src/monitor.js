@@ -220,32 +220,40 @@ async function checkZombieConnection(sessionId) {
     const lastMsgAge = Date.now() - new Date(data.timestamp).getTime();
     if (lastMsgAge <= ZOMBIE_THRESHOLD_MS) return;
 
-    // ── Stage 2 (2026-04-18): WebSocket health check ──────────────────────────
+    // ── Stage 2 (2026-04-20, fixed): WebSocket health check ───────────────────
     // Long silence alone is not enough to restart. If the underlying WA socket
     // is still OPEN, Baileys is exchanging keepalive frames every 15s and WA
     // considers us alive — the number is simply quiet, not a zombie. Restart
     // here would be pointless churn (extra reconnect = minor ban-risk signal
     // + noise alerts for legitimately low-traffic numbers like almaty-nurbolat).
     //
-    // Real zombies have state.connected === true (because no 'close' event
-    // fired) but the WebSocket has silently dropped — sock.ws.readyState will
-    // be 2 (CLOSING) or 3 (CLOSED). Only those get restarted.
+    // Baileys v7 API note: sock.ws is a WebSocketClient wrapper (see
+    // node_modules/baileys/lib/Socket/Client/websocket.d.ts) with getters
+    // isOpen / isClosed / isClosing / isConnecting — NOT the native WebSocket
+    // readyState. Earlier attempt used readyState and always got undefined,
+    // causing every silence to trip the "real zombie" branch and restart.
+    //
+    // Real zombies: state.connected === true (no 'close' event fired) but
+    // sock.ws.isOpen === false. Only those get restarted.
     const sock = sessionManagerRef?.getSession?.(sessionId)?.sock;
-    const wsReadyState = sock?.ws?.readyState;
-    const WS_OPEN = 1;
-    if (wsReadyState === WS_OPEN) {
+    const wsIsOpen = sock?.ws?.isOpen === true;
+    const wsIsConnecting = sock?.ws?.isConnecting === true;
+    if (wsIsOpen || wsIsConnecting) {
       const hours = Math.round(lastMsgAge / 3600000);
       console.log(
-        `[${sessionId}] Quiet but healthy: ${hours}h no messages, ws.readyState=OPEN. Skipping restart.`
+        `[${sessionId}] Quiet but healthy: ${hours}h no messages, ws.isOpen=${wsIsOpen} isConnecting=${wsIsConnecting}. Skipping restart.`
       );
       return;
     }
 
-    // WebSocket is not OPEN — this is a real zombie, restart it
+    // WebSocket is neither OPEN nor CONNECTING — real zombie, restart it
     const hours = Math.round(lastMsgAge / 3600000);
+    const wsState = sock?.ws
+      ? (sock.ws.isClosed ? 'closed' : sock.ws.isClosing ? 'closing' : 'unknown')
+      : 'no-sock';
     lastZombieRestart.set(sessionId, Date.now());
     sendTelegramAlert(
-      `🧟 Zombie detected [${sessionId}]: ${hours}h without messages + ws.readyState=${wsReadyState ?? 'unknown'}. Restarting...`
+      `🧟 Zombie detected [${sessionId}]: ${hours}h without messages + ws=${wsState}. Restarting...`
     ).catch(() => {});
 
     if (sessionManagerRef?.stopSession && sessionManagerRef?.startSession) {
