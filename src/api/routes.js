@@ -376,15 +376,26 @@ export function setupRoutes(app) {
       // Build session filter
       const sessionFilter = (query) => sessionId ? query.eq('session_id', sessionId) : query;
 
+      // Pre-load the set of remote_jids tagged as клиент or партнёр.
+      // Analytics should only reflect customer/partner interactions, not employees
+      // or unclassified chats.
+      const { data: relevantTagRows } = await supabase
+        .from('chat_tags')
+        .select('remote_jid')
+        .overlaps('tags', ['клиент', 'партнёр']);
+      const relevantJids = new Set((relevantTagRows ?? []).map((r) => r.remote_jid));
+
       // 1. KPI: response times (adjusted for working hours 10:00-20:00 Almaty)
       let rtQuery = supabase
         .from('manager_analytics')
-        .select('customer_message_at, manager_response_at')
+        .select('customer_message_at, manager_response_at, remote_jid')
         .gte('created_at', since)
         .not('manager_response_at', 'is', null);
       if (rangeEnd) rtQuery = rtQuery.lte('created_at', rangeEnd);
 
-      const { data: responseTimes } = await sessionFilter(rtQuery);
+      const { data: responseTimesRaw } = await sessionFilter(rtQuery);
+      // Filter: only клиент/партнёр chats
+      const responseTimes = (responseTimesRaw ?? []).filter((r) => relevantJids.has(r.remote_jid));
 
       // Calculate working-hours-only response time for each entry
       const WORK_START = 10; // 10:00 Almaty
@@ -446,7 +457,10 @@ export function setupRoutes(app) {
 
       const { data: aiData } = await sessionFilter(aiQuery);
 
-      const ai = (aiData ?? []).filter((row) => !isGarbageJid(row.remote_jid));
+      // Filter: garbage JIDs removed, and only клиент/партнёр chats counted in AI metrics
+      const ai = (aiData ?? []).filter(
+        (row) => !isGarbageJid(row.remote_jid) && relevantJids.has(row.remote_jid)
+      );
 
       // Lead temperature
       const leads = { hot: 0, warm: 0, cold: 0, dead: 0 };
@@ -931,6 +945,91 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error }, 'Cleanup LID garbage failed');
       res.status(500).json({ error: 'Cleanup failed' });
+    }
+  });
+
+  // Delete all manager_analytics rows for chats tagged as сотрудник.
+  // Auth: same JWT/x-api-key middleware as all other routes in this router.
+  router.post('/admin/cleanup-employee-analytics', async (_req, res) => {
+    try {
+      const { data: employeeTagRows, error: tagErr } = await supabase
+        .from('chat_tags')
+        .select('remote_jid')
+        .contains('tags', ['сотрудник']);
+
+      if (tagErr) {
+        logger.error({ err: tagErr }, 'cleanup-employee-analytics: failed to fetch employee jids');
+        return res.status(500).json({ error: tagErr.message });
+      }
+
+      const jids = (employeeTagRows ?? []).map((r) => r.remote_jid);
+
+      if (jids.length === 0) {
+        return res.json({ deleted: 0 });
+      }
+
+      const { count, error: delErr } = await supabase
+        .from('manager_analytics')
+        .delete({ count: 'exact' })
+        .in('remote_jid', jids);
+
+      if (delErr) {
+        logger.error({ err: delErr }, 'cleanup-employee-analytics: delete failed');
+        return res.status(500).json({ error: delErr.message });
+      }
+
+      logger.info({ deleted: count, employeeCount: jids.length }, 'cleanup-employee-analytics: done');
+      return res.json({ deleted: count ?? 0 });
+    } catch (err) {
+      logger.error({ err }, 'cleanup-employee-analytics: unexpected error');
+      return res.status(500).json({ error: 'Cleanup failed' });
+    }
+  });
+
+  // Tag all chats that have no entry in chat_tags (or have empty tags) as 'неизвестно'.
+  // Idempotent — safe to call multiple times.
+  router.post('/admin/backfill-unknown-tags', async (_req, res) => {
+    try {
+      const { data: allChats, error: chatsErr } = await supabase
+        .from('chats')
+        .select('remote_jid');
+
+      if (chatsErr) {
+        logger.error({ err: chatsErr }, 'backfill-unknown-tags: failed to fetch chats');
+        return res.status(500).json({ error: chatsErr.message });
+      }
+
+      const allJids = [...new Set((allChats ?? []).map((c) => c.remote_jid).filter(Boolean))];
+
+      if (allJids.length === 0) {
+        return res.json({ tagged: 0 });
+      }
+
+      // Fetch existing tag records in one batch
+      const { data: existingTags } = await supabase
+        .from('chat_tags')
+        .select('remote_jid, tags')
+        .in('remote_jid', allJids);
+
+      const taggedJids = new Set(
+        (existingTags ?? [])
+          .filter((r) => Array.isArray(r.tags) && r.tags.length > 0)
+          .map((r) => r.remote_jid)
+      );
+
+      const toTag = allJids.filter((jid) => !taggedJids.has(jid));
+
+      let tagged = 0;
+      for (const jid of toTag) {
+        const ok = await upsertChatTags(jid, { tags: ['неизвестно'], tagConfirmed: false });
+        if (ok) tagged++;
+      }
+
+      logger.info({ tagged, total: allJids.length }, 'backfill-unknown-tags: done');
+      return res.json({ tagged });
+    } catch (err) {
+      logger.error({ err }, 'backfill-unknown-tags: unexpected error');
+      return res.status(500).json({ error: 'Backfill failed' });
     }
   });
 

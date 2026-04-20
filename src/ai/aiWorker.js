@@ -207,6 +207,12 @@ async function callClaude(messages) {
 
 async function getResponseTimeContext(sessionId, remoteJid) {
   try {
+    // Only include response-time context for клиент/партнёр chats.
+    // Employees and unknowns are excluded to keep AI context clean.
+    const { tags } = await getChatTags(remoteJid);
+    const isRelevant = tags.includes('клиент') || tags.includes('партнёр');
+    if (!isRelevant) return '';
+
     const { data } = await supabase
       .from('manager_analytics')
       .select('response_time_seconds')

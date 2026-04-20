@@ -425,7 +425,15 @@ async function executeTool(name, input = {}) {
           return JSON.stringify({ error: error.message });
         }
 
-        const times = (data || [])
+        // Filter to клиент/партнёр only — exclude employees and unclassified chats
+        const { data: tagRows } = await supabase
+          .from('chat_tags')
+          .select('remote_jid')
+          .overlaps('tags', ['клиент', 'партнёр']);
+        const relevantJids = new Set((tagRows ?? []).map((r) => r.remote_jid));
+        const filteredData = (data || []).filter((r) => relevantJids.has(r.remote_jid));
+
+        const times = filteredData
           .map((row) => Number(row.response_time_seconds))
           .filter((value) => Number.isFinite(value) && value >= 0);
 
@@ -438,7 +446,7 @@ async function executeTool(name, input = {}) {
           slowest_seconds: times.length ? Math.max(...times) : 0,
           slow_over_2h: times.filter((value) => value > 7200).length,
           fast_under_5min: times.filter((value) => value <= 300).length,
-          recent_responses: (data || []).slice(0, 10),
+          recent_responses: filteredData.slice(0, 10),
         };
 
         return JSON.stringify(stats);
@@ -503,7 +511,13 @@ async function executeTool(name, input = {}) {
           { data: unanswered, error: err1 },
           { data: negative, error: err2 },
           { data: risky, error: err3 },
-        ] = await Promise.all([unansweredQuery, negativeQuery, riskyQuery]);
+          { data: fpTagRows },
+        ] = await Promise.all([
+          unansweredQuery,
+          negativeQuery,
+          riskyQuery,
+          supabase.from('chat_tags').select('remote_jid').overlaps('tags', ['клиент', 'партнёр']),
+        ]);
 
         if (err1 || err2 || err3) {
           return JSON.stringify({
@@ -511,10 +525,13 @@ async function executeTool(name, input = {}) {
           });
         }
 
+        // Only show unanswered/negative/risky for клиент/партнёр chats
+        const fpJids = new Set((fpTagRows ?? []).map((r) => r.remote_jid));
+
         return JSON.stringify({
-          unanswered_chats: unanswered || [],
-          negative_sentiment: negative || [],
-          risk_flag_chats: risky || [],
+          unanswered_chats: (unanswered || []).filter((r) => fpJids.has(r.remote_jid)),
+          negative_sentiment: (negative || []).filter((r) => fpJids.has(r.remote_jid)),
+          risk_flag_chats: (risky || []).filter((r) => fpJids.has(r.remote_jid)),
         });
       }
 

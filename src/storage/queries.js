@@ -214,6 +214,16 @@ export async function upsertChat({
 
     if (error) {
       logger.error({ err: error, remoteJid, sessionId }, 'Failed to upsert chat');
+    } else {
+      // Default tag for new chats — set only if no chat_tags record exists yet.
+      // Allows the AI worker to later replace 'неизвестно' with the real role.
+      // Groups (remote_jid ends with @g.us) are skipped — AI never classifies them.
+      if (!remoteJid.endsWith('@g.us')) {
+        const existing = await getChatTags(remoteJid);
+        if (existing.tags.length === 0) {
+          await upsertChatTags(remoteJid, { tags: ['неизвестно'], tagConfirmed: false });
+        }
+      }
     }
   } catch (error) {
     logger.error({ err: error, remoteJid, sessionId }, 'Unexpected error while upserting chat');

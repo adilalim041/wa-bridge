@@ -1,11 +1,38 @@
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
+import { getChatTags } from '../storage/queries.js';
+
+// Returns true if this remoteJid should be excluded from manager_analytics.
+// Rule: skip сотрудник always. Skip неизвестно only when ≥3 records already
+// exist (prevents data loss for real new clients before AI classification).
+async function shouldSkipAnalytics(remoteJid) {
+  try {
+    const { tags } = await getChatTags(remoteJid);
+    if (tags.includes('сотрудник')) return true;
+    if (tags.includes('неизвестно') || tags.length === 0) {
+      const { count } = await supabase
+        .from('manager_analytics')
+        .select('*', { count: 'exact', head: true })
+        .eq('remote_jid', remoteJid);
+      return (count ?? 0) >= 3;
+    }
+    return false;
+  } catch {
+    // Fail-open: if tag lookup errors, allow the record (better than losing data)
+    return false;
+  }
+}
 
 export async function trackResponseTime(sessionId, remoteJid, dialogSessionId, fromMe, timestamp) {
   try {
     const msgTime = new Date(timestamp);
 
     if (!fromMe) {
+      if (await shouldSkipAnalytics(remoteJid)) {
+        logger.debug({ remoteJid }, 'responseTracker: skipping employee/unknown chat');
+        return;
+      }
+
       const { error } = await supabase.from('manager_analytics').insert({
         session_id: sessionId,
         remote_jid: remoteJid,
