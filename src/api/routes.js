@@ -2712,7 +2712,7 @@ export function setupRoutes(app) {
       // 2. Load last 50 messages for this dialog session
       let messages = [];
       if (chatAi.dialog_session_id) {
-        const { data: msgs, error: msgsErr } = await supabase
+        const { data: msgs, error: msgsErr } = await db
           .from('messages')
           .select('body, from_me, timestamp, message_type, media_url')
           .eq('dialog_session_id', chatAi.dialog_session_id)
@@ -2732,7 +2732,7 @@ export function setupRoutes(app) {
       const remoteJid = chatAi.remote_jid;
 
       if (remoteJid) {
-        const { data: crm } = await supabase
+        const { data: crm } = await db
           .from('contacts_crm')
           .select('first_name, last_name')
           .eq('remote_jid', remoteJid)
@@ -2741,7 +2741,7 @@ export function setupRoutes(app) {
         if (crm?.first_name) {
           clientName = [crm.first_name, crm.last_name].filter(Boolean).join(' ');
         } else {
-          const { data: chat } = await supabase
+          const { data: chat } = await db
             .from('chats')
             .select('display_name')
             .eq('remote_jid', remoteJid)
