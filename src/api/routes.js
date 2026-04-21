@@ -1678,16 +1678,17 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone is required' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
       const [{ count, error: countError }, { data: recentUnread, error: recentError }] = await Promise.all([
-        supabase
+        db
           .from('messages')
           .select('*', { count: 'exact', head: true })
           .eq('session_id', sessionId)
           .eq('remote_jid', remoteJid)
           .eq('from_me', false)
           .is('read_at', null),
-        supabase
+        db
           .from('messages')
           .select('message_id, sender, chat_type')
           .eq('session_id', sessionId)
@@ -1707,7 +1708,7 @@ export function setupRoutes(app) {
       }
 
       const readAt = new Date().toISOString();
-      const { error: updateError } = await supabase
+      const { error: updateError } = await db
         .from('messages')
         .update({ read_at: readAt })
         .eq('session_id', sessionId)
