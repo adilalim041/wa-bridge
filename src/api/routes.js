@@ -1370,8 +1370,9 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone is required' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
-      const { error } = await supabase
+      const { error } = await db
         .from('chats')
         .upsert(
           {
@@ -1391,7 +1392,7 @@ export function setupRoutes(app) {
       invalidateHiddenCache(sessionId, remoteJid);
 
       if (hidden) {
-        const { error: deleteError } = await supabase
+        const { error: deleteError } = await db
           .from('messages')
           .delete()
           .eq('session_id', sessionId)
