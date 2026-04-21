@@ -1230,7 +1230,8 @@ export function setupRoutes(app) {
 
   router.get('/sessions/:sessionId/status', async (req, res) => {
     const { sessionId } = req.params;
-    const { data: config } = await supabase
+    const db = req.userClient ?? supabase;
+    const { data: config } = await db
       .from('session_config')
       .select('session_id')
       .eq('session_id', sessionId)
