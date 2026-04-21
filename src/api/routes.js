@@ -2108,9 +2108,10 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'sessionId, remoteJid, and valid dealStage required' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
       // Update the latest chat_ai record for this contact
-      const { data: latest } = await supabase
+      const { data: latest } = await db
         .from('chat_ai')
         .select('id')
         .eq('session_id', sessionId)
@@ -2120,14 +2121,14 @@ export function setupRoutes(app) {
         .maybeSingle();
 
       if (latest) {
-        await supabase.from('chat_ai').update({
+        await db.from('chat_ai').update({
           deal_stage: dealStage,
           stage_source: 'manual',
           stage_changed_at: new Date().toISOString(),
         }).eq('id', latest.id);
       } else {
         // No AI analysis yet — create a minimal record
-        await supabase.from('chat_ai').insert({
+        await db.from('chat_ai').insert({
           session_id: sessionId,
           remote_jid: remoteJid,
           deal_stage: dealStage,
