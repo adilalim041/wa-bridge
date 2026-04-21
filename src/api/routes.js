@@ -2141,12 +2141,13 @@ export function setupRoutes(app) {
 
   router.get('/tasks/stats', async (req, res) => {
     try {
+      const db = req.userClient ?? supabase;
       const { session_id } = req.query;
       const now = new Date().toISOString();
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
 
-      let baseQuery = supabase.from('tasks').select('id, status, due_date, completed_at');
+      let baseQuery = db.from('tasks').select('id, status, due_date, completed_at');
       if (session_id && session_id !== '__all__') {
         baseQuery = baseQuery.eq('session_id', session_id);
       }
