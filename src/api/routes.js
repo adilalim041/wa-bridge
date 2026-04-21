@@ -804,8 +804,9 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'action_required must be a boolean' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
-      const { data, error } = await supabase
+      const { data, error } = await db
         .from('chat_ai')
         .update(updates)
         .eq('id', id)
