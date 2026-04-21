@@ -75,14 +75,129 @@ const labelArray = z
   .array(z.string().min(1).max(30))
   .max(30);
 
+// Longer label array for lead_sources / refusal_reasons / task_types
+const labelArrayLong = z
+  .array(z.string().min(1).max(60))
+  .max(50);
+
+// Showroom shape inside company_profile
+const ShowroomSchema = z.object({
+  city:    z.string().min(1).max(80),
+  address: z.string().min(1).max(300),
+  hours:   z.string().max(100).optional(),
+});
+
+// company_profile — all fields optional so partial updates work
+const CompanyProfileSchema = z.object({
+  name:          z.string().max(100).optional(),
+  description:   z.string().max(2000).optional(),
+  website:       z.string().url().max(300).optional().or(z.literal('')),
+  phone:         z.string().max(40).optional(),
+  email:         z.string().email().max(200).optional().or(z.literal('')),
+  working_hours: z.string().max(200).optional(),
+  showrooms:     z.array(ShowroomSchema).max(10).optional(),
+}).strict();
+
 const TenantSettingsPutSchema = z.object({
-  roles:  labelArray.optional(),
-  cities: labelArray.optional(),
-  tags:   labelArray.optional(),
+  roles:           labelArray.optional(),
+  cities:          labelArray.optional(),
+  tags:            labelArray.optional(),
+  lead_sources:    labelArrayLong.optional(),
+  refusal_reasons: labelArrayLong.optional(),
+  task_types:      labelArrayLong.optional(),
+  company_profile: CompanyProfileSchema.optional(),
 }).refine(
-  (body) => body.roles !== undefined || body.cities !== undefined || body.tags !== undefined,
-  { message: 'At least one field (roles, cities, tags) is required' }
+  (body) =>
+    body.roles !== undefined ||
+    body.cities !== undefined ||
+    body.tags !== undefined ||
+    body.lead_sources !== undefined ||
+    body.refusal_reasons !== undefined ||
+    body.task_types !== undefined ||
+    body.company_profile !== undefined,
+  { message: 'At least one settings field is required' }
 );
+
+// ---------------------------------------------------------------------------
+// Zod schemas for /settings/managers
+// ---------------------------------------------------------------------------
+
+const ManagerCreateSchema = z.object({
+  name:        z.string().min(1).max(100),
+  email:       z.string().email().max(200).optional().or(z.literal('')),
+  phone:       z.string().max(40).optional(),
+  session_ids: z.array(z.string().min(1).max(80)).max(20).optional(),
+  notes:       z.string().max(1000).optional(),
+});
+
+const ManagerPatchSchema = z.object({
+  name:        z.string().min(1).max(100).optional(),
+  email:       z.string().email().max(200).optional().or(z.literal('')),
+  phone:       z.string().max(40).optional(),
+  session_ids: z.array(z.string().min(1).max(80)).max(20).optional(),
+  is_active:   z.boolean().optional(),
+  notes:       z.string().max(1000).optional(),
+}).refine(
+  (b) =>
+    b.name !== undefined ||
+    b.email !== undefined ||
+    b.phone !== undefined ||
+    b.session_ids !== undefined ||
+    b.is_active !== undefined ||
+    b.notes !== undefined,
+  { message: 'At least one field is required' }
+);
+
+const ReorderSchema = z.object({
+  ids: z.array(z.string().uuid()).min(1).max(200),
+});
+
+// ---------------------------------------------------------------------------
+// Zod schemas for /settings/templates
+// ---------------------------------------------------------------------------
+
+const TemplateCreateSchema = z.object({
+  title:    z.string().min(1).max(100),
+  body:     z.string().min(1).max(4000),
+  category: z.string().min(1).max(60).optional(),
+});
+
+const TemplatePatchSchema = z.object({
+  title:    z.string().min(1).max(100).optional(),
+  body:     z.string().min(1).max(4000).optional(),
+  category: z.string().min(1).max(60).optional(),
+}).refine(
+  (b) => b.title !== undefined || b.body !== undefined || b.category !== undefined,
+  { message: 'At least one field (title, body, category) is required' }
+);
+
+// ---------------------------------------------------------------------------
+// In-memory rate-limit map for WhatsApp profile updates.
+// Key: `${userId}:${sessionId}:${field}` — value: timestamp of last update.
+// WhatsApp bans accounts that change profile fields too frequently.
+// Limit: 1 update per field per hour.
+// ---------------------------------------------------------------------------
+const lastProfileUpdate = new Map(); // key → Date.now() ms timestamp
+const PROFILE_UPDATE_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Check whether the given profile field update is within the cooldown window.
+ * Returns null if allowed, or { retryAfterSeconds } if rate-limited.
+ */
+function checkProfileRateLimit(userId, sessionId, field) {
+  const key = `${userId}:${sessionId}:${field}`;
+  const last = lastProfileUpdate.get(key);
+  if (!last) return null;
+  const elapsed = Date.now() - last;
+  if (elapsed < PROFILE_UPDATE_COOLDOWN_MS) {
+    return { retryAfterSeconds: Math.ceil((PROFILE_UPDATE_COOLDOWN_MS - elapsed) / 1000) };
+  }
+  return null;
+}
+
+function markProfileUpdated(userId, sessionId, field) {
+  lastProfileUpdate.set(`${userId}:${sessionId}:${field}`, Date.now());
+}
 
 const hexColorField = z
   .string()
@@ -3204,10 +3319,20 @@ export function setupRoutes(app) {
         // First visit — return schema defaults without writing to DB.
         // The first PUT will create the row.
         settings = {
-          roles:  ['клиент', 'партнёр', 'менеджер', 'другое'],
-          cities: [],
-          tags:   [],
+          roles:           ['клиент', 'партнёр', 'менеджер', 'другое'],
+          cities:          [],
+          tags:            [],
+          lead_sources:    [],
+          refusal_reasons: [],
+          task_types:      [],
+          company_profile: {},
         };
+      } else {
+        // Back-fill new columns for rows created before 0008 migration
+        settings.lead_sources    = settings.lead_sources    ?? [];
+        settings.refusal_reasons = settings.refusal_reasons ?? [];
+        settings.task_types      = settings.task_types      ?? [];
+        settings.company_profile = settings.company_profile ?? {};
       }
 
       return res.json(settings);
@@ -3406,6 +3531,638 @@ export function setupRoutes(app) {
     } catch (err) {
       logger.error({ err, userId }, 'POST /funnel/stages/reorder failed');
       return res.status(500).json({ error: 'Failed to reorder stages' });
+    }
+  });
+
+  // ==========================================================================
+  // Settings: managers
+  // ==========================================================================
+
+  /**
+   * GET /settings/managers
+   * Returns list of managers for the authenticated tenant, sorted by sort_order ASC,
+   * then created_at ASC.
+   */
+  router.get('/settings/managers', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      const { data, error } = await db
+        .from('managers')
+        .select('*')
+        .eq('user_id', userId)
+        .order('sort_order', { ascending: true })
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+      return res.json(data ?? []);
+    } catch (err) {
+      logger.error({ err, userId }, 'GET /settings/managers failed');
+      return res.status(500).json({ error: 'Failed to fetch managers' });
+    }
+  });
+
+  /**
+   * POST /settings/managers
+   * Body: { name, email?, phone?, session_ids?, notes? }
+   * Creates a new manager. sort_order is set to max+1 among existing rows.
+   */
+  router.post('/settings/managers', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = ManagerCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      // Determine next sort_order
+      const { data: maxRow } = await db
+        .from('managers')
+        .select('sort_order')
+        .eq('user_id', userId)
+        .order('sort_order', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const sortOrder = maxRow ? maxRow.sort_order + 1 : 0;
+
+      const { data, error } = await db
+        .from('managers')
+        .insert({
+          user_id:     userId,
+          name:        parsed.data.name,
+          email:       parsed.data.email || null,
+          phone:       parsed.data.phone || null,
+          session_ids: parsed.data.session_ids ?? [],
+          notes:       parsed.data.notes || null,
+          sort_order:  sortOrder,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      return res.status(201).json(data);
+    } catch (err) {
+      logger.error({ err, userId }, 'POST /settings/managers failed');
+      return res.status(500).json({ error: 'Failed to create manager' });
+    }
+  });
+
+  /**
+   * POST /settings/managers/reorder
+   * Body: { ids: [uuid, ...] }
+   * Atomically resets sort_order so each id gets its array-index position.
+   * Must be registered BEFORE PATCH /:id to avoid Express matching "reorder" as :id.
+   */
+  router.post('/settings/managers/reorder', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = ReorderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      // Atomic batch update: each id gets sort_order = its index position.
+      // RLS ensures only the tenant's own rows can be touched.
+      await Promise.all(
+        parsed.data.ids.map((id, idx) =>
+          db
+            .from('managers')
+            .update({ sort_order: idx })
+            .eq('id', id)
+            .eq('user_id', userId)
+        )
+      );
+      return res.json({ reordered: parsed.data.ids.length });
+    } catch (err) {
+      logger.error({ err, userId }, 'POST /settings/managers/reorder failed');
+      return res.status(500).json({ error: 'Failed to reorder managers' });
+    }
+  });
+
+  /**
+   * PATCH /settings/managers/:id
+   * Body: partial manager fields.
+   * Returns 404 when the row doesn't exist or belongs to another tenant.
+   */
+  router.patch('/settings/managers/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = ManagerPatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    // Build update payload from only the provided fields
+    const patch = {};
+    if (parsed.data.name        !== undefined) patch.name        = parsed.data.name;
+    if (parsed.data.email       !== undefined) patch.email       = parsed.data.email || null;
+    if (parsed.data.phone       !== undefined) patch.phone       = parsed.data.phone || null;
+    if (parsed.data.session_ids !== undefined) patch.session_ids = parsed.data.session_ids;
+    if (parsed.data.is_active   !== undefined) patch.is_active   = parsed.data.is_active;
+    if (parsed.data.notes       !== undefined) patch.notes       = parsed.data.notes || null;
+
+    try {
+      const { data, error } = await db
+        .from('managers')
+        .update(patch)
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select()
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) {
+        return res.status(404).json({ error: 'Manager not found or access denied' });
+      }
+      return res.json(data);
+    } catch (err) {
+      logger.error({ err, userId, managerId: id }, 'PATCH /settings/managers/:id failed');
+      return res.status(500).json({ error: 'Failed to update manager' });
+    }
+  });
+
+  /**
+   * DELETE /settings/managers/:id
+   */
+  router.delete('/settings/managers/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      const { data, error } = await db
+        .from('managers')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select('id')
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) {
+        return res.status(404).json({ error: 'Manager not found or access denied' });
+      }
+      return res.json({ deleted: true });
+    } catch (err) {
+      logger.error({ err, userId, managerId: id }, 'DELETE /settings/managers/:id failed');
+      return res.status(500).json({ error: 'Failed to delete manager' });
+    }
+  });
+
+  // ==========================================================================
+  // Settings: message_templates
+  // ==========================================================================
+
+  /**
+   * GET /settings/templates
+   * Query: ?category=<category>  (optional filter)
+   * Returns templates sorted by sort_order ASC, created_at ASC.
+   */
+  router.get('/settings/templates', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+    const { category } = req.query;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      let query = db
+        .from('message_templates')
+        .select('*')
+        .eq('user_id', userId)
+        .order('sort_order', { ascending: true })
+        .order('created_at', { ascending: true });
+
+      if (category && typeof category === 'string') {
+        query = query.eq('category', category.trim());
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data ?? []);
+    } catch (err) {
+      logger.error({ err, userId }, 'GET /settings/templates failed');
+      return res.status(500).json({ error: 'Failed to fetch templates' });
+    }
+  });
+
+  /**
+   * POST /settings/templates
+   * Body: { title, body, category? }
+   */
+  router.post('/settings/templates', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = TemplateCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      const { data: maxRow } = await db
+        .from('message_templates')
+        .select('sort_order')
+        .eq('user_id', userId)
+        .order('sort_order', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const sortOrder = maxRow ? maxRow.sort_order + 1 : 0;
+
+      const { data, error } = await db
+        .from('message_templates')
+        .insert({
+          user_id:    userId,
+          title:      parsed.data.title,
+          body:       parsed.data.body,
+          category:   parsed.data.category ?? 'general',
+          sort_order: sortOrder,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      return res.status(201).json(data);
+    } catch (err) {
+      logger.error({ err, userId }, 'POST /settings/templates failed');
+      return res.status(500).json({ error: 'Failed to create template' });
+    }
+  });
+
+  /**
+   * POST /settings/templates/reorder
+   * Body: { ids: [uuid, ...] }
+   * Must be registered BEFORE PATCH /:id.
+   */
+  router.post('/settings/templates/reorder', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = ReorderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      await Promise.all(
+        parsed.data.ids.map((id, idx) =>
+          db
+            .from('message_templates')
+            .update({ sort_order: idx })
+            .eq('id', id)
+            .eq('user_id', userId)
+        )
+      );
+      return res.json({ reordered: parsed.data.ids.length });
+    } catch (err) {
+      logger.error({ err, userId }, 'POST /settings/templates/reorder failed');
+      return res.status(500).json({ error: 'Failed to reorder templates' });
+    }
+  });
+
+  /**
+   * PATCH /settings/templates/:id
+   * Body: partial template fields.
+   */
+  router.patch('/settings/templates/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = TemplatePatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    const patch = {};
+    if (parsed.data.title    !== undefined) patch.title    = parsed.data.title;
+    if (parsed.data.body     !== undefined) patch.body     = parsed.data.body;
+    if (parsed.data.category !== undefined) patch.category = parsed.data.category;
+
+    try {
+      const { data, error } = await db
+        .from('message_templates')
+        .update(patch)
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select()
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) {
+        return res.status(404).json({ error: 'Template not found or access denied' });
+      }
+      return res.json(data);
+    } catch (err) {
+      logger.error({ err, userId, templateId: id }, 'PATCH /settings/templates/:id failed');
+      return res.status(500).json({ error: 'Failed to update template' });
+    }
+  });
+
+  /**
+   * DELETE /settings/templates/:id
+   */
+  router.delete('/settings/templates/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      const { data, error } = await db
+        .from('message_templates')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select('id')
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) {
+        return res.status(404).json({ error: 'Template not found or access denied' });
+      }
+      return res.json({ deleted: true });
+    } catch (err) {
+      logger.error({ err, userId, templateId: id }, 'DELETE /settings/templates/:id failed');
+      return res.status(500).json({ error: 'Failed to delete template' });
+    }
+  });
+
+  // ==========================================================================
+  // WhatsApp profile management via Baileys
+  // ==========================================================================
+
+  /**
+   * Helper: resolve and validate a WhatsApp session sock for profile endpoints.
+   * Returns { sock } on success, or calls res.status(4xx/503).json() and returns null.
+   *
+   * Ownership check: we verify via session_config that this session_id belongs to
+   * the authenticated user. RLS on session_config enforces this when using db
+   * (req.userClient). If the row isn't visible through RLS, it's treated as 404.
+   */
+  async function resolveProfileSession(req, res, sessionId) {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      res.status(401).json({ error: 'User identity required' });
+      return null;
+    }
+
+    // Ownership check via session_config (RLS enforces user_id scoping)
+    const { data: sessionCfg } = await db
+      .from('session_config')
+      .select('session_id')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    if (!sessionCfg) {
+      res.status(404).json({ error: 'Session not found or access denied' });
+      return null;
+    }
+
+    const sock = sessionManager.getSession(sessionId)?.sock;
+    if (!sock?.user) {
+      res.status(503).json({ error: 'WhatsApp session is not connected. Scan QR first.' });
+      return null;
+    }
+
+    return { sock, userId };
+  }
+
+  /**
+   * GET /sessions/:sessionId/profile
+   * Returns current WhatsApp profile: name, status text, photo URL.
+   */
+  router.get('/sessions/:sessionId/profile', async (req, res) => {
+    const { sessionId } = req.params;
+    const ctx = await resolveProfileSession(req, res, sessionId);
+    if (!ctx) return;
+    const { sock } = ctx;
+
+    try {
+      let status = null;
+      let photoUrl = null;
+
+      // Fetch status text — Baileys may throw if WA server is slow; treat as null
+      try {
+        const statusResult = await sock.fetchStatus(sock.user.id);
+        status = statusResult?.status ?? null;
+      } catch {
+        // Status unavailable — non-fatal
+      }
+
+      // Fetch profile photo URL — null when no photo is set
+      try {
+        photoUrl = await sock.profilePictureUrl(sock.user.id, 'image');
+      } catch {
+        // No photo set or WA server error — non-fatal
+      }
+
+      return res.json({
+        name:     sock.user?.name ?? null,
+        status,
+        photoUrl,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, 'GET /sessions/:id/profile failed');
+      return res.status(500).json({ error: 'Failed to fetch WhatsApp profile' });
+    }
+  });
+
+  /**
+   * PUT /sessions/:sessionId/profile/name
+   * Body: { name: string }  — max 25 characters (WhatsApp hard limit).
+   * Rate-limited: 1 update per hour per session.
+   */
+  router.put('/sessions/:sessionId/profile/name', async (req, res) => {
+    const { sessionId } = req.params;
+    const ctx = await resolveProfileSession(req, res, sessionId);
+    if (!ctx) return;
+    const { sock, userId } = ctx;
+
+    const name = req.body?.name;
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    if (name.trim().length > 25) {
+      return res.status(400).json({ error: 'name must be 25 characters or fewer (WhatsApp limit)' });
+    }
+
+    const limited = checkProfileRateLimit(userId, sessionId, 'name');
+    if (limited) {
+      res.setHeader('Retry-After', limited.retryAfterSeconds);
+      return res.status(429).json({
+        error: 'Слишком частое обновление. Попробуйте через час.',
+        retryAfterSeconds: limited.retryAfterSeconds,
+      });
+    }
+
+    try {
+      await sock.updateProfileName(name.trim());
+      markProfileUpdated(userId, sessionId, 'name');
+      return res.json({ success: true, name: name.trim() });
+    } catch (err) {
+      logger.error({ err, sessionId }, 'PUT /sessions/:id/profile/name failed');
+      return res.status(500).json({ error: 'Failed to update WhatsApp profile name' });
+    }
+  });
+
+  /**
+   * PUT /sessions/:sessionId/profile/status
+   * Body: { status: string }  — max 139 characters (WhatsApp hard limit).
+   * Rate-limited: 1 update per hour per session.
+   */
+  router.put('/sessions/:sessionId/profile/status', async (req, res) => {
+    const { sessionId } = req.params;
+    const ctx = await resolveProfileSession(req, res, sessionId);
+    if (!ctx) return;
+    const { sock, userId } = ctx;
+
+    const status = req.body?.status;
+    if (typeof status !== 'string') {
+      return res.status(400).json({ error: 'status is required' });
+    }
+    if (status.length > 139) {
+      return res.status(400).json({ error: 'status must be 139 characters or fewer (WhatsApp limit)' });
+    }
+
+    const limited = checkProfileRateLimit(userId, sessionId, 'status');
+    if (limited) {
+      res.setHeader('Retry-After', limited.retryAfterSeconds);
+      return res.status(429).json({
+        error: 'Слишком частое обновление. Попробуйте через час.',
+        retryAfterSeconds: limited.retryAfterSeconds,
+      });
+    }
+
+    try {
+      await sock.updateProfileStatus(status);
+      markProfileUpdated(userId, sessionId, 'status');
+      return res.json({ success: true, status });
+    } catch (err) {
+      logger.error({ err, sessionId }, 'PUT /sessions/:id/profile/status failed');
+      return res.status(500).json({ error: 'Failed to update WhatsApp profile status' });
+    }
+  });
+
+  /**
+   * PUT /sessions/:sessionId/profile/photo
+   * Body: { url: string }  — Cloudinary HTTPS URL.
+   * Downloads the image to a buffer, then calls sock.updateProfilePicture.
+   * Rate-limited: 1 update per hour per session.
+   */
+  router.put('/sessions/:sessionId/profile/photo', async (req, res) => {
+    const { sessionId } = req.params;
+    const ctx = await resolveProfileSession(req, res, sessionId);
+    if (!ctx) return;
+    const { sock, userId } = ctx;
+
+    const url = req.body?.url;
+    if (typeof url !== 'string' || !url.startsWith('https://')) {
+      return res.status(400).json({ error: 'url is required and must be a valid HTTPS URL' });
+    }
+
+    const limited = checkProfileRateLimit(userId, sessionId, 'photo');
+    if (limited) {
+      res.setHeader('Retry-After', limited.retryAfterSeconds);
+      return res.status(429).json({
+        error: 'Слишком частое обновление. Попробуйте через час.',
+        retryAfterSeconds: limited.retryAfterSeconds,
+      });
+    }
+
+    try {
+      // Fetch the image from Cloudinary into a buffer
+      const { default: fetch } = await import('node-fetch');
+      const imageRes = await fetch(url, { timeout: 15_000 });
+      if (!imageRes.ok) {
+        return res.status(400).json({ error: `Failed to fetch image from URL (HTTP ${imageRes.status})` });
+      }
+      const buffer = Buffer.from(await imageRes.arrayBuffer());
+
+      await sock.updateProfilePicture(sock.user.id, buffer);
+      markProfileUpdated(userId, sessionId, 'photo');
+      return res.json({ success: true });
+    } catch (err) {
+      logger.error({ err, sessionId, url }, 'PUT /sessions/:id/profile/photo failed');
+      return res.status(500).json({ error: 'Failed to update WhatsApp profile photo' });
+    }
+  });
+
+  /**
+   * DELETE /sessions/:sessionId/profile/photo
+   * Removes the current WhatsApp profile photo.
+   * Rate-limited: 1 update per hour per session.
+   */
+  router.delete('/sessions/:sessionId/profile/photo', async (req, res) => {
+    const { sessionId } = req.params;
+    const ctx = await resolveProfileSession(req, res, sessionId);
+    if (!ctx) return;
+    const { sock, userId } = ctx;
+
+    const limited = checkProfileRateLimit(userId, sessionId, 'photo');
+    if (limited) {
+      res.setHeader('Retry-After', limited.retryAfterSeconds);
+      return res.status(429).json({
+        error: 'Слишком частое обновление. Попробуйте через час.',
+        retryAfterSeconds: limited.retryAfterSeconds,
+      });
+    }
+
+    try {
+      await sock.removeProfilePicture(sock.user.id);
+      markProfileUpdated(userId, sessionId, 'photo');
+      return res.json({ success: true });
+    } catch (err) {
+      logger.error({ err, sessionId }, 'DELETE /sessions/:id/profile/photo failed');
+      return res.status(500).json({ error: 'Failed to remove WhatsApp profile photo' });
     }
   });
 
