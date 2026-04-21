@@ -415,7 +415,7 @@ export function setupRoutes(app) {
     // '__service__' is the safe fallback — it keeps service-scope results isolated from
     // user-scoped RLS-filtered results. Never use 'anon' here as that would merge unknown
     // callers into a single bucket with their own bleed risk.
-    const userId = req.user?.id ?? '__service__';
+    const userId = req.user?.userId ?? '__service__';
     const cacheKey = makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days, userId);
     const cached = getAnalyticsCache(cacheKey);
     if (cached) {
@@ -1320,7 +1320,7 @@ export function setupRoutes(app) {
     const offset = Number(req.query.offset) || 0;
     const db = req.userClient ?? supabase;
     try {
-      const allChats = await getChatsWithLastMessage(sessionId, db, req.user?.id ?? '__service__');
+      const allChats = await getChatsWithLastMessage(sessionId, db, req.user?.userId ?? '__service__');
       const paginated = offset > 0 || limit < 2000
         ? allChats.slice(offset, offset + limit)
         : allChats;
@@ -1349,7 +1349,7 @@ export function setupRoutes(app) {
 
       // Fetch chats from all sessions in parallel (cached, 10s TTL)
       const allPromises = sessions.map(async (s) => {
-        const chats = await getChatsWithLastMessage(s.session_id, db, req.user?.id ?? '__service__');
+        const chats = await getChatsWithLastMessage(s.session_id, db, req.user?.userId ?? '__service__');
         return chats.map((chat) => ({
           ...chat,
           _sessionId: s.session_id,
@@ -3191,7 +3191,7 @@ export function setupRoutes(app) {
    */
   router.get('/settings/tenant', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
 
     if (!userId) {
       return res.status(401).json({ error: 'User identity required' });
@@ -3224,7 +3224,7 @@ export function setupRoutes(app) {
    */
   router.put('/settings/tenant', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
 
     if (!userId) {
       return res.status(401).json({ error: 'User identity required' });
@@ -3258,7 +3258,7 @@ export function setupRoutes(app) {
    */
   router.get('/funnel/stages', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
 
     if (!userId) {
       return res.status(401).json({ error: 'User identity required' });
@@ -3291,7 +3291,7 @@ export function setupRoutes(app) {
    */
   router.post('/funnel/stages', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
 
     if (!userId) {
       return res.status(401).json({ error: 'User identity required' });
@@ -3320,7 +3320,7 @@ export function setupRoutes(app) {
    */
   router.patch('/funnel/stages/:id', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
     const { id } = req.params;
 
     if (!userId) {
@@ -3351,7 +3351,7 @@ export function setupRoutes(app) {
    */
   router.delete('/funnel/stages/:id', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
     const { id } = req.params;
 
     if (!userId) {
@@ -3386,7 +3386,7 @@ export function setupRoutes(app) {
    */
   router.post('/funnel/stages/reorder', async (req, res) => {
     const db = req.userClient ?? supabase;
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
 
     if (!userId) {
       return res.status(401).json({ error: 'User identity required' });
