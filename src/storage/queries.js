@@ -618,9 +618,9 @@ export async function getCallsByChat(sessionId, remoteJid, { limit = 50, db = su
   }
 }
 
-export async function getMissedCallsCount(sessionId, remoteJid) {
+export async function getMissedCallsCount(sessionId, remoteJid, db = supabase) {
   try {
-    const { count, error } = await supabase
+    const { count, error } = await db
       .from('calls')
       .select('*', { count: 'exact', head: true })
       .eq('session_id', sessionId)
