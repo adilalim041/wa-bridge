@@ -35,11 +35,15 @@ export function startServer() {
     app.use(express.json({ limit: '10mb' }));
     app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-    const ALLOWED_ORIGINS = [
-        'https://wa-dashboard-blond.vercel.app',
-        'http://localhost:5173',
-        'http://localhost:3000',
-    ];
+    // CORS whitelist — production URLs come from ALLOWED_ORIGINS env (CSV).
+    // Localhost is always allowed for dev. Default fallback covers the Omoikiri
+    // dashboard so existing deploys don't break when the env var is unset.
+    const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://localhost:3000'];
+    const ENV_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://wa-dashboard-blond.vercel.app')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const ALLOWED_ORIGINS = [...new Set([...ENV_ORIGINS, ...DEFAULT_DEV_ORIGINS])];
 
     app.use((req, res, next) => {
         const origin = req.headers.origin;
