@@ -575,9 +575,9 @@ export async function upsertCall({
   }
 }
 
-export async function getCallsBySession(sessionId, { limit = 100, offset = 0 } = {}) {
+export async function getCallsBySession(sessionId, { limit = 100, offset = 0, db = supabase } = {}) {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('calls')
       .select('*')
       .eq('session_id', sessionId)

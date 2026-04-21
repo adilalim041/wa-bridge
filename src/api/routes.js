@@ -843,9 +843,10 @@ export function setupRoutes(app) {
     const { sessionId } = req.params;
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
     const offset = parseInt(req.query.offset, 10) || 0;
+    const db = req.userClient ?? supabase;
 
     try {
-      const calls = await getCallsBySession(sessionId, { limit, offset });
+      const calls = await getCallsBySession(sessionId, { limit, offset, db });
       return res.json({ calls: calls.map(formatCallRow) });
     } catch (err) {
       logger.error({ err, sessionId }, 'GET /sessions/:sessionId/calls failed');
