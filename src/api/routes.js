@@ -2954,13 +2954,14 @@ export function setupRoutes(app) {
    * Returns the audit journal of sent reports with resolved display names.
    */
   router.get('/reports', async (req, res) => {
+    const db = req.userClient ?? supabase;
     const sessionId = req.query.session_id || null;
     const dateFrom = req.query.date_from || null;
     const dateTo = req.query.date_to || null;
     const limit = Math.min(Number(req.query.limit) || 100, 500);
 
     try {
-      const rows = await listManagerReports({ sessionId, dateFrom, dateTo, limit });
+      const rows = await listManagerReports({ sessionId, dateFrom, dateTo, limit, db });
 
       // Resolve session display names for target and sender
       const allSessionIds = [...new Set([
@@ -2970,7 +2971,7 @@ export function setupRoutes(app) {
 
       let sessionNameMap = {};
       if (allSessionIds.length > 0) {
-        const { data: configs } = await supabase
+        const { data: configs } = await db
           .from('session_config')
           .select('session_id, display_name')
           .in('session_id', allSessionIds);
@@ -2983,7 +2984,7 @@ export function setupRoutes(app) {
       const clientJids = [...new Set(rows.map((r) => r.client_remote_jid).filter(Boolean))];
       let clientNameMap = {};
       if (clientJids.length > 0) {
-        const { data: chats } = await supabase
+        const { data: chats } = await db
           .from('chats')
           .select('remote_jid, display_name')
           .in('remote_jid', clientJids);

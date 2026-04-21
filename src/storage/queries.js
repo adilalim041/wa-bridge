@@ -1010,11 +1010,11 @@ export async function insertManagerReport(row) {
  * @param {number} [opts.limit=100]   Max rows.
  * @returns {Promise<Array>}
  */
-export async function listManagerReports({ sessionId, dateFrom, dateTo, limit = 100 } = {}) {
+export async function listManagerReports({ sessionId, dateFrom, dateTo, limit = 100, db = supabase } = {}) {
   try {
     const safeLimit = Math.min(Number(limit) || 100, 500);
 
-    let query = supabase
+    let query = db
       .from('manager_reports')
       .select('*')
       .order('sent_at', { ascending: false })
