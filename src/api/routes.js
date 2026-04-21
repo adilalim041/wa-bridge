@@ -2838,6 +2838,10 @@ export function setupRoutes(app) {
       }
 
       // Idempotency: check for recent duplicate (within 60 seconds)
+      // SERVICE-ROLE INTENTIONAL: dedup must execute even if user JWT expired
+      // between PDF upload and the audit trail. Tightening RLS policy later
+      // (user_id = auth.uid()) would turn this into a silent-deny → duplicate
+      // reports sent. Global dedup is a system invariant, not per-user.
       const since60s = new Date(Date.now() - 60_000).toISOString();
       const { data: existingReport } = await supabase
         .from('manager_reports')
@@ -2892,6 +2896,10 @@ export function setupRoutes(app) {
       let pdfUrl;
       const safeFilename = filename.slice(0, 200).replace(/[^a-zA-Z0-9._-]/g, '_');
 
+      // SERVICE-ROLE INTENTIONAL: insertManagerReport, markChatAiReportSent below all use
+      // service_role client (imported at top of file). These are audit-trail writes that must
+      // succeed regardless of the caller's JWT state (expired, rotated, etc). Do NOT migrate
+      // these to userClient — a failed audit write would leave an untracked sent report.
       try {
         const uploadResult = await uploadReportPdf(pdfBase64, safeFilename);
         pdfUrl = uploadResult.url;
