@@ -289,7 +289,8 @@ export function setupRoutes(app) {
   router.get('/ai/analyze/dates', async (req, res) => {
     try {
       const sessionId = req.query.session_id || null;
-      let query = supabase
+      const db = req.userClient ?? supabase;
+      let query = db
         .from('chat_ai')
         .select('analysis_date')
         .not('analysis_date', 'is', null)
