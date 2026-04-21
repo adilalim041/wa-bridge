@@ -47,10 +47,8 @@ export const toolInputSchemas = {
   update_deal_stage: z.object({
     session_id: sessionIdField,
     remote_jid: remoteJidField,
-    deal_stage: z.enum([
-      'needs_review', 'first_contact', 'consultation', 'model_selection',
-      'price_negotiation', 'payment', 'delivery', 'completed', 'refused',
-    ]),
+    // deal_stage is tenant-defined — no hardcoded enum; soft limit 40 chars
+    deal_stage: z.string().min(1).max(40).transform((s) => s.trim()),
   }),
 
   update_tags: z.object({
@@ -95,10 +93,9 @@ export const DailyAnalysisSchema = z.object({
     'consultation', 'partnership', 'other',
   ]).catch('other'),
 
-  deal_stage: z.enum([
-    'needs_review', 'first_contact', 'consultation', 'model_selection',
-    'price_negotiation', 'payment', 'delivery', 'completed', 'refused',
-  ]).catch('needs_review'),
+  // TODO dynamic stages per tenant — prompt is hardcoded with 9 Omoikiri stages,
+  // backend no longer whitelists. .catch() keeps fallback for malformed AI output.
+  deal_stage: z.string().min(1).max(40).catch('needs_review'),
 
   sentiment: z.enum(['positive', 'neutral', 'negative', 'aggressive']).catch('neutral'),
 
@@ -134,10 +131,8 @@ export const DailyAnalysisSchema = z.object({
 export const ClassifyItemSchema = z.object({
   id: z.number(),
   customer_type: z.enum(CUSTOMER_TYPES),
-  deal_stage: z.enum([
-    'needs_review', 'first_contact', 'consultation', 'model_selection',
-    'price_negotiation', 'payment', 'delivery', 'completed', 'refused',
-  ]).optional(),
+  // Tenant-defined stage name; optional (classify may omit)
+  deal_stage: z.string().min(1).max(40).optional(),
 });
 
 export const ClassifyBatchSchema = z.array(ClassifyItemSchema);

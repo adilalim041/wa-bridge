@@ -208,7 +208,8 @@ const TOOLS = [
         },
         deal_stage: {
           type: 'string',
-          enum: ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused', 'needs_review'],
+          // NOTE: valid stages are tenant-defined. Use the stage names configured in the funnel settings.
+          // Common Omoikiri stages: needs_review, first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused
           description: 'New deal stage',
         },
       },
@@ -536,19 +537,20 @@ async function executeTool(name, input = {}) {
       }
 
       case 'update_deal_stage': {
-        const VALID_STAGES = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+        // TODO Q-3: load valid stages dynamically from funnel_stages for this user_id
+        // For now: no hardcoded whitelist — any string ≤40 chars is accepted.
         const sessionId = typeof input.session_id === 'string' && input.session_id.trim()
           ? input.session_id.trim()
           : 'omoikiri-main';
         const remoteJid = typeof input.remote_jid === 'string' ? input.remote_jid.trim() : '';
-        const dealStage = input.deal_stage;
+        const dealStage = typeof input.deal_stage === 'string' ? input.deal_stage.trim() : '';
 
         if (!remoteJid) {
           return JSON.stringify({ error: 'remote_jid is required' });
         }
 
-        if (!dealStage || !VALID_STAGES.includes(dealStage)) {
-          return JSON.stringify({ error: `Invalid deal_stage. Must be one of: ${VALID_STAGES.join(', ')}` });
+        if (!dealStage || dealStage.length > 40) {
+          return JSON.stringify({ error: 'deal_stage must be a non-empty string of up to 40 characters' });
         }
 
         // Find the latest chat_ai record

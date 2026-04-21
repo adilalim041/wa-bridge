@@ -59,10 +59,9 @@ function invalidateAnalyticsCache() {
 
 // Allowed values for validation
 const VALID_TEMPERATURES = new Set(['hot', 'warm', 'cold', 'dead']);
-const VALID_DEAL_STAGES = new Set([
-  'first_contact', 'consultation', 'model_selection', 'price_negotiation',
-  'payment', 'delivery', 'completed', 'refused', 'needs_review',
-]);
+// NOTE: deal_stage is no longer validated against a hardcoded whitelist.
+// Valid stages are tenant-defined in the funnel_stages table.
+// Soft validation (string, 1-40 chars) is applied at the handler level.
 const VALID_MANAGER_ISSUES = new Set([
   'slow_first_response', 'no_followup', 'poor_consultation', 'no_photos',
   'no_showroom_invite', 'no_upsell', 'rude_tone', 'formal_tone', 'no_alternative',
@@ -828,10 +827,27 @@ export function setupRoutes(app) {
         error: `lead_temperature must be one of: ${[...VALID_TEMPERATURES].join(', ')} or null`,
       });
     }
-    if ('deal_stage' in updates && updates.deal_stage !== null && !VALID_DEAL_STAGES.has(updates.deal_stage)) {
-      return res.status(400).json({
-        error: `deal_stage must be one of: ${[...VALID_DEAL_STAGES].join(', ')}`,
-      });
+    if ('deal_stage' in updates && updates.deal_stage !== null) {
+      const ds = updates.deal_stage;
+      if (typeof ds !== 'string' || ds.trim().length === 0 || ds.trim().length > 40) {
+        return res.status(400).json({ error: 'deal_stage must be a string of 1–40 characters' });
+      }
+      updates.deal_stage = ds.trim();
+      // Verify stage exists in the user's funnel configuration
+      const userId = req.user?.userId;
+      if (userId) {
+        const { data: stageRow } = await (req.userClient ?? supabase)
+          .from('funnel_stages')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('name', updates.deal_stage)
+          .maybeSingle();
+        if (!stageRow) {
+          return res.status(400).json({
+            error: `Стадия "${updates.deal_stage}" не существует в воронке. Сначала создайте её в Настройках.`,
+          });
+        }
+      }
     }
     if ('manager_issues' in updates) {
       if (!Array.isArray(updates.manager_issues)) {
@@ -2053,7 +2069,20 @@ export function setupRoutes(app) {
 
       // Get CRM contact info and chat display names
       const jids = [...latestByJid.keys()];
-      if (!jids.length) return res.json({ stages: {}, contacts: [] });
+      if (!jids.length) {
+        // Still need stages_meta even when there are no contacts
+        const userId = req.user?.userId;
+        let stages_meta = [];
+        if (userId) {
+          const { data: metaRows } = await db
+            .from('funnel_stages')
+            .select('id, name, color, sort_order, is_final')
+            .eq('user_id', userId)
+            .order('sort_order', { ascending: true });
+          stages_meta = metaRows || [];
+        }
+        return res.json({ stages: {}, contacts: [], stages_meta, total: 0 });
+      }
 
       // Fetch CRM data
       let crmQuery = db.from('contacts_crm').select('*');
@@ -2138,16 +2167,46 @@ export function setupRoutes(app) {
         });
       }
 
-      // Group by stage
-      const stages = {};
-      const STAGE_ORDER = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
-      for (const s of STAGE_ORDER) stages[s] = [];
-      for (const c of contacts) {
-        const stage = stages[c.dealStage] ? c.dealStage : 'needs_review';
-        stages[stage].push(c);
+      // Load tenant funnel stages for metadata
+      const userId = req.user?.userId;
+      let stages_meta = [];
+      if (userId) {
+        const { data: metaRows } = await db
+          .from('funnel_stages')
+          .select('id, name, color, sort_order, is_final')
+          .eq('user_id', userId)
+          .order('sort_order', { ascending: true });
+        stages_meta = metaRows || [];
       }
 
-      return res.json({ stages, total: contacts.length });
+      // Build a set of known stage names for grouping
+      const knownStageNames = new Set(stages_meta.map((s) => s.name));
+
+      // Group by stage; unknown stages fall into __unknown bucket
+      const stages = {};
+      for (const s of stages_meta) stages[s.name] = [];
+      stages['__unknown'] = [];
+
+      for (const c of contacts) {
+        if (knownStageNames.has(c.dealStage)) {
+          stages[c.dealStage].push(c);
+        } else {
+          stages['__unknown'].push(c);
+        }
+      }
+
+      // Append virtual __unknown entry to stages_meta if bucket has items
+      if (stages['__unknown'].length > 0) {
+        stages_meta = [
+          ...stages_meta,
+          { id: '__unknown', name: 'Без стадии', color: '#64748b', sort_order: 999, is_final: false },
+        ];
+      } else {
+        // Remove empty __unknown bucket from response
+        delete stages['__unknown'];
+      }
+
+      return res.json({ stages, stages_meta, total: contacts.length });
     } catch (error) {
       logger.error({ err: error }, 'Failed to fetch CRM funnel');
       return res.status(500).json({ error: 'Failed to fetch funnel data' });
@@ -2157,11 +2216,14 @@ export function setupRoutes(app) {
   // Update deal stage manually
   router.post('/crm/deal-stage', async (req, res) => {
     const { sessionId, remoteJid, dealStage } = req.body || {};
-    const VALID_STAGES = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
 
-    if (!sessionId || !remoteJid || !VALID_STAGES.includes(dealStage)) {
-      return res.status(400).json({ error: 'sessionId, remoteJid, and valid dealStage required' });
+    if (!sessionId || !remoteJid) {
+      return res.status(400).json({ error: 'sessionId and remoteJid are required' });
     }
+    if (!dealStage || typeof dealStage !== 'string' || dealStage.trim().length === 0 || dealStage.trim().length > 40) {
+      return res.status(400).json({ error: 'dealStage must be a non-empty string of up to 40 characters' });
+    }
+    const normalizedStage = dealStage.trim();
 
     const db = req.userClient ?? supabase;
     try {
@@ -2177,7 +2239,7 @@ export function setupRoutes(app) {
 
       if (latest) {
         await db.from('chat_ai').update({
-          deal_stage: dealStage,
+          deal_stage: normalizedStage,
           stage_source: 'manual',
           stage_changed_at: new Date().toISOString(),
         }).eq('id', latest.id);
@@ -2186,7 +2248,7 @@ export function setupRoutes(app) {
         await db.from('chat_ai').insert({
           session_id: sessionId,
           remote_jid: remoteJid,
-          deal_stage: dealStage,
+          deal_stage: normalizedStage,
           analysis_date: new Date().toISOString().slice(0, 10),
           customer_type: 'unknown',
           stage_source: 'manual',
@@ -2194,7 +2256,7 @@ export function setupRoutes(app) {
         });
       }
 
-      return res.json({ success: true });
+      return res.json({ success: true, dealStage: normalizedStage });
     } catch (error) {
       logger.error({ err: error }, 'Failed to update deal stage');
       return res.status(500).json({ error: 'Failed to update deal stage' });

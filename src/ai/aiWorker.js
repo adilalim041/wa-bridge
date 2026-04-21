@@ -19,7 +19,9 @@ const MAX_CONTEXT_MESSAGES = 30;  // messages from target day
 const PREV_DAY_CONTEXT = 10;      // extra messages from before target day for context
 const DAILY_ANALYSIS_HOUR = Number(process.env.DAILY_ANALYSIS_HOUR || 23); // 23:00 default
 
-const VALID_STAGES = ['needs_review', 'first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused'];
+// TODO dynamic stages per tenant — prompt hardcoded with 9 Omoikiri stages,
+// backend no longer whitelists. AI can write any string; funnel_stages is source of truth.
+const VALID_STAGES = null; // no longer used — kept as tombstone to avoid ReferenceError on deploy
 
 // Escape XML special chars so message content cannot break tag structure
 function escapeXml(str) {
@@ -894,7 +896,7 @@ export async function classifyUntaggedChats() {
               classified++;
 
               // Update deal_stage in chat_ai if classification returned one
-              if (r.deal_stage && VALID_STAGES.includes(r.deal_stage)) {
+              if (r.deal_stage && typeof r.deal_stage === 'string' && r.deal_stage.trim().length > 0) {
                 try {
                   const { data: latest } = await supabase
                     .from('chat_ai')
@@ -1169,7 +1171,7 @@ export async function reclassifyStuckContacts() {
         if (Array.isArray(results)) {
           for (const r of results) {
             const idx = (r.id || 1) - 1;
-            if (idx >= 0 && idx < batch.length && r.deal_stage && VALID_STAGES.includes(r.deal_stage)) {
+            if (idx >= 0 && idx < batch.length && r.deal_stage && typeof r.deal_stage === 'string' && r.deal_stage.trim().length > 0) {
               const item = batch[idx].row;
               // Only update if the new stage is different from first_contact
               if (r.deal_stage !== 'first_contact') {
