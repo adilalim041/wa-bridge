@@ -708,14 +708,14 @@ export async function getCallsKpi(days = 7) {
   }
 }
 
-export async function getUnifiedMessages(remoteJid, limit = 50, offset = 0) {
+export async function getUnifiedMessages(remoteJid, limit = 50, offset = 0, db = supabase) {
   // Reject LID/group jids
   const digits = (remoteJid || '').replace(/@.*$/, '').replace(/\D/g, '');
   if (!remoteJid || digits.length > 13 || remoteJid.includes('@g.us') || remoteJid.includes('@lid')) {
     return [];
   }
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('messages')
       .select('*')
       .eq('remote_jid', remoteJid)

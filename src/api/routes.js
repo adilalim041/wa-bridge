@@ -1565,11 +1565,12 @@ export function setupRoutes(app) {
 
   // Cross-session: get unified messages from ALL sessions for one contact
   router.get('/contacts/:phone/unified-messages', async (req, res) => {
+    const db = req.userClient ?? supabase;
     const phone = normalizeChatId(req.params.phone);
     const limit = Number.parseInt(req.query.limit, 10) || 50;
     const offset = Number.parseInt(req.query.offset, 10) || 0;
     try {
-      const messages = await getUnifiedMessages(phone, limit, offset);
+      const messages = await getUnifiedMessages(phone, limit, offset, db);
       return res.json(messages);
     } catch (error) {
       logger.error({ err: error, phone }, 'Failed to fetch unified messages');
