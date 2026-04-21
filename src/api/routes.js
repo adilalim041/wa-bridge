@@ -1087,8 +1087,9 @@ export function setupRoutes(app) {
     });
   });
 
-  router.get('/sessions', async (_req, res) => {
-    const { data: configs, error } = await supabase
+  router.get('/sessions', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const { data: configs, error } = await db
       .from('session_config')
       .select('*')
       .order('created_at', { ascending: true });
