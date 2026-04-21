@@ -2170,11 +2170,12 @@ export function setupRoutes(app) {
 
   router.get('/tasks', async (req, res) => {
     try {
+      const db = req.userClient ?? supabase;
       const { session_id, status, remote_jid, limit, offset } = req.query;
       const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
       const safeOffset = Math.max(Number(offset) || 0, 0);
 
-      let query = supabase
+      let query = db
         .from('tasks')
         .select('*')
         .order('due_date', { ascending: true })
@@ -2200,8 +2201,8 @@ export function setupRoutes(app) {
       const contactMap = new Map();
       if (jids.length) {
         const [{ data: contacts }, { data: chats }] = await Promise.all([
-          supabase.from('contacts_crm').select('remote_jid, first_name, last_name, company').in('remote_jid', jids),
-          supabase.from('chats').select('remote_jid, display_name').in('remote_jid', jids),
+          db.from('contacts_crm').select('remote_jid, first_name, last_name, company').in('remote_jid', jids),
+          db.from('chats').select('remote_jid, display_name').in('remote_jid', jids),
         ]);
         for (const c of contacts || []) {
           contactMap.set(c.remote_jid, c);
