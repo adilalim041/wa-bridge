@@ -1917,8 +1917,9 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone is required' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
-      const { error } = await supabase
+      const { error } = await db
         .from('contacts_crm')
         .delete()
         .eq('session_id', sessionId)
