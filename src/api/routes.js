@@ -878,9 +878,10 @@ export function setupRoutes(app) {
    */
   router.get('/analytics/calls-kpi', async (req, res) => {
     const days = Math.min(parseInt(req.query.days, 10) || 7, 90);
+    const db = req.userClient ?? supabase;
 
     try {
-      const kpi = await getCallsKpi(days);
+      const kpi = await getCallsKpi(days, db);
       if (!kpi) {
         return res.status(500).json({ error: 'Failed to compute calls KPI' });
       }

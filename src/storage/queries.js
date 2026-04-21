@@ -639,11 +639,11 @@ export async function getMissedCallsCount(sessionId, remoteJid, db = supabase) {
   }
 }
 
-export async function getCallsKpi(days = 7) {
+export async function getCallsKpi(days = 7, db = supabase) {
   try {
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('calls')
       .select('session_id, status, missed, duration_sec, from_me')
       .gte('offered_at', since);
