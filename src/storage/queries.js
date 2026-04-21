@@ -763,18 +763,19 @@ export async function getContacts(sessionId, db = supabase) {
 
 // In-memory cache for getChatsWithLastMessage — 10s TTL, reduces DB load at 8 sessions
 // Cache key is composite: `${sessionId}::${userId}` where userId is:
-//   - '__service__' when called with serviceClient (internal workers, admin endpoints)
-//   - req.user.id (Supabase auth UID) when called with userClient (dashboard requests)
-//   - 'anon' when userId not provided (backward-compat, not used in authenticated paths)
+//   - '__service__' for x-api-key / worker paths (no req.user — passed explicitly from handler)
+//   - req.user.id (Supabase auth UID) for dashboard JWT requests (passed explicitly from handler)
+// userId is passed explicitly from the handler, NOT inferred via identity check (db === supabase).
 // This prevents cross-tenant cache bleed: service_role rows must NOT be served to
 // a lower-privilege user client that goes through RLS.
+// Pattern mirrors analyticsCache fix (commit acb5943, audit HIGH #4).
 const chatsCache = new Map(); // `${sessionId}::${userId}` -> { data, timestamp }
 const CHATS_CACHE_TTL = 10_000; // 10 seconds
 
 export async function getChatsWithLastMessage(sessionId, db = supabase, userId = null) {
   // W1.1 Phase 2: thread dbClient through all Supabase calls
-  // W1.1 audit fix: composite cache key prevents service_role data bleeding into user-scoped reads
-  const cacheUserId = db === supabase ? '__service__' : (userId ?? 'anon');
+  // W1.1 Phase 3 P-2: userId passed explicitly from handler — no db===supabase identity check
+  const cacheUserId = userId ?? '__service__';
   const cacheKey = `${sessionId}::${cacheUserId}`;
   const cached = chatsCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CHATS_CACHE_TTL) {

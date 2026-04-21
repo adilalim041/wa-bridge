@@ -1255,7 +1255,7 @@ export function setupRoutes(app) {
     const offset = Number(req.query.offset) || 0;
     const db = req.userClient ?? supabase;
     try {
-      const allChats = await getChatsWithLastMessage(sessionId, db, req.user?.id ?? null);
+      const allChats = await getChatsWithLastMessage(sessionId, db, req.user?.id ?? '__service__');
       const paginated = offset > 0 || limit < 2000
         ? allChats.slice(offset, offset + limit)
         : allChats;
@@ -1284,7 +1284,7 @@ export function setupRoutes(app) {
 
       // Fetch chats from all sessions in parallel (cached, 10s TTL)
       const allPromises = sessions.map(async (s) => {
-        const chats = await getChatsWithLastMessage(s.session_id, db, req.user?.id ?? null);
+        const chats = await getChatsWithLastMessage(s.session_id, db, req.user?.id ?? '__service__');
         return chats.map((chat) => ({
           ...chat,
           _sessionId: s.session_id,
