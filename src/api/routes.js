@@ -2335,13 +2335,14 @@ export function setupRoutes(app) {
   });
 
   router.delete('/tasks/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
     try {
       const { id } = req.params;
       const { session_id } = req.query;
 
       // If session_id provided, verify the task belongs to that session before deleting
       if (session_id) {
-        const { data: task, error: fetchErr } = await supabase
+        const { data: task, error: fetchErr } = await db
           .from('tasks')
           .select('id, session_id')
           .eq('id', id)
@@ -2353,7 +2354,7 @@ export function setupRoutes(app) {
         }
       }
 
-      const { error } = await supabase.from('tasks').delete().eq('id', id);
+      const { error } = await db.from('tasks').delete().eq('id', id);
       if (error) throw error;
       res.json({ success: true });
     } catch (error) {
