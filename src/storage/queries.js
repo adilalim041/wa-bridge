@@ -761,14 +761,21 @@ export async function getContacts(sessionId) {
 }
 
 // In-memory cache for getChatsWithLastMessage — 10s TTL, reduces DB load at 8 sessions
-// TODO(SaaS): multi-tenant caching must key on (sessionId, userId), not sessionId alone
-const chatsCache = new Map(); // sessionId -> { data, timestamp }
+// Cache key is composite: `${sessionId}::${userId}` where userId is:
+//   - '__service__' when called with serviceClient (internal workers, admin endpoints)
+//   - req.user.id (Supabase auth UID) when called with userClient (dashboard requests)
+//   - 'anon' when userId not provided (backward-compat, not used in authenticated paths)
+// This prevents cross-tenant cache bleed: service_role rows must NOT be served to
+// a lower-privilege user client that goes through RLS.
+const chatsCache = new Map(); // `${sessionId}::${userId}` -> { data, timestamp }
 const CHATS_CACHE_TTL = 10_000; // 10 seconds
 
-export async function getChatsWithLastMessage(sessionId, db = supabase) {
+export async function getChatsWithLastMessage(sessionId, db = supabase, userId = null) {
   // W1.1 Phase 2: thread dbClient through all Supabase calls
-  // Check cache first
-  const cached = chatsCache.get(sessionId);
+  // W1.1 audit fix: composite cache key prevents service_role data bleeding into user-scoped reads
+  const cacheUserId = db === supabase ? '__service__' : (userId ?? 'anon');
+  const cacheKey = `${sessionId}::${cacheUserId}`;
+  const cached = chatsCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CHATS_CACHE_TTL) {
     return cached.data;
   }
@@ -821,7 +828,7 @@ export async function getChatsWithLastMessage(sessionId, db = supabase) {
       await applyChatTagsOverlay(result, db);
       const elapsed = Date.now() - queryStart;
       if (elapsed > 2000) logger.warn({ sessionId, elapsed }, 'Slow getChatsWithLastMessage query');
-      chatsCache.set(sessionId, { data: result, timestamp: Date.now() });
+      chatsCache.set(cacheKey, { data: result, timestamp: Date.now() });
       return result;
     }
 
