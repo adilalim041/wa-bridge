@@ -4094,19 +4094,25 @@ export function setupRoutes(app) {
 
   /**
    * PUT /sessions/:sessionId/profile/photo
-   * Body: { url: string }  — Cloudinary HTTPS URL.
-   * Downloads the image to a buffer, then calls sock.updateProfilePicture.
-   * Rate-limited: 1 update per hour per session.
+   * Two modes:
+   *   1) multipart/form-data with field "photo" (file) — server uploads to Cloudinary
+   *      (signed, with WA-compliant 640x640 transform), then pushes to Baileys.
+   *   2) application/json with { url: "https://..." } — server fetches URL and pushes
+   *      to Baileys (legacy; kept for backward compat with existing API clients).
+   * Rate-limited: 1 update per hour per session (marked only on success).
    */
-  router.put('/sessions/:sessionId/profile/photo', async (req, res) => {
+  router.put('/sessions/:sessionId/profile/photo', upload.single('photo'), async (req, res) => {
     const { sessionId } = req.params;
     const ctx = await resolveProfileSession(req, res, sessionId);
     if (!ctx) return;
     const { sock, userId } = ctx;
 
-    const url = req.body?.url;
-    if (typeof url !== 'string' || !url.startsWith('https://')) {
-      return res.status(400).json({ error: 'url is required and must be a valid HTTPS URL' });
+    const hasFile = !!req.file;
+    const bodyUrl = req.body?.url;
+    const hasUrl = typeof bodyUrl === 'string' && bodyUrl.startsWith('https://');
+
+    if (!hasFile && !hasUrl) {
+      return res.status(400).json({ error: 'Either multipart "photo" file or body.url (HTTPS) is required' });
     }
 
     const limited = checkProfileRateLimit(userId, sessionId, 'photo');
@@ -4118,20 +4124,52 @@ export function setupRoutes(app) {
       });
     }
 
-    try {
-      // Fetch the image from Cloudinary into a buffer
-      const { default: fetch } = await import('node-fetch');
-      const imageRes = await fetch(url, { timeout: 15_000 });
-      if (!imageRes.ok) {
-        return res.status(400).json({ error: `Failed to fetch image from URL (HTTP ${imageRes.status})` });
-      }
-      const buffer = Buffer.from(await imageRes.arrayBuffer());
+    let photoUrl = null;
+    let buffer = null;
 
+    try {
+      if (hasFile) {
+        // Server-side signed upload to Cloudinary (no public unsigned preset required).
+        const result = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              folder: 'omoikiri_crm/wa_profile',
+              public_id: `${userId}_${sessionId}`,
+              overwrite: true,
+              transformation: [
+                { width: 640, height: 640, crop: 'fill', gravity: 'face' },
+                { quality: 'auto', fetch_format: 'jpg' },
+              ],
+            },
+            (err, r) => (err ? reject(err) : resolve(r))
+          );
+          stream.end(req.file.buffer);
+        });
+        photoUrl = result?.secure_url || null;
+        if (!photoUrl) {
+          return res.status(500).json({ error: 'Cloudinary upload failed' });
+        }
+      } else {
+        photoUrl = bodyUrl;
+      }
+
+      const { default: fetch } = await import('node-fetch');
+      const imageRes = await fetch(photoUrl, { timeout: 15_000 });
+      if (!imageRes.ok) {
+        return res.status(400).json({ error: `Failed to fetch image (HTTP ${imageRes.status})` });
+      }
+      buffer = Buffer.from(await imageRes.arrayBuffer());
+    } catch (err) {
+      logger.error({ err, sessionId }, 'PUT /sessions/:id/profile/photo: upload/fetch failed');
+      return res.status(500).json({ error: 'Failed to prepare profile photo' });
+    }
+
+    try {
       await sock.updateProfilePicture(sock.user.id, buffer);
       markProfileUpdated(userId, sessionId, 'photo');
-      return res.json({ success: true });
+      return res.json({ success: true, photoUrl });
     } catch (err) {
-      logger.error({ err, sessionId, url }, 'PUT /sessions/:id/profile/photo failed');
+      logger.error({ err, sessionId }, 'PUT /sessions/:id/profile/photo: Baileys update failed');
       return res.status(500).json({ error: 'Failed to update WhatsApp profile photo' });
     }
   });
