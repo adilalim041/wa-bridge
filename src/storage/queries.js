@@ -596,9 +596,9 @@ export async function getCallsBySession(sessionId, { limit = 100, offset = 0, db
   }
 }
 
-export async function getCallsByChat(sessionId, remoteJid, { limit = 50 } = {}) {
+export async function getCallsByChat(sessionId, remoteJid, { limit = 50, db = supabase } = {}) {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('calls')
       .select('*')
       .eq('session_id', sessionId)

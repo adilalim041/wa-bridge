@@ -861,9 +861,10 @@ export function setupRoutes(app) {
   router.get('/sessions/:sessionId/chats/:phone/calls', async (req, res) => {
     const { sessionId, phone } = req.params;
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const db = req.userClient ?? supabase;
 
     try {
-      const calls = await getCallsByChat(sessionId, phone, { limit });
+      const calls = await getCallsByChat(sessionId, phone, { limit, db });
       return res.json({ calls: calls.map(formatCallRow) });
     } catch (err) {
       logger.error({ err, sessionId, phone }, 'GET /sessions/:sessionId/chats/:phone/calls failed');
