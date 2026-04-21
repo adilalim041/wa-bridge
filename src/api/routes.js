@@ -2359,8 +2359,9 @@ export function setupRoutes(app) {
 
   router.get('/sessions/:sessionId/contacts', async (req, res) => {
     const { sessionId } = req.params;
+    const db = req.userClient ?? supabase;
     try {
-      const contacts = await getContacts(sessionId);
+      const contacts = await getContacts(sessionId, db);
       return res.json(contacts);
     } catch (error) {
       logger.error({ err: error, sessionId }, 'Failed to fetch contacts');

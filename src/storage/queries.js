@@ -734,9 +734,9 @@ export async function getUnifiedMessages(remoteJid, limit = 50, offset = 0, db =
   }
 }
 
-export async function getContacts(sessionId) {
+export async function getContacts(sessionId, db = supabase) {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('messages')
       .select('remote_jid, push_name, timestamp')
       .eq('session_id', sessionId)
