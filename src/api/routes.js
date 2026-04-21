@@ -2292,6 +2292,7 @@ export function setupRoutes(app) {
   });
 
   router.patch('/tasks/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
     try {
       const { id } = req.params;
       const updates = { ...req.body, updated_at: new Date().toISOString() };
@@ -2318,7 +2319,7 @@ export function setupRoutes(app) {
         return res.status(400).json({ error: 'Description must be under 2000 characters' });
       }
 
-      const { data, error } = await supabase
+      const { data, error } = await db
         .from('tasks')
         .update(sanitized)
         .eq('id', id)
