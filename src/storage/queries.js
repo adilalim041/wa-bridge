@@ -332,14 +332,14 @@ export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0, 
 }
 
 // Find all sessions where this contact exists
-export async function getLinkedSessions(remoteJid) {
+export async function getLinkedSessions(remoteJid, db = supabase) {
   try {
     const [chatsRes, tagsRes] = await Promise.all([
-      supabase
+      db
         .from('chats')
         .select('session_id, display_name, last_message_at')
         .eq('remote_jid', remoteJid),
-      getChatTags(remoteJid),
+      getChatTags(remoteJid, db),
     ]);
 
     if (chatsRes.error) {
@@ -352,7 +352,7 @@ export async function getLinkedSessions(remoteJid) {
 
     // Enrich with session display names
     const sessionIds = [...new Set(data.map((c) => c.session_id))];
-    const { data: configs } = await supabase
+    const { data: configs } = await db
       .from('session_config')
       .select('session_id, display_name')
       .in('session_id', sessionIds);
@@ -384,10 +384,10 @@ export async function getLinkedSessions(remoteJid) {
 // inherits the same tag. Backed by the `chat_tags` table (see
 // sql/wave7_enrichment.sql). Reads/writes here are session-agnostic.
 
-export async function getChatTags(remoteJid) {
+export async function getChatTags(remoteJid, db = supabase) {
   if (!remoteJid) return { tags: [], tagConfirmed: false };
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('chat_tags')
       .select('tags, tag_confirmed')
       .eq('remote_jid', remoteJid)

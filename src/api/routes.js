@@ -1552,9 +1552,10 @@ export function setupRoutes(app) {
 
   // Cross-session: find all sessions where this contact exists
   router.get('/contacts/:phone/linked-sessions', async (req, res) => {
+    const db = req.userClient ?? supabase;
     const phone = normalizeChatId(req.params.phone);
     try {
-      const sessions = await getLinkedSessions(phone);
+      const sessions = await getLinkedSessions(phone, db);
       return res.json(sessions);
     } catch (error) {
       logger.error({ err: error, phone }, 'Failed to fetch linked sessions');
