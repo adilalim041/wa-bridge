@@ -620,6 +620,8 @@ export function setupRoutes(app) {
     }
 
     try {
+      const db = req.userClient ?? supabase;
+
       // Build date range for analysis_date
       let sinceDateStr;
       if (date_from) {
@@ -630,7 +632,7 @@ export function setupRoutes(app) {
       }
 
       // Build chat_ai query
-      let aiQuery = supabase
+      let aiQuery = db
         .from('chat_ai')
         .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score, report_sent_at')
         .gte('analysis_date', sinceDateStr)
@@ -671,7 +673,7 @@ export function setupRoutes(app) {
       const sessionIds = [...new Set(aiRows.map((r) => r.session_id))];
 
       // Fetch chat metadata (display_name, last_message_at) — tags live in chat_tags now
-      const { data: chatsData } = await supabase
+      const { data: chatsData } = await db
         .from('chats')
         .select('session_id, remote_jid, display_name, last_message_at')
         .in('session_id', sessionIds);
@@ -683,10 +685,10 @@ export function setupRoutes(app) {
 
       // W7A: phone-level tags
       const uniqueJids = [...new Set(aiRows.map((r) => r.remote_jid))];
-      const tagsMap = await getChatTagsByJids(uniqueJids);
+      const tagsMap = await getChatTagsByJids(uniqueJids, db);
 
       // Fetch session display names
-      const { data: sessionsData } = await supabase
+      const { data: sessionsData } = await db
         .from('session_config')
         .select('session_id, display_name')
         .in('session_id', sessionIds);
