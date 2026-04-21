@@ -1450,7 +1450,8 @@ export function setupRoutes(app) {
       payload.tags = [tag];
     }
 
-    const ok = await upsertChatTags(remoteJid, payload);
+    const db = req.userClient ?? supabase;
+    const ok = await upsertChatTags(remoteJid, payload, db);
     if (!ok) {
       return res.status(500).json({ error: 'Failed to confirm tag' });
     }
