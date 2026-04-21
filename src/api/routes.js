@@ -1806,6 +1806,7 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'notes too long (max 5000 chars)' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
       const payload = {
         session_id: sessionId,
@@ -1828,7 +1829,7 @@ export function setupRoutes(app) {
         if (payload[key] === undefined) delete payload[key];
       }
 
-      const { data, error } = await supabase
+      const { data, error } = await db
         .from('contacts_crm')
         .upsert(payload, { onConflict: 'session_id,remote_jid' })
         .select()
