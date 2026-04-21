@@ -1449,8 +1449,10 @@ export function setupRoutes(app) {
         return res.status(400).json({ error: 'Query too long (max 200)' });
       }
 
+      const db = req.userClient ?? supabase;
+
       // Use ilike for case-insensitive partial match
-      let query = supabase
+      let query = db
         .from('messages')
         .select('message_id, session_id, remote_jid, body, from_me, message_type, timestamp, push_name')
         .ilike('body', `%${q}%`)
@@ -1475,7 +1477,7 @@ export function setupRoutes(app) {
 
       if (jids.length) {
         // CRM contacts
-        const { data: contacts } = await supabase
+        const { data: contacts } = await db
           .from('contacts_crm')
           .select('remote_jid, first_name, last_name')
           .in('remote_jid', jids);
@@ -1484,7 +1486,7 @@ export function setupRoutes(app) {
         }
 
         // Chat display names fallback
-        const { data: chats } = await supabase
+        const { data: chats } = await db
           .from('chats')
           .select('remote_jid, display_name')
           .in('remote_jid', jids);
@@ -1508,7 +1510,7 @@ export function setupRoutes(app) {
       }));
 
       // Count total matches (for "N results found" display)
-      let countQuery = supabase
+      let countQuery = db
         .from('messages')
         .select('message_id', { count: 'exact', head: true })
         .ilike('body', `%${q}%`)
