@@ -1422,7 +1422,8 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'phone and tags array are required' });
     }
 
-    const ok = await upsertChatTags(remoteJid, { tags: inputTags, tagConfirmed: true });
+    const db = req.userClient ?? supabase;
+    const ok = await upsertChatTags(remoteJid, { tags: inputTags, tagConfirmed: true }, db);
     if (!ok) {
       return res.status(500).json({ error: 'Failed to update tags' });
     }
