@@ -2482,6 +2482,7 @@ export function setupRoutes(app) {
   // ── Monthly report ────────────────────────────────────────────────────
   router.get('/reports/monthly', async (req, res) => {
     try {
+      const db = req.userClient ?? supabase;
       const { month } = req.query; // format: "2026-03"
       if (!month || !/^\d{4}-\d{2}$/.test(month)) {
         return res.status(400).json({ error: 'month parameter required (format: YYYY-MM)' });
@@ -2493,7 +2494,7 @@ export function setupRoutes(app) {
       const endDate = endMonth.toISOString().slice(0, 10);
 
       // 1. Total unique chats with messages this month (ordered desc so first per key = latest)
-      const { data: msgStats } = await supabase
+      const { data: msgStats } = await db
         .from('messages')
         .select('remote_jid, session_id, from_me')
         .gte('timestamp', startDate)
@@ -2509,7 +2510,7 @@ export function setupRoutes(app) {
       const fromManagers = (msgStats || []).filter(m => m.from_me).length;
 
       // 2. Tasks created this month
-      const { data: tasks } = await supabase
+      const { data: tasks } = await db
         .from('tasks')
         .select('id, status, task_type, created_by, completed_at')
         .gte('created_at', startDate)
@@ -2523,7 +2524,7 @@ export function setupRoutes(app) {
       };
 
       // 3. AI analysis results this month
-      const { data: analyses } = await supabase
+      const { data: analyses } = await db
         .from('chat_ai')
         .select('customer_type, lead_temperature, deal_stage, manager_issues')
         .gte('analysis_date', startDate)
