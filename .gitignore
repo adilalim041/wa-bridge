@@ -65,3 +65,8 @@ tests/red-team/results-*.json
 /_reclassify*.mjs
 /_verify*.mjs
 /_smoke*.mjs
+/_fetch*.mjs
+/_daily*.mjs
+/_daily_pending_*.json
+/_tmp_*/
+_tmp_msgs/

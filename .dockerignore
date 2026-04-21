@@ -1,5 +1,47 @@
 node_modules
-auth_state
-.env
 .git
+.github/
+.vscode/
+.claude/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+
+# WhatsApp auth state (mounted at runtime)
+auth_state/
+auth_info*/
+.wwebjs_auth/
+.wwebjs_cache/
+sessions/
+*.session
+tokens/
+
+# Ad-hoc diagnostic / analysis scripts — never in prod image
+_*.mjs
+_*.cjs
+_tmp_*/
+_tmp_msgs/
+tmp_*/
+
+# SQL migrations + tests + docs — runtime doesn't need these
+sql/
+tests/
+docs/
 *.md
+!README.md
+
+# Dashboard is deployed separately (Vercel)
+wa-dashboard/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large artifacts
+*.log
+logs/
