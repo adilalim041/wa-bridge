@@ -1918,7 +1918,8 @@ export function setupRoutes(app) {
     const { sessionId } = req.params;
 
     try {
-      let query = supabase
+      const db = req.userClient ?? supabase;
+      let query = db
         .from('contacts_crm')
         .select('*')
         .order('updated_at', { ascending: false });
