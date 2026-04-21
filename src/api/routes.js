@@ -2412,6 +2412,8 @@ export function setupRoutes(app) {
       return res.status(429).json({ error: 'Rate limit exceeded' });
     }
 
+    const db = req.userClient ?? supabase;
+
     try {
       const result = await sendWithDelay(sock, jid, { text: message });
       limiter.recordSend(jid);
@@ -2453,7 +2455,7 @@ export function setupRoutes(app) {
         try {
           const dialogSessionId = await getOrCreateDialogSession(sessionId, phone, now);
           if (dialogSessionId) {
-            await supabase
+            await db
               .from('messages')
               .update({ dialog_session_id: dialogSessionId })
               .eq('message_id', messageId)
