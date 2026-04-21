@@ -1607,8 +1607,9 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'remoteJid and messageIds are required' });
     }
 
+    const db = req.userClient ?? supabase;
     try {
-      const { data: rows, error: fetchError } = await supabase
+      const { data: rows, error: fetchError } = await db
         .from('messages')
         .select('message_id, sender, chat_type')
         .eq('session_id', sessionId)
@@ -1622,7 +1623,7 @@ export function setupRoutes(app) {
       }
 
       const readAt = new Date().toISOString();
-      const { error: updateError } = await supabase
+      const { error: updateError } = await db
         .from('messages')
         .update({ read_at: readAt })
         .eq('session_id', sessionId)
