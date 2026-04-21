@@ -1430,7 +1430,7 @@ export function setupRoutes(app) {
     if (!ok) {
       return res.status(500).json({ error: 'Failed to update tags' });
     }
-    const { tags, tagConfirmed } = await getChatTags(remoteJid);
+    const { tags, tagConfirmed } = await getChatTags(remoteJid, db);
     return res.json({ success: true, tags, tagConfirmed, sessionId });
   });
 
