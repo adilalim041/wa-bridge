@@ -1890,7 +1890,8 @@ export function setupRoutes(app) {
         return res.status(500).json({ error: 'Failed to upload avatar' });
       }
 
-      const { error } = await supabase
+      const db = req.userClient ?? supabase;
+      const { error } = await db
         .from('contacts_crm')
         .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
         .eq('session_id', sessionId)
