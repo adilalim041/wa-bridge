@@ -2421,6 +2421,12 @@ export function setupRoutes(app) {
       const messageId = result?.key?.id ?? `sent-${Date.now()}`;
 
       // Save sent message directly to Supabase — don't rely on messages.upsert event
+      // SERVICE-ROLE INTENTIONAL: saveMessage / upsertChat below run on service_role
+      // by design. Ingestion parity — these helpers are also called by the Baileys
+      // message-event handler (machine-to-machine, no req.user), so they must write
+      // through service_role regardless of the caller's auth mode. The inline
+      // messages.update for dialog_session_id at line ~2458 DOES go through `db`
+      // (user JWT path) because it's a user-facing correction, not an ingestion write.
       const now = new Date().toISOString();
       try {
         const { saveMessage, upsertChat } = await import('../storage/queries.js');
