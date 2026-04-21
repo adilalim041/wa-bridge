@@ -303,9 +303,10 @@ export async function saveContact(remoteJid, pushName) {
   }
 }
 
-export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0) {
+export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0, db = supabase) {
+  // W1.1 Phase 2: accept optional dbClient so RLS-filtered reads work via userClient
   try {
-    let query = supabase
+    let query = db
       .from('messages')
       .select('*')
       .eq('session_id', sessionId);

@@ -1536,7 +1536,8 @@ export function setupRoutes(app) {
     const offset = Number.parseInt(req.query.offset, 10) || 0;
 
     try {
-      const messages = await getMessages(sessionId, phone, limit, offset);
+      const db = req.userClient ?? supabase;
+      const messages = await getMessages(sessionId, phone, limit, offset, db);
       return res.json(messages);
     } catch (error) {
       logger.error({ err: error, sessionId, phone }, 'Failed to fetch messages');
