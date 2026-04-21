@@ -1952,8 +1952,10 @@ export function setupRoutes(app) {
   router.get('/crm/funnel', async (req, res) => {
     const sessionId = req.query.session_id;
     try {
+      const db = req.userClient ?? supabase;
+
       // Get latest deal_stage per remote_jid from chat_ai
-      let query = supabase
+      let query = db
         .from('chat_ai')
         .select('session_id, remote_jid, deal_stage, customer_type, lead_temperature, analysis_date, sentiment, stage_source')
         .order('analysis_date', { ascending: false });
@@ -1980,7 +1982,7 @@ export function setupRoutes(app) {
       if (!jids.length) return res.json({ stages: {}, contacts: [] });
 
       // Fetch CRM data
-      let crmQuery = supabase.from('contacts_crm').select('*');
+      let crmQuery = db.from('contacts_crm').select('*');
       if (sessionId && sessionId !== '__all__') {
         crmQuery = crmQuery.eq('session_id', sessionId);
       }
@@ -1991,13 +1993,13 @@ export function setupRoutes(app) {
       }
 
       // Fetch chat display names (tags now live in chat_tags — W7A)
-      let chatQuery = supabase.from('chats').select('session_id, remote_jid, display_name, last_message_body, last_message_timestamp');
+      let chatQuery = db.from('chats').select('session_id, remote_jid, display_name, last_message_body, last_message_timestamp');
       if (sessionId && sessionId !== '__all__') {
         chatQuery = chatQuery.eq('session_id', sessionId);
       }
       const [{ data: chatRows }, funnelTagsMap] = await Promise.all([
         chatQuery,
-        getChatTagsByJids(jids),
+        getChatTagsByJids(jids, db),
       ]);
       const chatMap = new Map();
       for (const c of chatRows || []) {
@@ -2015,7 +2017,7 @@ export function setupRoutes(app) {
         // Get latest push_name for each jid (from incoming messages)
         for (let i = 0; i < jidsNeedingName.length; i += 50) {
           const batch = jidsNeedingName.slice(i, i + 50);
-          const { data: msgs } = await supabase
+          const { data: msgs } = await db
             .from('messages')
             .select('remote_jid, push_name')
             .in('remote_jid', batch)
