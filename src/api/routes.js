@@ -2692,9 +2692,11 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'chatAiId is required' });
     }
 
+    const db = req.userClient ?? supabase;
+
     try {
       // 1. Load chat_ai record
-      const chatAi = await getChatAiById(chatAiId);
+      const chatAi = await getChatAiById(chatAiId, db);
       if (!chatAi) {
         return res.status(404).json({ error: 'chat_ai record not found' });
       }
@@ -2806,6 +2808,8 @@ export function setupRoutes(app) {
       return res.status(400).json({ error: 'pdfBase64 too large (max ~10MB)' });
     }
 
+    const db = req.userClient ?? supabase;
+
     try {
       // Load active sessions
       const activeSessions = await getActiveSessions();
@@ -2837,7 +2841,7 @@ export function setupRoutes(app) {
       }
 
       // Load chat_ai for dialog_session_id + remote_jid
-      const chatAi = await getChatAiById(chatAiId);
+      const chatAi = await getChatAiById(chatAiId, db);
       if (!chatAi) {
         return res.status(404).json({ error: 'chat_ai record not found' });
       }

@@ -1070,9 +1070,9 @@ export async function markChatAiReportSent(chatAiId, sentAt) {
  * @param {string} chatAiId
  * @returns {Promise<object|null>}
  */
-export async function getChatAiById(chatAiId) {
+export async function getChatAiById(chatAiId, db = supabase) {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('chat_ai')
       .select('*')
       .eq('id', chatAiId)
