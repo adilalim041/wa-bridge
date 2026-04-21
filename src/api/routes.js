@@ -11,7 +11,8 @@ import { invalidateHiddenCache } from '../baileys/messageHandler.js';
 import { sessionManager } from '../baileys/sessionManager.js';
 import { logger } from '../config.js';
 import { supabase } from '../storage/supabase.js';
-import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow, getChatTags, getChatTagsByJids, upsertChatTags, insertManagerReport, listManagerReports, markChatAiReportSent, getChatAiById, getActiveSessions } from '../storage/queries.js';
+import { getChatsWithLastMessage, getContacts, getMessages, getQueueStats, getLinkedSessions, getUnifiedMessages, getCallsBySession, getCallsByChat, getCallsKpi, formatCallRow, getChatTags, getChatTagsByJids, upsertChatTags, insertManagerReport, listManagerReports, markChatAiReportSent, getChatAiById, getActiveSessions, getTenantSettings, upsertTenantSettings, getFunnelStages, createFunnelStage, updateFunnelStage, deleteFunnelStage, reorderFunnelStages } from '../storage/queries.js';
+import { z } from 'zod';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 import { generateCoachingComment } from '../ai/coachingGenerator.js';
 import { uploadReportPdf } from '../reports/uploadPdfToCloudinary.js';
@@ -66,6 +67,51 @@ const VALID_MANAGER_ISSUES = new Set([
   'slow_first_response', 'no_followup', 'poor_consultation', 'no_photos',
   'no_showroom_invite', 'no_upsell', 'rude_tone', 'formal_tone', 'no_alternative',
 ]);
+
+// ---------------------------------------------------------------------------
+// Zod schemas for tenant_settings + funnel_stages endpoints
+// ---------------------------------------------------------------------------
+
+const labelArray = z
+  .array(z.string().min(1).max(30))
+  .max(30);
+
+const TenantSettingsPutSchema = z.object({
+  roles:  labelArray.optional(),
+  cities: labelArray.optional(),
+  tags:   labelArray.optional(),
+}).refine(
+  (body) => body.roles !== undefined || body.cities !== undefined || body.tags !== undefined,
+  { message: 'At least one field (roles, cities, tags) is required' }
+);
+
+const hexColorField = z
+  .string()
+  .regex(/^#[0-9a-fA-F]{6}$/, 'color must be a 6-digit hex value, e.g. #3b82f6');
+
+const FunnelStageCreateSchema = z.object({
+  name:     z.string().min(1).max(40),
+  color:    hexColorField.optional(),
+  is_final: z.boolean().optional(),
+});
+
+const FunnelStagePatchSchema = z.object({
+  name:     z.string().min(1).max(40).optional(),
+  color:    hexColorField.optional(),
+  is_final: z.boolean().optional(),
+}).refine(
+  (body) => body.name !== undefined || body.color !== undefined || body.is_final !== undefined,
+  { message: 'At least one field (name, color, is_final) is required' }
+);
+
+const FunnelStageReorderSchema = z.object({
+  order: z.array(z.string().uuid()).min(1).max(200),
+});
+
+/** Format Zod error issues into a human-readable message. */
+function zodErrorMessage(err) {
+  return err.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ');
+}
 
 const CYRILLIC_MAP = {
   а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh',
@@ -3069,6 +3115,235 @@ export function setupRoutes(app) {
     } catch (err) {
       logger.error({ err }, 'GET /reports failed');
       return res.status(500).json({ error: 'Failed to fetch reports' });
+    }
+  });
+
+  // ==========================================================================
+  // Settings: tenant_settings
+  // ==========================================================================
+
+  /**
+   * GET /settings/tenant
+   * Returns { roles, cities, tags } for the authenticated tenant.
+   * If no row exists yet, returns the schema defaults and does NOT insert.
+   */
+  router.get('/settings/tenant', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      let settings = await getTenantSettings(userId, db);
+
+      if (!settings) {
+        // First visit — return schema defaults without writing to DB.
+        // The first PUT will create the row.
+        settings = {
+          roles:  ['клиент', 'партнёр', 'менеджер', 'другое'],
+          cities: [],
+          tags:   [],
+        };
+      }
+
+      return res.json(settings);
+    } catch (err) {
+      logger.error({ err, userId }, 'GET /settings/tenant failed');
+      return res.status(500).json({ error: 'Failed to fetch tenant settings' });
+    }
+  });
+
+  /**
+   * PUT /settings/tenant
+   * Body: { roles?, cities?, tags? }  — partial update, merges with existing values.
+   * Upserts the row (INSERT on first call, UPDATE on subsequent calls).
+   */
+  router.put('/settings/tenant', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = TenantSettingsPutSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      const result = await upsertTenantSettings(userId, parsed.data, db);
+      if (!result) {
+        return res.status(500).json({ error: 'Failed to save tenant settings' });
+      }
+      return res.json(result);
+    } catch (err) {
+      logger.error({ err, userId }, 'PUT /settings/tenant failed');
+      return res.status(500).json({ error: 'Failed to save tenant settings' });
+    }
+  });
+
+  // ==========================================================================
+  // Funnel stages
+  // ==========================================================================
+
+  /**
+   * GET /funnel/stages
+   * Returns ordered list of funnel stages for the tenant.
+   * If no stages exist, seeds one default "Новый лид" stage and returns it.
+   */
+  router.get('/funnel/stages', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      let stages = await getFunnelStages(userId, db);
+
+      if (stages.length === 0) {
+        // Seed default stage for new tenants so UI is never blank
+        const defaultStage = await createFunnelStage(
+          userId,
+          { name: 'Новый лид', color: '#3b82f6', is_final: false },
+          db
+        );
+        stages = defaultStage ? [defaultStage] : [];
+      }
+
+      return res.json(stages);
+    } catch (err) {
+      logger.error({ err, userId }, 'GET /funnel/stages failed');
+      return res.status(500).json({ error: 'Failed to fetch funnel stages' });
+    }
+  });
+
+  /**
+   * POST /funnel/stages
+   * Body: { name, color?, is_final? }
+   * Appends a new stage at the end (sort_order = max + 1).
+   */
+  router.post('/funnel/stages', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = FunnelStageCreateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      const stage = await createFunnelStage(userId, parsed.data, db);
+      if (!stage) {
+        return res.status(500).json({ error: 'Failed to create funnel stage' });
+      }
+      return res.status(201).json(stage);
+    } catch (err) {
+      logger.error({ err, userId }, 'POST /funnel/stages failed');
+      return res.status(500).json({ error: 'Failed to create funnel stage' });
+    }
+  });
+
+  /**
+   * PATCH /funnel/stages/:id
+   * Body: { name?, color?, is_final? }  — partial update.
+   */
+  router.patch('/funnel/stages/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = FunnelStagePatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      const stage = await updateFunnelStage(id, userId, parsed.data, db);
+      if (!stage) {
+        return res.status(404).json({ error: 'Stage not found or access denied' });
+      }
+      return res.json(stage);
+    } catch (err) {
+      logger.error({ err, userId, stageId: id }, 'PATCH /funnel/stages/:id failed');
+      return res.status(500).json({ error: 'Failed to update funnel stage' });
+    }
+  });
+
+  /**
+   * DELETE /funnel/stages/:id
+   * Returns 409 if any active chat_ai deal is on this stage.
+   * Returns 404 if stage not found or belongs to another tenant.
+   */
+  router.delete('/funnel/stages/:id', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    try {
+      const result = await deleteFunnelStage(id, userId, db);
+
+      if (result.conflict) {
+        return res.status(409).json({
+          error: `Cannot delete: ${result.conflictCount} active deal(s) are on this stage`,
+          conflictCount: result.conflictCount,
+        });
+      }
+
+      if (!result.deleted) {
+        return res.status(404).json({ error: 'Stage not found or access denied' });
+      }
+
+      return res.json({ deleted: true });
+    } catch (err) {
+      logger.error({ err, userId, stageId: id }, 'DELETE /funnel/stages/:id failed');
+      return res.status(500).json({ error: 'Failed to delete funnel stage' });
+    }
+  });
+
+  /**
+   * POST /funnel/stages/reorder
+   * Body: { order: [id1, id2, id3, ...] }
+   * Batch-updates sort_order so each stage gets its position index.
+   */
+  router.post('/funnel/stages/reorder', async (req, res) => {
+    const db = req.userClient ?? supabase;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User identity required' });
+    }
+
+    const parsed = FunnelStageReorderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: zodErrorMessage(parsed.error) });
+    }
+
+    try {
+      const ok = await reorderFunnelStages(userId, parsed.data.order, db);
+      if (!ok) {
+        return res.status(500).json({ error: 'Failed to reorder stages' });
+      }
+      return res.json({ reordered: parsed.data.order.length });
+    } catch (err) {
+      logger.error({ err, userId }, 'POST /funnel/stages/reorder failed');
+      return res.status(500).json({ error: 'Failed to reorder stages' });
     }
   });
 
