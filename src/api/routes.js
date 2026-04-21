@@ -2251,6 +2251,7 @@ export function setupRoutes(app) {
   });
 
   router.post('/tasks', async (req, res) => {
+    const db = req.userClient ?? supabase;
     try {
       const { sessionId, remoteJid, title, description, taskType, priority, dueDate, assignedTo, dealValue, notes } = req.body;
 
@@ -2263,7 +2264,7 @@ export function setupRoutes(app) {
       const VALID_TYPES = ['follow_up', 'call_back', 'send_quote', 'send_catalog', 'visit_showroom', 'custom'];
       const VALID_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
 
-      const { data, error } = await supabase
+      const { data, error } = await db
         .from('tasks')
         .insert({
           session_id: sessionId,
