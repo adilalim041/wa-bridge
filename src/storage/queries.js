@@ -1128,3 +1128,275 @@ export async function getActiveSessions(db = supabase) {
     return [];
   }
 }
+
+// ============================================================================
+// tenant_settings helpers
+// ============================================================================
+
+/**
+ * Fetch tenant settings for a given userId.
+ * Returns null if no row exists yet (caller handles default seeding).
+ *
+ * @param {string} userId  - Supabase auth.users UUID
+ * @param {object} db      - Supabase client (userClient for RLS, supabase for service)
+ * @returns {Promise<{roles: string[], cities: string[], tags: string[]} | null>}
+ */
+export async function getTenantSettings(userId, db = supabase) {
+  try {
+    const { data, error } = await db
+      .from('tenant_settings')
+      .select('roles, cities, tags')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      logger.error({ err: error, userId }, 'getTenantSettings: query failed');
+      return null;
+    }
+
+    return data; // null when no row
+  } catch (err) {
+    logger.error({ err, userId }, 'getTenantSettings: unexpected error');
+    return null;
+  }
+}
+
+/**
+ * Upsert tenant settings (INSERT on first call, UPDATE on subsequent calls).
+ * Only provided fields are merged — omitted fields retain their DB values.
+ *
+ * @param {string} userId
+ * @param {{ roles?: string[], cities?: string[], tags?: string[] }} payload
+ * @param {object} db
+ * @returns {Promise<{roles: string[], cities: string[], tags: string[]} | null>}
+ */
+export async function upsertTenantSettings(userId, payload, db = supabase) {
+  try {
+    const { data, error } = await db
+      .from('tenant_settings')
+      .upsert(
+        { user_id: userId, ...payload },
+        { onConflict: 'user_id', ignoreDuplicates: false }
+      )
+      .select('roles, cities, tags')
+      .single();
+
+    if (error) {
+      logger.error({ err: error, userId }, 'upsertTenantSettings: upsert failed');
+      return null;
+    }
+
+    return data;
+  } catch (err) {
+    logger.error({ err, userId }, 'upsertTenantSettings: unexpected error');
+    return null;
+  }
+}
+
+// ============================================================================
+// funnel_stages helpers
+// ============================================================================
+
+/**
+ * Fetch all funnel stages for a tenant, ordered by sort_order asc.
+ *
+ * @param {string} userId
+ * @param {object} db
+ * @returns {Promise<Array<{id: string, name: string, color: string, sort_order: number, is_final: boolean}>>}
+ */
+export async function getFunnelStages(userId, db = supabase) {
+  try {
+    const { data, error } = await db
+      .from('funnel_stages')
+      .select('id, name, color, sort_order, is_final, created_at, updated_at')
+      .eq('user_id', userId)
+      .order('sort_order', { ascending: true });
+
+    if (error) {
+      logger.error({ err: error, userId }, 'getFunnelStages: query failed');
+      return [];
+    }
+
+    return data ?? [];
+  } catch (err) {
+    logger.error({ err, userId }, 'getFunnelStages: unexpected error');
+    return [];
+  }
+}
+
+/**
+ * Insert a new funnel stage for a tenant.
+ * sort_order is auto-set to (max existing + 1) to append at the end.
+ *
+ * @param {string} userId
+ * @param {{ name: string, color?: string, is_final?: boolean }} payload
+ * @param {object} db
+ * @returns {Promise<{id: string, name: string, color: string, sort_order: number, is_final: boolean} | null>}
+ */
+export async function createFunnelStage(userId, payload, db = supabase) {
+  try {
+    // Determine next sort_order
+    const { data: existing } = await db
+      .from('funnel_stages')
+      .select('sort_order')
+      .eq('user_id', userId)
+      .order('sort_order', { ascending: false })
+      .limit(1);
+
+    const nextOrder = existing && existing.length > 0
+      ? (existing[0].sort_order + 1)
+      : 0;
+
+    const { data, error } = await db
+      .from('funnel_stages')
+      .insert({
+        user_id: userId,
+        name: payload.name,
+        color: payload.color ?? '#3b82f6',
+        is_final: payload.is_final ?? false,
+        sort_order: nextOrder,
+      })
+      .select('id, name, color, sort_order, is_final, created_at, updated_at')
+      .single();
+
+    if (error) {
+      logger.error({ err: error, userId }, 'createFunnelStage: insert failed');
+      return null;
+    }
+
+    return data;
+  } catch (err) {
+    logger.error({ err, userId }, 'createFunnelStage: unexpected error');
+    return null;
+  }
+}
+
+/**
+ * Update a funnel stage. Only the calling tenant's own stages can be modified
+ * (the WHERE clause includes user_id so RLS is doubly enforced).
+ *
+ * @param {string} id      - Stage UUID
+ * @param {string} userId
+ * @param {{ name?: string, color?: string, is_final?: boolean }} payload
+ * @param {object} db
+ * @returns {Promise<{id: string, name: string, color: string, sort_order: number, is_final: boolean} | null>}
+ */
+export async function updateFunnelStage(id, userId, payload, db = supabase) {
+  try {
+    const { data, error } = await db
+      .from('funnel_stages')
+      .update(payload)
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select('id, name, color, sort_order, is_final, created_at, updated_at')
+      .single();
+
+    if (error) {
+      logger.error({ err: error, id, userId }, 'updateFunnelStage: update failed');
+      return null;
+    }
+
+    return data;
+  } catch (err) {
+    logger.error({ err, id, userId }, 'updateFunnelStage: unexpected error');
+    return null;
+  }
+}
+
+/**
+ * Delete a funnel stage. Returns false (and does NOT delete) if any chat_ai
+ * row currently has deal_stage matching this stage's name — prevents orphaned data.
+ *
+ * The collision check is done via the service-role client intentionally:
+ * chat_ai rows may belong to any session; we need a full-table count.
+ * The DELETE itself uses the caller's db (RLS-gated by user_id).
+ *
+ * @param {string} id
+ * @param {string} userId
+ * @param {object} db
+ * @returns {Promise<{ deleted: boolean, conflict: boolean, conflictCount?: number }>}
+ */
+export async function deleteFunnelStage(id, userId, db = supabase) {
+  try {
+    // Fetch the stage name first (need it for the collision check)
+    const { data: stage, error: stageErr } = await db
+      .from('funnel_stages')
+      .select('name')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (stageErr) {
+      logger.error({ err: stageErr, id }, 'deleteFunnelStage: fetch stage failed');
+      return { deleted: false, conflict: false };
+    }
+
+    if (!stage) {
+      // Not found or belongs to another tenant
+      return { deleted: false, conflict: false };
+    }
+
+    // Check for active deals on this stage
+    // SERVICE ROLE INTENTIONAL: collision check must see all sessions regardless
+    // of which session the user happens to be viewing. We read count only, no data.
+    const { count, error: countErr } = await supabase
+      .from('chat_ai')
+      .select('id', { count: 'exact', head: true })
+      .eq('deal_stage', stage.name);
+
+    if (countErr) {
+      logger.error({ err: countErr, id }, 'deleteFunnelStage: collision check failed');
+      return { deleted: false, conflict: false };
+    }
+
+    if (count > 0) {
+      return { deleted: false, conflict: true, conflictCount: count };
+    }
+
+    // Safe to delete
+    const { error: delErr } = await db
+      .from('funnel_stages')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    if (delErr) {
+      logger.error({ err: delErr, id }, 'deleteFunnelStage: delete failed');
+      return { deleted: false, conflict: false };
+    }
+
+    return { deleted: true, conflict: false };
+  } catch (err) {
+    logger.error({ err, id, userId }, 'deleteFunnelStage: unexpected error');
+    return { deleted: false, conflict: false };
+  }
+}
+
+/**
+ * Batch update sort_order for a tenant's funnel stages.
+ * Accepts an ordered array of IDs — positions are 0-indexed from the array.
+ *
+ * Each update is scoped to the tenant's user_id to prevent cross-tenant tampering.
+ *
+ * @param {string} userId
+ * @param {string[]} orderIds  - Stage UUIDs in desired order (index = new sort_order)
+ * @param {object} db
+ * @returns {Promise<boolean>}  true on success
+ */
+export async function reorderFunnelStages(userId, orderIds, db = supabase) {
+  try {
+    await Promise.all(
+      orderIds.map((stageId, index) =>
+        db
+          .from('funnel_stages')
+          .update({ sort_order: index })
+          .eq('id', stageId)
+          .eq('user_id', userId)
+      )
+    );
+    return true;
+  } catch (err) {
+    logger.error({ err, userId }, 'reorderFunnelStages: unexpected error');
+    return false;
+  }
+}
