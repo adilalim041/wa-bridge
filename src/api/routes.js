@@ -1732,7 +1732,8 @@ export function setupRoutes(app) {
     }
 
     try {
-      const { data, error } = await supabase
+      const db = req.userClient ?? supabase;
+      const { data, error } = await db
         .from('contacts_crm')
         .select('*')
         .eq('session_id', sessionId)
