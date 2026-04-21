@@ -2747,7 +2747,7 @@ export function setupRoutes(app) {
       const coachingComment = await generateCoachingComment({ messages, chatAi, clientName });
 
       // 5. Load active sessions for target dropdown
-      const activeSessions = await getActiveSessions();
+      const activeSessions = await getActiveSessions(db);
 
       // 6. Build available targets (all active sessions)
       const availableTargets = activeSessions.map((s) => ({
@@ -2812,7 +2812,7 @@ export function setupRoutes(app) {
 
     try {
       // Load active sessions
-      const activeSessions = await getActiveSessions();
+      const activeSessions = await getActiveSessions(db);
       const activeSet = new Set(activeSessions.map((s) => s.session_id));
 
       // Validate target is an active session

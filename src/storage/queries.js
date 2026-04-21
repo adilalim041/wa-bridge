@@ -1095,9 +1095,9 @@ export async function getChatAiById(chatAiId, db = supabase) {
  * Falls back to all rows if is_active column doesn't exist (schema mismatch guard).
  * @returns {Promise<Array<{session_id: string, display_name: string, phone_number: string}>>}
  */
-export async function getActiveSessions() {
+export async function getActiveSessions(db = supabase) {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('session_config')
       .select('session_id, display_name, phone_number')
       .eq('is_active', true)
@@ -1107,7 +1107,7 @@ export async function getActiveSessions() {
       // If is_active column is missing — fall back to all rows
       if (error.code === 'PGRST116' || error.message?.includes('is_active')) {
         logger.warn('getActiveSessions: is_active column not found — fetching all rows');
-        const { data: all, error: allErr } = await supabase
+        const { data: all, error: allErr } = await db
           .from('session_config')
           .select('session_id, display_name, phone_number')
           .order('created_at', { ascending: true });
