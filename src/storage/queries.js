@@ -432,7 +432,7 @@ export async function getChatTagsByJids(remoteJids = [], db = supabase) {
   }
 }
 
-export async function upsertChatTags(remoteJid, { tags, tagConfirmed } = {}) {
+export async function upsertChatTags(remoteJid, { tags, tagConfirmed } = {}, db = supabase) {
   if (!remoteJid) return false;
   const cleanTags = Array.isArray(tags)
     ? [...new Set(tags.map((t) => t?.toString().trim().toLowerCase()).filter(Boolean))].slice(0, 10)
@@ -444,7 +444,7 @@ export async function upsertChatTags(remoteJid, { tags, tagConfirmed } = {}) {
   if (cleanTags !== undefined) payload.tags = cleanTags;
   if (typeof tagConfirmed === 'boolean') payload.tag_confirmed = tagConfirmed;
   try {
-    const { error } = await supabase
+    const { error } = await db
       .from('chat_tags')
       .upsert(payload, { onConflict: 'remote_jid' });
     if (error) {
