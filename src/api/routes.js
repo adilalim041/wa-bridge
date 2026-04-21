@@ -373,20 +373,21 @@ export function setupRoutes(app) {
     const since = rangeStart || new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
     try {
+      const db = req.userClient ?? supabase;
       // Build session filter
       const sessionFilter = (query) => sessionId ? query.eq('session_id', sessionId) : query;
 
       // Pre-load the set of remote_jids tagged as клиент or партнёр.
       // Analytics should only reflect customer/partner interactions, not employees
       // or unclassified chats.
-      const { data: relevantTagRows } = await supabase
+      const { data: relevantTagRows } = await db
         .from('chat_tags')
         .select('remote_jid')
         .overlaps('tags', ['клиент', 'партнёр']);
       const relevantJids = new Set((relevantTagRows ?? []).map((r) => r.remote_jid));
 
       // 1. KPI: response times (adjusted for working hours 10:00-20:00 Almaty)
-      let rtQuery = supabase
+      let rtQuery = db
         .from('manager_analytics')
         .select('customer_message_at, manager_response_at, remote_jid')
         .gte('created_at', since)
@@ -439,7 +440,7 @@ export function setupRoutes(app) {
         : 0;
 
       // 2. AI analysis breakdown — filter by analysis_date range or days
-      let aiQuery = supabase
+      let aiQuery = db
         .from('chat_ai')
         .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues');
 
@@ -549,7 +550,7 @@ export function setupRoutes(app) {
       }
 
       // 3. Dialog sessions count
-      let dialogQuery = supabase
+      let dialogQuery = db
         .from('dialog_sessions')
         .select('*', { count: 'exact', head: true })
         .gte('started_at', since);
@@ -557,7 +558,7 @@ export function setupRoutes(app) {
       const { count: totalDialogs } = await sessionFilter(dialogQuery);
 
       // 4. Daily message trend — only fetch timestamp column, limit to 10k max
-      let msgQuery = supabase
+      let msgQuery = db
         .from('messages')
         .select('timestamp')
         .gte('timestamp', since)
