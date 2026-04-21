@@ -22,11 +22,16 @@ const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 // ---------------------------------------------------------------------------
 // In-process cache for /analytics/summary
 // ---------------------------------------------------------------------------
-const analyticsCache = new Map(); // key → { data, expiresAt }
+// Cache key is composite: `${sessionId}|...|${userId}` where userId is:
+//   - '__service__' when called via x-api-key (internal workers, admin, no req.user)
+//   - req.user.id (Supabase auth UID) when called via user JWT (dashboard requests)
+// This prevents cross-tenant cache bleed: service_role rows must NOT be served to
+// a lower-privilege user client that goes through RLS.
+const analyticsCache = new Map(); // `${sessionId}|dateFrom|dateTo|days|userId` → { data, expiresAt }
 const ANALYTICS_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
-function makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days) {
-  return `${sessionId || '_all'}|${dateFrom || ''}|${dateTo || ''}|${days}`;
+function makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days, userId) {
+  return `${sessionId || '_all'}|${dateFrom || ''}|${dateTo || ''}|${days}|${userId ?? '__service__'}`;
 }
 
 function getAnalyticsCache(key) {
@@ -360,7 +365,12 @@ export function setupRoutes(app) {
     const days = Math.min(Number(req.query.days) || 7, 90);
 
     // Serve from cache if available
-    const cacheKey = makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days);
+    // userId: explicit from req.user (JWT path) or '__service__' (x-api-key / worker path).
+    // '__service__' is the safe fallback — it keeps service-scope results isolated from
+    // user-scoped RLS-filtered results. Never use 'anon' here as that would merge unknown
+    // callers into a single bucket with their own bleed risk.
+    const userId = req.user?.id ?? '__service__';
+    const cacheKey = makeAnalyticsCacheKey(sessionId, dateFrom, dateTo, days, userId);
     const cached = getAnalyticsCache(cacheKey);
     if (cached) {
       logger.debug({ cacheKey }, 'analytics/summary: cache hit');
