@@ -1323,6 +1323,7 @@ export function setupRoutes(app) {
 
     const jid = buildWhatsAppJid(phone);
 
+    const db = req.userClient ?? supabase;
     try {
       if (mute) {
         const expiration = duration && duration > 0 ? Math.floor(Date.now() / 1000) + duration : -1;
@@ -1335,7 +1336,7 @@ export function setupRoutes(app) {
         ? new Date(Date.now() + duration * 1000).toISOString()
         : null;
 
-      const { error: persistError } = await supabase
+      const { error: persistError } = await db
         .from('chats')
         .upsert(
           {
