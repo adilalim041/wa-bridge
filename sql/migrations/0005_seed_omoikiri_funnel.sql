@@ -4,11 +4,11 @@
 --
 -- HOW TO USE:
 --   1. Open Supabase Dashboard → SQL Editor for the WPAdil project.
---   2. Log in to the dashboard first (so auth.uid() resolves to Adil's user).
+--   2. Replace the email below with your account email if different.
 --   3. Paste and run this script.
 --
--- For psql / service-role context: replace auth.uid() with a literal UUID:
---   DECLARE uid uuid := '<your-user-uuid>';
+-- NOTE: Supabase SQL Editor runs as the `postgres` role, so auth.uid()
+-- returns NULL. We resolve user_id from auth.users by email instead.
 --
 -- EFFECT: Deletes all existing funnel_stages for this user, then inserts
 -- the 9 Omoikiri stages. Stage names match legacy chat_ai.deal_stage values
@@ -20,10 +20,10 @@
 
 DO $$
 DECLARE
-  uid uuid := auth.uid();
+  uid uuid := (SELECT id FROM auth.users WHERE email = 'adilalim041@gmail.com');
 BEGIN
   IF uid IS NULL THEN
-    RAISE EXCEPTION 'auth.uid() returned NULL. Run this script while logged in to the Supabase dashboard, or replace auth.uid() with your literal user UUID.';
+    RAISE EXCEPTION 'User not found. Edit the email literal in this script to match your Supabase auth user.';
   END IF;
 
   DELETE FROM funnel_stages WHERE user_id = uid;
