@@ -1139,13 +1139,13 @@ export async function getActiveSessions(db = supabase) {
  *
  * @param {string} userId  - Supabase auth.users UUID
  * @param {object} db      - Supabase client (userClient for RLS, supabase for service)
- * @returns {Promise<{roles: string[], cities: string[], tags: string[]} | null>}
+ * @returns {Promise<{roles: string[], cities: string[], tags: string[], lead_sources: string[], refusal_reasons: string[], task_types: string[], company_profile: object} | null>}
  */
 export async function getTenantSettings(userId, db = supabase) {
   try {
     const { data, error } = await db
       .from('tenant_settings')
-      .select('roles, cities, tags')
+      .select('roles, cities, tags, lead_sources, refusal_reasons, task_types, company_profile')
       .eq('user_id', userId)
       .maybeSingle();
 
@@ -1166,9 +1166,9 @@ export async function getTenantSettings(userId, db = supabase) {
  * Only provided fields are merged — omitted fields retain their DB values.
  *
  * @param {string} userId
- * @param {{ roles?: string[], cities?: string[], tags?: string[] }} payload
+ * @param {{ roles?: string[], cities?: string[], tags?: string[], lead_sources?: string[], refusal_reasons?: string[], task_types?: string[], company_profile?: object }} payload
  * @param {object} db
- * @returns {Promise<{roles: string[], cities: string[], tags: string[]} | null>}
+ * @returns {Promise<{roles: string[], cities: string[], tags: string[], lead_sources: string[], refusal_reasons: string[], task_types: string[], company_profile: object} | null>}
  */
 export async function upsertTenantSettings(userId, payload, db = supabase) {
   try {
@@ -1178,7 +1178,7 @@ export async function upsertTenantSettings(userId, payload, db = supabase) {
         { user_id: userId, ...payload },
         { onConflict: 'user_id', ignoreDuplicates: false }
       )
-      .select('roles, cities, tags')
+      .select('roles, cities, tags, lead_sources, refusal_reasons, task_types, company_profile')
       .single();
 
     if (error) {
