@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import QRCode from 'qrcode';
 import { v2 as cloudinary } from 'cloudinary';
@@ -52,6 +53,25 @@ function setAnalyticsCache(key, data) {
 function invalidateAnalyticsCache() {
   analyticsCache.clear();
 }
+
+// ---------------------------------------------------------------------------
+// Per-(user, session) rate-limiter for the reconnect endpoint.
+// WhatsApp flags frequent reconnects (auth_state wipe + Baileys restart) as
+// suspicious device behaviour — ban-risk. 3 reconnects/hour per user+session
+// is a hard ceiling. keyGenerator falls back to IP if req.user is absent
+// (should not happen for JWT-authenticated endpoints, but defensive).
+// ---------------------------------------------------------------------------
+const reconnectLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3,
+  keyGenerator: (req) => `${req.user?.userId ?? req.ip}:${req.params.sessionId}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error:
+      'Слишком частое переподключение. Попробуй через час — WhatsApp может пометить устройство как подозрительное.',
+  },
+});
 
 // Call-row serialization is shared with the WebSocket emit path — see
 // formatCallRow in src/storage/queries.js. Keep the REST response and the
@@ -1332,7 +1352,12 @@ export function setupRoutes(app) {
   router.delete('/sessions/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
 
-    const { data: config } = await supabase
+    // Ownership check via RLS: req.userClient only sees rows belonging to the
+    // calling user — prevents tenant A from deleting tenant B's session.
+    // Destructive ops below remain on service_role (supabase) — ownership is
+    // already confirmed at this point.
+    const db = req.userClient ?? supabase;
+    const { data: config } = await db
       .from('session_config')
       .select('session_id')
       .eq('session_id', sessionId)
@@ -1358,7 +1383,10 @@ export function setupRoutes(app) {
   // Force-restart a session (kills socket, reconnects fresh)
   router.post('/sessions/:sessionId/restart', async (req, res) => {
     const { sessionId } = req.params;
-    const { data: config } = await supabase
+
+    // Ownership check via RLS: same pattern as DELETE and reconnect.
+    const db = req.userClient ?? supabase;
+    const { data: config } = await db
       .from('session_config')
       .select('session_id')
       .eq('session_id', sessionId)
@@ -1378,7 +1406,9 @@ export function setupRoutes(app) {
   });
 
   // Reconnect an existing session — clears stale auth_state so Baileys issues a fresh QR
-  router.post('/sessions/:sessionId/reconnect', async (req, res) => {
+  // reconnectLimiter: 3/hour per (userId + sessionId) — prevents double-click / UI-loop
+  // spam that WhatsApp reads as suspicious frequent reconnects (ban-risk).
+  router.post('/sessions/:sessionId/reconnect', reconnectLimiter, async (req, res) => {
     const { sessionId } = req.params;
     const db = req.userClient ?? supabase;
 
