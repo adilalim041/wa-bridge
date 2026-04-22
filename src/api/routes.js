@@ -1377,6 +1377,41 @@ export function setupRoutes(app) {
     return res.json({ success: true, sessionId, connected: state.connected, hasQR: Boolean(state.qr) });
   });
 
+  // Reconnect an existing session — clears stale auth_state so Baileys issues a fresh QR
+  router.post('/sessions/:sessionId/reconnect', async (req, res) => {
+    const { sessionId } = req.params;
+    const db = req.userClient ?? supabase;
+
+    // RLS: req.userClient sees only rows where user_id = auth.uid()
+    const { data: config } = await db
+      .from('session_config')
+      .select('session_id')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+
+    if (!config) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Clear stale auth_state using service key — same as DisconnectReason.loggedOut handler
+    const { error: clearError } = await supabase
+      .from('auth_state')
+      .delete()
+      .eq('session_id', sessionId);
+
+    if (clearError) {
+      logger.error({ err: clearError, sessionId }, 'Failed to clear auth_state during reconnect');
+      return res.status(500).json({ error: 'Failed to clear auth state' });
+    }
+
+    logger.info({ sessionId }, 'User-requested reconnect — cleared auth_state and restarted session');
+    await sessionManager.stopSession(sessionId);
+    await new Promise((r) => setTimeout(r, 2000));
+    await sessionManager.startSession(sessionId);
+
+    return res.json({ success: true, sessionId, connected: false, hasQR: false });
+  });
+
   router.get('/sessions/:sessionId/status', async (req, res) => {
     const { sessionId } = req.params;
     const db = req.userClient ?? supabase;
