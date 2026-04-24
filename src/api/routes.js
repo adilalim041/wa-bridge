@@ -605,7 +605,7 @@ export function setupRoutes(app) {
       // 2. AI analysis breakdown — filter by analysis_date range or days
       let aiQuery = db
         .from('chat_ai')
-        .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues');
+        .select('lead_temperature, deal_stage, sentiment, risk_flags, action_required, session_id, remote_jid, summary_ru, action_suggestion, customer_type, consultation_score, consultation_details, followup_status, manager_issues, intent');
 
       if (dateFrom && dateTo && dateFrom === dateTo) {
         aiQuery = aiQuery.eq('analysis_date', dateFrom);
@@ -680,6 +680,30 @@ export function setupRoutes(app) {
       // Action required count
       const actionRequired = ai.filter((r) => r.action_required).length;
 
+      // Critical chats — anything with aggressive sentiment, non-empty risk_flags,
+      // or an explicit complaint intent. These are the situations Adil said he
+      // was missing because they were not visually distinguished from generic
+      // "action required" items.
+      function isCritical(row) {
+        if (row.sentiment === 'aggressive') return true;
+        if (row.intent === 'complaint') return true;
+        if (Array.isArray(row.risk_flags) && row.risk_flags.length > 0) return true;
+        return false;
+      }
+      const criticalAll = ai.filter(isCritical);
+      const criticalCount = criticalAll.length;
+      const criticalChats = criticalAll
+        .slice(0, 50)
+        .map((r) => ({
+          sessionId: r.session_id,
+          remoteJid: r.remote_jid,
+          summary: r.summary_ru,
+          action: r.action_suggestion,
+          sentiment: r.sentiment,
+          intent: r.intent,
+          riskFlags: r.risk_flags || [],
+        }));
+
       // Customer types breakdown
       const customerTypes = {};
       for (const row of ai) {
@@ -746,6 +770,7 @@ export function setupRoutes(app) {
           hotLeads: leads.hot,
           totalDialogs: totalDialogs || 0,
           actionRequired,
+          criticalCount,
           avgConsultationScore,
         },
         leads,
@@ -753,6 +778,7 @@ export function setupRoutes(app) {
         sentiment,
         topRisks,
         actionChats,
+        criticalChats,
         dailyStats,
         customerTypes,
         managerIssues,
@@ -774,11 +800,11 @@ export function setupRoutes(app) {
     const { type, value, session_id, date_from, date_to } = req.query;
     const days = Math.min(Number(req.query.days) || 7, 90);
 
-    const VALID_TYPES = new Set(['risk', 'issue', 'action_required', 'temperature', 'followup']);
+    const VALID_TYPES = new Set(['risk', 'issue', 'action_required', 'temperature', 'followup', 'critical']);
     if (!type || !VALID_TYPES.has(type)) {
       return res.status(400).json({ error: `type must be one of: ${[...VALID_TYPES].join(', ')}` });
     }
-    if (type !== 'action_required' && !value) {
+    if (type !== 'action_required' && type !== 'critical' && !value) {
       return res.status(400).json({ error: 'value is required for this filter type' });
     }
 
@@ -797,7 +823,7 @@ export function setupRoutes(app) {
       // Build chat_ai query
       let aiQuery = db
         .from('chat_ai')
-        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score, report_sent_at')
+        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score, report_sent_at, intent')
         .gte('analysis_date', sinceDateStr)
         .limit(100);
 
@@ -819,9 +845,21 @@ export function setupRoutes(app) {
         aiQuery = aiQuery.eq('lead_temperature', value);
       } else if (type === 'followup') {
         aiQuery = aiQuery.eq('followup_status', value);
+      } else if (type === 'critical') {
+        // Can't express "risk_flags non-empty OR sentiment=aggressive OR intent=complaint"
+        // cleanly in PostgREST (array length check isn't a first-class filter). Fetch a
+        // superset and filter client-side — we're already limited to 100 rows per call.
+        aiQuery = aiQuery.or('sentiment.eq.aggressive,intent.eq.complaint,risk_flags.not.is.null');
       }
 
-      const { data: aiRows, error: aiError } = await aiQuery;
+      const { data: aiRowsRaw, error: aiError } = await aiQuery;
+      const aiRows = type === 'critical'
+        ? (aiRowsRaw || []).filter((r) =>
+            r.sentiment === 'aggressive' ||
+            r.intent === 'complaint' ||
+            (Array.isArray(r.risk_flags) && r.risk_flags.length > 0)
+          )
+        : aiRowsRaw;
       if (aiError) {
         logger.error({ err: aiError }, 'chats-by-filter: chat_ai query failed');
         return res.status(500).json({ error: 'Failed to query AI data' });
