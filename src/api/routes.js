@@ -19,6 +19,7 @@ import { generateCoachingComment } from '../ai/coachingGenerator.js';
 import { uploadReportPdf } from '../reports/uploadPdfToCloudinary.js';
 import { resolveSender } from '../reports/routing.js';
 import { isSentryEnabled } from '../observability/sentry.js';
+import { runCloudinaryCleanup, getCleanupConfig } from '../cleanup/cloudinaryCleanup.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -409,6 +410,39 @@ export function setupRoutes(app) {
     throw new Error(
       `Sentry smoke test from /test-sentry-error at ${new Date().toISOString()} (sentry_enabled=${enabled})`
     );
+  });
+
+  // POST /admin/cloudinary-cleanup — manual run (audit + on-demand sweep).
+  // ?mode=dry-run    — safe default, lists candidates, deletes nothing.
+  // ?mode=delete     — actually deletes (matches scheduler when env=delete).
+  // ?retentionDays=N — override TTL for this call only.
+  // Always restricted to wa-bridge/ folder by hard-coded prefix in the
+  // cleanup module — no way to scope this elsewhere from the API.
+  router.post('/admin/cloudinary-cleanup', async (req, res) => {
+    const requestedMode = String(req.query.mode || 'dry-run').toLowerCase();
+    const allowedModes = ['dry-run', 'delete'];
+    if (!allowedModes.includes(requestedMode)) {
+      return res.status(400).json({ error: `mode must be one of: ${allowedModes.join(', ')}` });
+    }
+    const retentionDaysOverride = req.query.retentionDays ? Number(req.query.retentionDays) : undefined;
+    if (retentionDaysOverride !== undefined && (!Number.isFinite(retentionDaysOverride) || retentionDaysOverride < 1)) {
+      return res.status(400).json({ error: 'retentionDays must be a positive integer' });
+    }
+    try {
+      const summary = await runCloudinaryCleanup({
+        mode: requestedMode,
+        retentionDays: retentionDaysOverride,
+      });
+      return res.json(summary);
+    } catch (err) {
+      logger.error({ err: err.message }, 'admin_cloudinary_cleanup_failed');
+      return res.status(500).json({ error: 'Cleanup failed', message: err.message });
+    }
+  });
+
+  // GET /admin/cloudinary-cleanup/config — what env says, no I/O
+  router.get('/admin/cloudinary-cleanup/config', (_req, res) => {
+    return res.json(getCleanupConfig());
   });
 
   // On-demand daily analysis — accepts optional ?date=YYYY-MM-DD
