@@ -621,10 +621,16 @@ export function setupRoutes(app) {
 
       const { data: aiData } = await sessionFilter(aiQuery);
 
-      // Filter: garbage JIDs removed, and only клиент/партнёр chats counted in AI metrics
-      const ai = (aiData ?? []).filter(
-        (row) => !isGarbageJid(row.remote_jid) && relevantJids.has(row.remote_jid)
-      );
+      // Two views over the same AI rows:
+      //  - aiAll: only garbage filtered out — used for criticalChats so that
+      //    aggressive/complaint/risk_flags signals reach the dashboard even
+      //    when the chat is tagged as colleague or hasn't been tag-confirmed
+      //    yet (e.g. landlord rent ultimatum, vendor complaint).
+      //  - ai: additionally restricted to клиент/партнёр chats — used for
+      //    sales KPIs (lead temperature, deal stages, response times, etc.)
+      //    where colleague chats would skew the numbers.
+      const aiAll = (aiData ?? []).filter((row) => !isGarbageJid(row.remote_jid));
+      const ai = aiAll.filter((row) => relevantJids.has(row.remote_jid));
 
       // Lead temperature
       const leads = { hot: 0, warm: 0, cold: 0, dead: 0 };
@@ -680,17 +686,18 @@ export function setupRoutes(app) {
       // Action required count
       const actionRequired = ai.filter((r) => r.action_required).length;
 
-      // Critical chats — anything with aggressive sentiment, non-empty risk_flags,
-      // or an explicit complaint intent. These are the situations Adil said he
-      // was missing because they were not visually distinguished from generic
-      // "action required" items.
+      // Critical chats — aggressive sentiment, non-empty risk_flags, or
+      // explicit complaint intent. Computed from aiAll (NOT ai) so that
+      // colleague-tagged or untagged chats can still surface as critical:
+      // the landlord-rent ultimatum and vendor complaints don't carry
+      // клиент/партнёр tags but are exactly what we want to flag.
       function isCritical(row) {
         if (row.sentiment === 'aggressive') return true;
         if (row.intent === 'complaint') return true;
         if (Array.isArray(row.risk_flags) && row.risk_flags.length > 0) return true;
         return false;
       }
-      const criticalAll = ai.filter(isCritical);
+      const criticalAll = aiAll.filter(isCritical);
       const criticalCount = criticalAll.length;
       const criticalChats = criticalAll
         .slice(0, 50)
