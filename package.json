@@ -7,6 +7,7 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@sentry/node": "^10.50.0",
     "@supabase/supabase-js": "^2.49.8",
     "baileys": "github:WhiskeySockets/Baileys#8e5093c198de5c5c0230a76e8a7224f6006ebb2e",
     "cloudinary": "^2.9.0",

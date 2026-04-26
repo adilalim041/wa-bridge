@@ -18,6 +18,7 @@ import { sendTelegramMessage, isTelegramConfigured } from '../notifications/tele
 import { generateCoachingComment } from '../ai/coachingGenerator.js';
 import { uploadReportPdf } from '../reports/uploadPdfToCloudinary.js';
 import { resolveSender } from '../reports/routing.js';
+import { isSentryEnabled } from '../observability/sentry.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -397,6 +398,18 @@ async function renderQrPage(sessionId, displayName, state) {
 
 export function setupRoutes(app) {
   const router = express.Router();
+
+  // GET /test-sentry-error — admin-only smoke test for Sentry wiring.
+  // Throws synchronously so expressErrorHandler captures it; the request
+  // returns 500 and an event should appear in Sentry within seconds.
+  // Mounted under x-api-key auth (same as other admin endpoints) so a random
+  // visitor can't burn through the Sentry quota.
+  router.get('/test-sentry-error', (_req, _res) => {
+    const enabled = isSentryEnabled();
+    throw new Error(
+      `Sentry smoke test from /test-sentry-error at ${new Date().toISOString()} (sentry_enabled=${enabled})`
+    );
+  });
 
   // On-demand daily analysis — accepts optional ?date=YYYY-MM-DD
   router.post('/ai/analyze', async (req, res) => {
