@@ -60,6 +60,33 @@ export function captureException(err, ctx = {}) {
 }
 
 /**
+ * Capture a known operational event (no Error stack needed).
+ * Use for intentional system alerts (cascade ban, mass disconnect, etc.)
+ * where the event itself is expected code-path but warrants visibility in Sentry.
+ *
+ * @param {string} message - Short human-readable event name (shows in Sentry issue title)
+ * @param {{ level?: 'fatal'|'error'|'warning'|'info', tags?: object, extra?: object }} opts
+ */
+export function captureMessage(message, { level = 'error', tags = {}, extra = {} } = {}) {
+  if (SENTRY_ENABLED) {
+    Sentry.withScope((scope) => {
+      scope.setLevel(level);
+      for (const [k, v] of Object.entries(tags)) {
+        if (v == null) continue;
+        const str = typeof v === 'string' ? v : String(v);
+        scope.setTag(k, str.length > 200 ? str.slice(0, 200) : str);
+      }
+      for (const [k, v] of Object.entries(extra)) {
+        scope.setExtra(k, v);
+      }
+      Sentry.captureMessage(message, level);
+    });
+  }
+  const pinoLevel = level === 'fatal' || level === 'error' ? 'error' : level === 'warning' ? 'warn' : 'info';
+  logger[pinoLevel]({ ...tags, ...extra }, `sentry_message: ${message}`);
+}
+
+/**
  * Express error-handling middleware. Mount AFTER all routes.
  * Captures the error, then delegates to Express's default 500 response.
  */

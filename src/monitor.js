@@ -1,5 +1,6 @@
 import { config } from './config.js';
 import { supabase } from './storage/supabase.js';
+import { captureMessage } from './observability/sentry.js';
 
 const TELEGRAM_BOT_TOKEN = config.telegramBotToken;
 const TELEGRAM_CHAT_ID = config.telegramChatId;
@@ -44,6 +45,11 @@ export function trackDisconnectEvent(sessionId, statusCode) {
     sendTelegramAlert(
       `🛑 Ban risk [${sessionId}]: ${entry.loggedOut} loggedOut events today. Check account!`
     ).catch(() => {});
+    captureMessage('Ban risk: high loggedOut count', {
+      level: 'warning',
+      tags: { kind: 'ban-risk', session_id: sessionId },
+      extra: { loggedOutCount: entry.loggedOut, date: entry.date },
+    });
   }
 
   // Cascade ban detection: 3+ sessions getting loggedOut in 15 min = shutdown ALL
@@ -63,6 +69,11 @@ export function trackDisconnectEvent(sessionId, statusCode) {
       sendTelegramAlert(
         `🚨 CASCADE BAN DETECTED: ${uniqueSessions.size} sessions banned in 15 min (${sessionList}).\n\nShutting down ALL sessions to protect remaining accounts. Check Railway logs + manually review before restarting.`
       ).catch(() => {});
+      captureMessage('Cascade ban detected', {
+        level: 'fatal',
+        tags: { kind: 'cascade-ban', sessionCount: String(uniqueSessions.size) },
+        extra: { sessions: sessionList, windowMs: CASCADE_BAN_WINDOW_MS },
+      });
       console.error('CASCADE BAN — shutting down all sessions:', sessionList);
 
       // Safety net (W2 anti-ban #5, 2026-04-17): in normal operation the
@@ -110,9 +121,18 @@ export function checkMassDisconnect(allSessionsCount) {
       massDisconnectTimer = setTimeout(() => {
         // Still many disconnected after 60s?
         if (disconnectedAt.size >= 3) {
+          const downCount = disconnectedAt.size;
           sendTelegramAlert(
-            `🚨 Mass disconnect: ${disconnectedAt.size}/${allSessionsCount} sessions down! Possible network/Railway issue.`
+            `🚨 Mass disconnect: ${downCount}/${allSessionsCount} sessions down! Possible network/Railway issue.`
           ).catch(() => {});
+          captureMessage('Mass disconnect', {
+            level: 'error',
+            tags: { kind: 'mass-disconnect', sessionCount: String(allSessionsCount) },
+            extra: {
+              disconnectedCount: downCount,
+              disconnectedSessions: Array.from(disconnectedAt.keys()),
+            },
+          });
         }
         massDisconnectTimer = null;
       }, 60000);
@@ -255,6 +275,11 @@ async function checkZombieConnection(sessionId) {
     sendTelegramAlert(
       `🧟 Zombie detected [${sessionId}]: ${hours}h without messages + ws=${wsState}. Restarting...`
     ).catch(() => {});
+    captureMessage('Zombie connection restart', {
+      level: 'warning',
+      tags: { kind: 'zombie-restart', session_id: sessionId },
+      extra: { silenceHours: hours, wsState },
+    });
 
     if (sessionManagerRef?.stopSession && sessionManagerRef?.startSession) {
       await sessionManagerRef.stopSession(sessionId);
@@ -294,6 +319,11 @@ export function startHealthMonitor(sessionId) {
       lastAlertTime.set(sessionId, Date.now());
       const minutes = Math.round(downtime / 60000);
       sendTelegramAlert(`WA Bridge [${sessionId}]: Disconnected for ${minutes} minutes!`).catch(() => {});
+      captureMessage('Connection lost', {
+        level: 'warning',
+        tags: { kind: 'connection-lost', session_id: sessionId },
+        extra: { downtimeMinutes: minutes },
+      });
     }
   }, CHECK_INTERVAL);
 

@@ -2,6 +2,7 @@ import qrcode from 'qrcode-terminal';
 import { fetchLatestBaileysVersion, makeWASocket, DisconnectReason } from 'baileys';
 import { logger, baileysLogger } from '../config.js';
 import { sendTelegramAlert, startHealthMonitor, updateConnectionStatus, trackDisconnectEvent, checkMassDisconnect } from '../monitor.js';
+import { captureMessage } from '../observability/sentry.js';
 import { logAudit } from '../storage/auditLog.js';
 import { supabase } from '../storage/supabase.js';
 import { useSupabaseAuthState } from '../storage/authState.js';
@@ -407,6 +408,11 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         }
 
         sendTelegramAlert(`WA Bridge [${sessionId}]: Session logged out! Need new QR scan.`).catch(() => {});
+        captureMessage('Session logged out', {
+          level: 'error',
+          tags: { kind: 'session-logged-out', session_id: sessionId },
+          extra: { statusCode },
+        });
         console.log(`[${sessionId}] Session expired. Auth state cleared. Restarting for new QR...`);
 
         const reconnectFn = () =>
@@ -465,6 +471,11 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         sendTelegramAlert(
           `🛑 WA Bridge [${sessionId}]: ${MAX_RECONNECT_ATTEMPTS} reconnect attempts exceeded! Auto-reconnect STOPPED. Manual intervention required.`
         ).catch(() => {});
+        captureMessage('Max reconnect attempts exceeded', {
+          level: 'error',
+          tags: { kind: 'reconnect-cap-reached', session_id: sessionId },
+          extra: { attempts: attempt, maxAttempts: MAX_RECONNECT_ATTEMPTS },
+        });
         logger.error({ sessionId, attempt }, 'Max reconnect attempts exceeded — stopping');
         return;
       }
@@ -476,6 +487,11 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         sendTelegramAlert(
           `WA Bridge [${sessionId}]: 15 failed reconnect attempts. Retrying every 10min.`
         ).catch(() => {});
+        captureMessage('Reconnect attempt threshold', {
+          level: 'warning',
+          tags: { kind: 'reconnect-threshold', session_id: sessionId },
+          extra: { attempts: attempt },
+        });
       }
 
       scheduleReconnect(sessionId, delay, () =>
