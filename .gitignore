@@ -70,3 +70,4 @@ tests/red-team/results-*.json
 /_daily_pending_*.json
 /_tmp_*/
 _tmp_msgs/
+_tmp/
