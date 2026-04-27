@@ -568,6 +568,36 @@ export async function upsertCall({
       return null;
     }
 
+    // Bump chats.last_message_at so calls move chat to top of list, mirroring
+    // message ingestion behaviour. Use offered_at to preserve actual event time.
+    // Only bump on the 'offer' event — that is the canonical moment the call arrived.
+    // Subsequent status transitions (accept / reject / terminate) must NOT override
+    // a real message that came after the call was offered.
+    // Non-transactional: if this update fails we log a warning and continue — a
+    // missed bump only affects sidebar sort order, not data integrity.
+    if (offeredAt) {
+      try {
+        const { error: bumpError } = await supabase
+          .from('chats')
+          .update({ last_message_at: offeredAt })
+          .eq('session_id', sessionId)
+          .eq('remote_jid', remoteJid)
+          .lt('last_message_at', offeredAt); // only update if call is newer
+
+        if (bumpError) {
+          logger.warn(
+            { err: bumpError, callId, sessionId, remoteJid },
+            'upsertCall: failed to bump chats.last_message_at (non-fatal)'
+          );
+        }
+      } catch (bumpErr) {
+        logger.warn(
+          { err: bumpErr, callId, sessionId, remoteJid },
+          'upsertCall: unexpected error bumping chats.last_message_at (non-fatal)'
+        );
+      }
+    }
+
     return data;
   } catch (err) {
     logger.error({ err, callId, sessionId }, 'Unexpected error in upsertCall');
@@ -799,33 +829,46 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
           const digits = jid.replace(/\D/g, '');
           return digits.length >= 7 && digits.length <= 13;
         })
-        .map((row) => ({
-        remoteJid: row.remote_jid,
-        chatType: row.chat_type,
-        displayName: row.display_name,
-        participantCount: row.participant_count,
-        phoneNumber: row.phone_number,
-        isMuted: row.is_muted,
-        mutedUntil: row.muted_until || null,
-        tags: row.tags || [],
-        tagConfirmed: row.tag_confirmed || false,
-        lastMessage: row.last_message_body || null,
-        lastMessageType: row.last_message_type || 'text',
-        lastTimestamp: row.last_timestamp,
-        fromMe: row.last_from_me,
-        pushName: row.last_push_name || null,
-        sender: row.last_sender || null,
-        mediaUrl: row.last_media_url || null,
-        mediaType: row.last_media_type || null,
-        fileName: row.last_file_name || null,
-        unreadCount: Number(row.unread_count) || 0,
-        hasCrmContact: Boolean(row.crm_first_name),
-        crmName: row.crm_first_name
-          ? `${row.crm_first_name}${row.crm_last_name ? ` ${row.crm_last_name}` : ''}`
-          : null,
-        crmRole: row.crm_role || null,
-        crmAvatarUrl: row.crm_avatar_url || null,
-      }));
+        .map((row) => {
+          // Determine whether the most recent event was a call or a message.
+          // SQL function returns last_call_offered_at (null when no calls yet).
+          // We compare timestamps so the freshest event wins for display.
+          const msgTs = row.last_timestamp ? new Date(row.last_timestamp).getTime() : 0;
+          const callTs = row.last_call_offered_at ? new Date(row.last_call_offered_at).getTime() : 0;
+          const callIsNewer = callTs > msgTs;
+
+          return {
+            remoteJid: row.remote_jid,
+            chatType: row.chat_type,
+            displayName: row.display_name,
+            participantCount: row.participant_count,
+            phoneNumber: row.phone_number,
+            isMuted: row.is_muted,
+            mutedUntil: row.muted_until || null,
+            tags: row.tags || [],
+            tagConfirmed: row.tag_confirmed || false,
+            // If call is newer — show call metadata; otherwise show last message as before.
+            lastMessage: callIsNewer ? null : (row.last_message_body || null),
+            lastMessageType: callIsNewer ? 'call' : (row.last_message_type || 'text'),
+            lastTimestamp: callIsNewer ? row.last_call_offered_at : row.last_timestamp,
+            fromMe: callIsNewer ? Boolean(row.last_call_from_me) : row.last_from_me,
+            pushName: callIsNewer ? null : (row.last_push_name || null),
+            sender: callIsNewer ? null : (row.last_sender || null),
+            mediaUrl: callIsNewer ? null : (row.last_media_url || null),
+            mediaType: callIsNewer ? null : (row.last_media_type || null),
+            fileName: callIsNewer ? null : (row.last_file_name || null),
+            unreadCount: Number(row.unread_count) || 0,
+            hasCrmContact: Boolean(row.crm_first_name),
+            crmName: row.crm_first_name
+              ? `${row.crm_first_name}${row.crm_last_name ? ` ${row.crm_last_name}` : ''}`
+              : null,
+            crmRole: row.crm_role || null,
+            crmAvatarUrl: row.crm_avatar_url || null,
+            // Call-specific fields (null when last event was a message)
+            lastCallMissed: callIsNewer ? Boolean(row.last_call_missed) : null,
+            lastCallDurationSec: callIsNewer ? (row.last_call_duration_sec ?? null) : null,
+          };
+        });
       // W7A overlay: phone-level chat_tags wins over legacy chats.tags
       await applyChatTagsOverlay(result, db);
       const elapsed = Date.now() - queryStart;
@@ -864,15 +907,36 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
 
     const jids = cleanChats.map((c) => c.remote_jid);
 
-    const { data: crmContacts } = await db
-      .from('contacts_crm')
-      .select('remote_jid, first_name, last_name, role, avatar_url')
-      .eq('session_id', sessionId)
-      .in('remote_jid', jids);
+    // Fetch latest call per jid in a single query using order + in().
+    // Supabase/PostgREST doesn't expose DISTINCT ON directly, so we fetch all calls
+    // for these jids ordered by offered_at DESC and collapse in JS.
+    // For up to 2000 chats with typically <5 calls each this is fast enough.
+    const [{ data: crmContacts }, { data: latestCallsRaw }] = await Promise.all([
+      db
+        .from('contacts_crm')
+        .select('remote_jid, first_name, last_name, role, avatar_url')
+        .eq('session_id', sessionId)
+        .in('remote_jid', jids),
+      db
+        .from('calls')
+        .select('remote_jid, offered_at, missed, from_me, duration_sec')
+        .eq('session_id', sessionId)
+        .in('remote_jid', jids)
+        .order('offered_at', { ascending: false })
+        .limit(jids.length * 3), // at most 3 calls per jid is plenty for latest-call lookup
+    ]);
 
     const crmMap = new Map();
     for (const c of crmContacts ?? []) {
       crmMap.set(c.remote_jid, c);
+    }
+
+    // Collapse: first occurrence per remote_jid is the most recent (ordered DESC above)
+    const latestCallMap = new Map();
+    for (const call of latestCallsRaw ?? []) {
+      if (!latestCallMap.has(call.remote_jid)) {
+        latestCallMap.set(call.remote_jid, call);
+      }
     }
 
     const BATCH_SIZE = 50;
@@ -915,6 +979,12 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
             ? `${crmContact.first_name}${crmContact.last_name ? ` ${crmContact.last_name}` : ''}`
             : null;
 
+          // Determine whether the most recent event was a call or a message.
+          const latestCall = latestCallMap.get(chat.remote_jid) || null;
+          const msgTs = lastMessage?.timestamp ? new Date(lastMessage.timestamp).getTime() : 0;
+          const callTs = latestCall?.offered_at ? new Date(latestCall.offered_at).getTime() : 0;
+          const callIsNewer = callTs > msgTs;
+
           return {
             remoteJid: chat.remote_jid,
             chatType: chat.chat_type,
@@ -926,20 +996,25 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
             // legacy tags field — will be overwritten by applyChatTagsOverlay below
             tags: chat.tags || [],
             tagConfirmed: chat.tag_confirmed || false,
-            lastMessage: lastMessage?.body || null,
-            lastMessageType: lastMessage?.message_type || 'text',
-            lastTimestamp: lastMessage?.timestamp || chat.last_message_at,
-            fromMe: lastMessage?.from_me || false,
-            pushName: lastMessage?.push_name || null,
-            sender: lastMessage?.sender || null,
-            mediaUrl: lastMessage?.media_url || null,
-            mediaType: lastMessage?.media_type || null,
-            fileName: lastMessage?.file_name || null,
+            lastMessage: callIsNewer ? null : (lastMessage?.body || null),
+            lastMessageType: callIsNewer ? 'call' : (lastMessage?.message_type || 'text'),
+            lastTimestamp: callIsNewer
+              ? latestCall.offered_at
+              : (lastMessage?.timestamp || chat.last_message_at),
+            fromMe: callIsNewer ? Boolean(latestCall.from_me) : (lastMessage?.from_me || false),
+            pushName: callIsNewer ? null : (lastMessage?.push_name || null),
+            sender: callIsNewer ? null : (lastMessage?.sender || null),
+            mediaUrl: callIsNewer ? null : (lastMessage?.media_url || null),
+            mediaType: callIsNewer ? null : (lastMessage?.media_type || null),
+            fileName: callIsNewer ? null : (lastMessage?.file_name || null),
             unreadCount: count || 0,
             hasCrmContact: Boolean(crmContact),
             crmName,
             crmRole: crmContact?.role || null,
             crmAvatarUrl: crmContact?.avatar_url || null,
+            // Call-specific fields (null when last event was a message)
+            lastCallMissed: callIsNewer ? Boolean(latestCall.missed) : null,
+            lastCallDurationSec: callIsNewer ? (latestCall.duration_sec ?? null) : null,
           };
         })
       );
