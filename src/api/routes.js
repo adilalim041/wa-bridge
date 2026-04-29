@@ -1218,6 +1218,63 @@ export function setupRoutes(app) {
   });
 
   // ---------------------------------------------------------------------------
+  // POST /chat_ai/:id/feedback — manager flags AI analysis as wrong. Stored
+  // in chat_ai_feedback so the daily-wa-analysis skill can read recent
+  // feedback as in-context guidelines on the next run.
+  // ---------------------------------------------------------------------------
+  const FEEDBACK_KINDS = new Set(['wrong_category', 'wrong_summary', 'wrong_severity', 'wrong_assignment', 'other']);
+
+  router.post('/chat_ai/:id/feedback', async (req, res) => {
+    const { id } = req.params;
+    const { kind, comment } = req.body || {};
+
+    if (!id || typeof id !== 'string') {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+    if (!kind || !FEEDBACK_KINDS.has(kind)) {
+      return res.status(400).json({ error: `kind must be one of: ${[...FEEDBACK_KINDS].join(', ')}` });
+    }
+    const cleanComment = typeof comment === 'string' ? comment.trim().slice(0, 2000) : null;
+    if (!cleanComment && kind === 'other') {
+      return res.status(400).json({ error: 'comment required when kind=other' });
+    }
+
+    try {
+      const db = req.userClient ?? supabase;
+
+      // Verify the chat_ai row exists (FK violation otherwise = obscure 500)
+      const { data: existing, error: readErr } = await db
+        .from('chat_ai')
+        .select('id')
+        .eq('id', id)
+        .maybeSingle();
+      if (readErr || !existing) {
+        return res.status(404).json({ error: 'chat_ai record not found' });
+      }
+
+      const userId = req.user?.userId || req.user?.id || '__service__';
+      const { error: insertErr } = await db
+        .from('chat_ai_feedback')
+        .insert({
+          chat_ai_id: id,
+          kind,
+          comment_ru: cleanComment || null,
+          created_by: userId,
+        });
+      if (insertErr) {
+        logger.error({ err: insertErr, id }, 'feedback insert failed');
+        return res.status(500).json({ error: 'Save failed' });
+      }
+
+      logger.info({ id, kind, userId }, 'chat_ai feedback recorded');
+      return res.json({ ok: true });
+    } catch (error) {
+      logger.error({ err: error, id }, 'feedback unexpected error');
+      return res.status(500).json({ error: 'Save failed' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Calls API
   // ---------------------------------------------------------------------------
 
