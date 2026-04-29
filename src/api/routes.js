@@ -1902,6 +1902,13 @@ export function setupRoutes(app) {
   // W7A: tags are now phone-level (chat_tags table). The :sessionId param is
   // accepted for backward compat with the old URL shape but ignored — tags
   // apply to the contact across ALL sessions.
+  // 2026-04-29: when a manager flips the tag to 'сотрудник' or 'спам',
+  // auto-dismiss any active problem-carousel rows for this jid as 'won'
+  // (with audit marker '__tag_change__'). Adil's complaint was seeing
+  // colleague chats flagged as problems — fixing the tag should fix the
+  // carousel without a second click.
+  const NON_PROBLEM_TAGS = new Set(['сотрудник', 'спам']);
+
   router.post('/sessions/:sessionId/chats/:phone/tags', async (req, res) => {
     const { sessionId } = req.params;
     const remoteJid = normalizeChatId(req.params.phone);
@@ -1916,8 +1923,41 @@ export function setupRoutes(app) {
     if (!ok) {
       return res.status(500).json({ error: 'Failed to update tags' });
     }
+
+    // Cascade: if the new primary tag means "this isn't a real customer
+    // conversation" — drop any active flagged-problem rows for this jid
+    // so they disappear from the carousel immediately.
+    const newPrimary = (inputTags[0] || '').toLowerCase();
+    let cascaded = 0;
+    if (NON_PROBLEM_TAGS.has(newPrimary)) {
+      try {
+        const userId = req.user?.userId || req.user?.id || '__service__';
+        const { data: updated, error: cascadeErr } = await db
+          .from('chat_ai')
+          .update({
+            problem_dismissed_action: 'won',
+            problem_dismissed_at: new Date().toISOString(),
+            problem_dismissed_by: `__tag_change__:${userId}`,
+          })
+          .eq('remote_jid', remoteJid)
+          .is('problem_dismissed_at', null)
+          .select('id');
+        if (cascadeErr) {
+          logger.warn({ err: cascadeErr, remoteJid }, 'tag-change cascade dismiss failed');
+        } else {
+          cascaded = updated?.length || 0;
+          if (cascaded > 0) {
+            invalidateAnalyticsCache();
+            logger.info({ remoteJid, newPrimary, cascaded }, 'tag change cascaded to dismiss carousel rows');
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, remoteJid }, 'tag-change cascade unexpected error');
+      }
+    }
+
     const { tags, tagConfirmed } = await getChatTags(remoteJid, db);
-    return res.json({ success: true, tags, tagConfirmed, sessionId });
+    return res.json({ success: true, tags, tagConfirmed, sessionId, cascaded });
   });
 
   // Confirm (or change + confirm) a chat tag — phone-level
