@@ -854,11 +854,18 @@ export function setupRoutes(app) {
     const { type, value, session_id, date_from, date_to } = req.query;
     const days = Math.min(Number(req.query.days) || 7, 90);
 
-    const VALID_TYPES = new Set(['risk', 'issue', 'action_required', 'temperature', 'followup', 'critical']);
+    // 'slow' / 'no_followup' / 'football' / 'lost' added 2026-04-29 for the
+    // "проблемные переписки carousel" feature. They piggy-back on this same
+    // endpoint so the existing AnalyticsPopup drilldown UI keeps working.
+    const VALID_TYPES = new Set([
+      'risk', 'issue', 'action_required', 'temperature', 'followup', 'critical',
+      'slow', 'no_followup', 'football', 'lost',
+    ]);
+    const TYPES_WITHOUT_VALUE = new Set(['action_required', 'critical', 'slow', 'no_followup', 'football', 'lost']);
     if (!type || !VALID_TYPES.has(type)) {
       return res.status(400).json({ error: `type must be one of: ${[...VALID_TYPES].join(', ')}` });
     }
-    if (type !== 'action_required' && type !== 'critical' && !value) {
+    if (!TYPES_WITHOUT_VALUE.has(type) && !value) {
       return res.status(400).json({ error: 'value is required for this filter type' });
     }
 
@@ -874,10 +881,36 @@ export function setupRoutes(app) {
         sinceDateStr = sinceDate.toISOString().slice(0, 10);
       }
 
+      // For 'football' we first resolve the set of remote_jids from v_football_cases
+      // (cross-session view), then filter chat_ai to those jids. For all other types
+      // chat_ai is the primary source.
+      let footballMeta = null; // { jidsSet: Set, perJid: Map<jid, {sessions, count, last_outbound_at}> }
+      if (type === 'football') {
+        const { data: footballRows, error: footballErr } = await db
+          .from('v_football_cases')
+          .select('remote_jid, sessions, session_count, last_outbound_at');
+        if (footballErr) {
+          logger.error({ err: footballErr }, 'chats-by-filter football view query failed');
+          return res.status(500).json({ error: 'Failed to query football view' });
+        }
+        const perJid = new Map();
+        for (const r of footballRows ?? []) {
+          perJid.set(r.remote_jid, {
+            sessions: r.sessions || [],
+            count: r.session_count || 0,
+            lastOutboundAt: r.last_outbound_at || null,
+          });
+        }
+        footballMeta = { jidsSet: new Set(perJid.keys()), perJid };
+        if (footballMeta.jidsSet.size === 0) {
+          return res.json({ total: 0, filter: { type, value: null }, chats: [] });
+        }
+      }
+
       // Build chat_ai query
       let aiQuery = db
         .from('chat_ai')
-        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score, report_sent_at, intent')
+        .select('id, session_id, remote_jid, dialog_session_id, analysis_date, lead_temperature, deal_stage, sentiment, risk_flags, manager_issues, action_required, action_suggestion, followup_status, summary_ru, consultation_score, report_sent_at, intent, problem_dismissed_action, problem_dismissed_at')
         .gte('analysis_date', sinceDateStr)
         .limit(100);
 
@@ -886,6 +919,13 @@ export function setupRoutes(app) {
       }
       if (session_id) {
         aiQuery = aiQuery.eq('session_id', session_id);
+      }
+
+      // Hide dismissed rows from every category EXCEPT 'lost' (which IS the
+      // dismissed-as-lost view). Carousel needs this so once a manager clicks
+      // "Нет — оставить как проблему" the row disappears from active categories.
+      if (type !== 'lost') {
+        aiQuery = aiQuery.is('problem_dismissed_at', null);
       }
 
       // Type-specific filter
@@ -904,6 +944,14 @@ export function setupRoutes(app) {
         // cleanly in PostgREST (array length check isn't a first-class filter). Fetch a
         // superset and filter client-side — we're already limited to 100 rows per call.
         aiQuery = aiQuery.or('sentiment.eq.aggressive,intent.eq.complaint,risk_flags.not.is.null');
+      } else if (type === 'slow') {
+        aiQuery = aiQuery.contains('manager_issues', ['slow_first_response']);
+      } else if (type === 'no_followup') {
+        aiQuery = aiQuery.contains('manager_issues', ['no_followup']);
+      } else if (type === 'football') {
+        aiQuery = aiQuery.in('remote_jid', [...footballMeta.jidsSet]);
+      } else if (type === 'lost') {
+        aiQuery = aiQuery.eq('problem_dismissed_action', 'lost');
       }
 
       const { data: aiRowsRaw, error: aiError } = await aiQuery;
@@ -961,6 +1009,9 @@ export function setupRoutes(app) {
           const chat = chatsMap[key] || {};
           const digits = r.remote_jid.replace(/\D/g, '');
           const tagEntry = tagsMap[r.remote_jid] || { tags: [], tagConfirmed: false };
+          // Football metadata: attached when the row's jid appears in v_football_cases
+          // (resolved earlier for type='football', otherwise undefined).
+          const football = footballMeta?.perJid?.get(r.remote_jid);
           return {
             sessionId: r.session_id,
             sessionDisplayName: sessionsMap[r.session_id] || r.session_id,
@@ -984,6 +1035,10 @@ export function setupRoutes(app) {
             tagConfirmed: tagEntry.tagConfirmed,
             reportSentAt: r.report_sent_at || null,
             report_sent_at: r.report_sent_at || null,
+            problemDismissedAction: r.problem_dismissed_action || null,
+            problemDismissedAt: r.problem_dismissed_at || null,
+            footballSessions: football?.sessions || null,
+            footballSessionCount: football?.count || null,
           };
         });
 
@@ -1091,6 +1146,74 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, id }, 'PATCH chat_ai unexpected error');
       return res.status(500).json({ error: 'Update failed' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // POST /chat_ai/:id/dismiss-problem — remove a chat from the "проблемные
+  // переписки" carousel. The server decides won/lost from the row's current
+  // deal_stage at dismiss time (see WIN_STAGES below). Frontend only sends
+  // a click — no payload required.
+  // ---------------------------------------------------------------------------
+  router.post('/chat_ai/:id/dismiss-problem', async (req, res) => {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string') {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+
+    // Stages that mean "deal moved forward" — clicking "Нет" on one of these
+    // closes it as a win. Anything else (consultation stuck, refused, NULL,
+    // needs_review, etc.) is a "просранный лид" (lost).
+    const WIN_STAGES = new Set([
+      'completed', 'delivery', 'payment', 'closed_won', 'post_sale',
+      'Завершено', 'Доставка', 'Оплата',
+    ]);
+
+    try {
+      const db = req.userClient ?? supabase;
+
+      // Read current deal_stage to decide win vs lost
+      const { data: existing, error: readErr } = await db
+        .from('chat_ai')
+        .select('id, deal_stage, problem_dismissed_action')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (readErr) {
+        logger.error({ err: readErr, id }, 'dismiss-problem read failed');
+        return res.status(500).json({ error: 'Read failed' });
+      }
+      if (!existing) {
+        return res.status(404).json({ error: 'chat_ai record not found' });
+      }
+      if (existing.problem_dismissed_action) {
+        // Already dismissed — idempotent return
+        return res.json({ ok: true, action: existing.problem_dismissed_action, alreadyDismissed: true });
+      }
+
+      const action = WIN_STAGES.has(existing.deal_stage) ? 'won' : 'lost';
+      const userId = req.user?.userId || req.user?.id || '__service__';
+
+      const { error: updateErr } = await db
+        .from('chat_ai')
+        .update({
+          problem_dismissed_action: action,
+          problem_dismissed_at: new Date().toISOString(),
+          problem_dismissed_by: userId,
+        })
+        .eq('id', id);
+
+      if (updateErr) {
+        logger.error({ err: updateErr, id }, 'dismiss-problem update failed');
+        return res.status(500).json({ error: 'Update failed' });
+      }
+
+      invalidateAnalyticsCache();
+      logger.info({ id, action, userId, dealStage: existing.deal_stage }, 'chat_ai problem dismissed');
+      return res.json({ ok: true, action });
+    } catch (error) {
+      logger.error({ err: error, id }, 'dismiss-problem unexpected error');
+      return res.status(500).json({ error: 'Dismiss failed' });
     }
   });
 

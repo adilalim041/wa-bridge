@@ -29,6 +29,9 @@ Thumbs.db
 # Claude Code local settings
 .claude/
 
+# Mempalace memory palace tooling config (local mining only)
+mempalace.yaml
+
 # Sub-projects (have their own git)
 bazav2/
 
