@@ -3,11 +3,20 @@ import { supabase } from '../storage/supabase.js';
 import { sendTelegramMessage, isTelegramConfigured } from './telegramBot.js';
 import { getChatTagsByJids } from '../storage/queries.js';
 
+// 2026-04-29: Adil muted all four legacy Telegram channels (overdue tasks,
+// hot lead alerts, daily summary, auto follow-up) — they were spamming.
+// We're replacing them with a single morning-digest cron at 09:30 Almaty
+// (designed in backlog 2026-04-29). Until that's wired, every channel
+// short-circuits via TG_NOTIFICATIONS_MUTED. Flip to false here OR set env
+// TG_NOTIFICATIONS_MUTED=false to re-enable the legacy ones temporarily.
+const TG_NOTIFICATIONS_MUTED = (process.env.TG_NOTIFICATIONS_MUTED ?? 'true').toLowerCase() !== 'false';
+
 let lastOverdueHash = '';
 let lastUnansweredHash = '';
 
 // ── Overdue task checker ──
 async function checkOverdueTasks() {
+  if (TG_NOTIFICATIONS_MUTED) return;
   if (!isTelegramConfigured()) return;
 
   try {
@@ -156,6 +165,7 @@ async function checkUnansweredChats() {
 
 // ── Hot lead alert ──
 export async function notifyHotLead(contactName, phone, topic, suggestion) {
+  if (TG_NOTIFICATIONS_MUTED) return;
   if (!isTelegramConfigured()) return;
 
   let msg = `🔥 <b>Горячий лид</b>\n`;
@@ -170,6 +180,7 @@ export async function notifyHotLead(contactName, phone, topic, suggestion) {
 
 // ── Daily summary ──
 export async function sendDailySummary(analysisResult) {
+  if (TG_NOTIFICATIONS_MUTED) return;
   if (!isTelegramConfigured()) return;
 
   try {
@@ -217,6 +228,7 @@ export async function sendDailySummary(analysisResult) {
 
 // ── Automatic follow-up task creation ──
 async function createFollowUpTasks() {
+  if (TG_NOTIFICATIONS_MUTED) return;
   try {
     const oneDayAgo = new Date(Date.now() - 24 * 3600000).toISOString();
 
@@ -336,6 +348,10 @@ let checkerInterval = null;
 let followUpRanToday = false;
 
 export function startNotificationChecker() {
+  if (TG_NOTIFICATIONS_MUTED) {
+    logger.info('TG_NOTIFICATIONS_MUTED=true — legacy notification checker not started');
+    return;
+  }
   if (!isTelegramConfigured()) {
     logger.info('Telegram not configured, skipping notification checker');
     return;
