@@ -57,6 +57,37 @@ export function invalidateSalesCache() {
   _cache.clear();
 }
 
+// ─── Параллельная пагинация ─────────────────────────────────────────────────
+// Вместо 7 последовательных range-запросов (medium 2200 sales = 2200/1000 = 3, items 6800/1000 = 7),
+// делаем все запросы одновременно через Promise.all. Ускоряет загрузку 4-7x.
+async function loadAllParallel(sb, table, selectFields, filters = {}) {
+  // 1. Узнаём общее кол-во строк (head запрос)
+  let cntQ = sb.from(table).select('*', { count: 'exact', head: true });
+  if (filters.eq) for (const [k, v] of Object.entries(filters.eq)) cntQ = cntQ.eq(k, v);
+  if (filters.notNull) for (const k of filters.notNull) cntQ = cntQ.not(k, 'is', null);
+  if (filters.isNull) for (const k of filters.isNull) cntQ = cntQ.is(k, null);
+  if (filters.gte) for (const [k, v] of Object.entries(filters.gte)) cntQ = cntQ.gte(k, v);
+  if (filters.lte) for (const [k, v] of Object.entries(filters.lte)) cntQ = cntQ.lte(k, v);
+  const { count } = await cntQ;
+  const total = count || 0;
+  if (total === 0) return [];
+
+  const PAGE = 1000;
+  const pages = Math.ceil(total / PAGE);
+  const promises = [];
+  for (let p = 0; p < pages; p++) {
+    let q = sb.from(table).select(selectFields).range(p * PAGE, (p + 1) * PAGE - 1);
+    if (filters.eq) for (const [k, v] of Object.entries(filters.eq)) q = q.eq(k, v);
+    if (filters.notNull) for (const k of filters.notNull) q = q.not(k, 'is', null);
+    if (filters.isNull) for (const k of filters.isNull) q = q.is(k, null);
+    if (filters.gte) for (const [k, v] of Object.entries(filters.gte)) q = q.gte(k, v);
+    if (filters.lte) for (const [k, v] of Object.entries(filters.lte)) q = q.lte(k, v);
+    promises.push(q);
+  }
+  const results = await Promise.all(promises);
+  return results.flatMap(r => r.data || []);
+}
+
 // UUID v4 — простая валидация (не строгая, но достаточная для SQL safety)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isUuid(s) { return typeof s === 'string' && UUID_RE.test(s); }
@@ -522,31 +553,16 @@ export async function getSalesAnalytics(req, params = {}) {
 
   const sb = pickClient(req);
 
-  // Pagination helper (PostgREST max range = 1000)
-  async function loadAll(query) {
-    let all = [];
-    let off = 0;
-    while (true) {
-      const { data, error } = await query.range(off, off + 999);
-      if (error) throw error;
-      if (!data || data.length === 0) break;
-      all.push(...data);
-      if (data.length < 1000) break;
-      off += 1000;
-    }
-    return all;
-  }
-
-  // 1. Sales timeline
-  let salesQ = sb.from('sales').select('id, sale_date, total_amount, agency_id, partner_id, customer_id');
-  if (args.date_from) salesQ = salesQ.gte('sale_date', args.date_from);
-  if (args.date_to) salesQ = salesQ.lte('sale_date', args.date_to);
-  // B2B/B2C channel filter:
-  //   B2B = есть partner_id (заказ через дизайнера/посредника)
-  //   B2C = partner_id IS NULL (прямой клиент)
-  if (args.channel === 'b2b') salesQ = salesQ.not('partner_id', 'is', null);
-  if (args.channel === 'b2c') salesQ = salesQ.is('partner_id', null);
-  const sales = await loadAll(salesQ);
+  // Параллельная пагинация для sales (с фильтрами)
+  const filters = {};
+  if (args.date_from) filters.gte = { sale_date: args.date_from };
+  if (args.date_to) filters.lte = { sale_date: args.date_to };
+  if (args.channel === 'b2b') filters.notNull = ['partner_id'];
+  if (args.channel === 'b2c') filters.isNull = ['partner_id'];
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, sale_date, total_amount, agency_id, partner_id, customer_id',
+    filters
+  );
 
   // Bucket by month
   const monthly = {};
@@ -603,17 +619,8 @@ export async function getSalesAnalytics(req, params = {}) {
     agency_id: cMap.get(p.contact_id)?.agency_id || null,
   }));
 
-  // 4. Categories
-  let itemsQ = sb.from('sale_items').select('category, sale_id, amount');
-  // Если есть date filter — фильтр по sales через join — proще загрузить ID-ки
-  if (args.date_from || args.date_to) {
-    const saleIds = sales.map(s => s.sale_date && (
-      (!args.date_from || s.sale_date >= args.date_from) &&
-      (!args.date_to || s.sale_date <= args.date_to)
-    )).map((ok, i) => ok ? sales[i].id : null).filter(Boolean);
-    // фильтр упрощим — берём всё (sale_items без даты, фильтр был выше через sales)
-  }
-  const items = await loadAll(itemsQ);
+  // 4. Categories — берём все sale_items параллельно
+  const items = await loadAllParallel(sb, 'sale_items', 'category, sale_id, amount');
   const cats = {};
   for (const it of items || []) {
     const c = it.category || 'other';
@@ -837,19 +844,11 @@ export async function getSegmentation(req) {
 
   const sb = pickClient(req);
 
-  // 1. Все sales c customer_id
-  let sales = [];
-  let off = 0;
-  while (true) {
-    const { data } = await sb.from('sales')
-      .select('customer_id, sale_date, total_amount, city, sale_items(category)')
-      .not('customer_id', 'is', null)
-      .range(off, off + 999);
-    if (!data || data.length === 0) break;
-    sales.push(...data);
-    if (data.length < 1000) break;
-    off += 1000;
-  }
+  // 1. Все sales c customer_id — параллельная пагинация
+  const sales = await loadAllParallel(sb, 'sales',
+    'customer_id, sale_date, total_amount, city, sale_items(category)',
+    { notNull: ['customer_id'] }
+  );
 
   const today = new Date();
   const todayMs = today.getTime();
@@ -1035,27 +1034,11 @@ export async function getProductInsights(req) {
   if (cached) return cached;
   const sb = pickClient(req);
 
-  // Все sale_items + sales (для дат)
-  let items = [];
-  let off = 0;
-  while (true) {
-    const { data } = await sb.from('sale_items')
-      .select('sale_id, sku, raw_name, qty, amount, category')
-      .range(off, off + 999);
-    if (!data || data.length === 0) break;
-    items.push(...data);
-    if (data.length < 1000) break;
-    off += 1000;
-  }
-  let sales = [];
-  off = 0;
-  while (true) {
-    const { data } = await sb.from('sales').select('id, sale_date, customer_id').range(off, off + 999);
-    if (!data || data.length === 0) break;
-    sales.push(...data);
-    if (data.length < 1000) break;
-    off += 1000;
-  }
+  // Все sale_items + sales — параллельно (значительно быстрее последовательной pagination)
+  const [items, sales] = await Promise.all([
+    loadAllParallel(sb, 'sale_items', 'sale_id, sku, raw_name, qty, amount, category'),
+    loadAllParallel(sb, 'sales', 'id, sale_date, customer_id'),
+  ]);
   const salesById = new Map(sales.map(s => [s.id, s]));
 
   // 1. Top SKUs (агрегируем по SKU; если SKU отсутствует — по raw_name)
@@ -1354,19 +1337,11 @@ export async function getPartnerInsights(req) {
   const cutoff_90 = new Date(todayMs - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const cutoff_180 = new Date(todayMs - 180 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  // 1. Все sales где партнёр заполнен
-  let sales = [];
-  let off = 0;
-  while (true) {
-    const { data } = await sb.from('sales')
-      .select('id, partner_id, sale_date, total_amount, customer_id, agency_id, commission_text')
-      .not('partner_id', 'is', null)
-      .range(off, off + 999);
-    if (!data || data.length === 0) break;
-    sales.push(...data);
-    if (data.length < 1000) break;
-    off += 1000;
-  }
+  // 1. Все sales где партнёр заполнен — параллельная пагинация
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, partner_id, sale_date, total_amount, customer_id, agency_id, commission_text',
+    { notNull: ['partner_id'] }
+  );
 
   // 2. Aggregate per partner
   const byPartner = {};
