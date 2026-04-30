@@ -1614,6 +1614,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/segmentation — RFM + cohorts + cities (Group B)
+  router.get('/sales-crm/segmentation', async (req, res) => {
+    try {
+      const r = await salesCrm.getSegmentation(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_segmentation_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners/by-phone/:phone  — cross-link from chat (jid → partner)
   // Returns 200 always: { partner: {...} | null }. Не-найден — это нормальный
   // случай (большинство WhatsApp-номеров не пересекаются с продажами), не 404.

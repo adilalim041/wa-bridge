@@ -716,6 +716,211 @@ export async function getSalesAnalytics(req, params = {}) {
   };
 }
 
+// ── 7b. getSegmentation — RFM + cohorts + cities (Group B) ──────────────────
+//
+// RFM scoring: для каждого клиента (customer_id) считаются три балла 1-5:
+//   R — Recency (дни с последней покупки → меньше = выше балл)
+//   F — Frequency (кол-во заказов → больше = выше)
+//   M — Monetary (общая сумма → больше = выше)
+// Группы:
+//   Champions   — R≥4, F≥4, M≥4
+//   Loyal       — F≥4 (и не champions)
+//   Big Spender — M≥4 (и не champions, не loyal)
+//   At Risk     — R≤2 и F≥3 (раньше много, давно ничего)
+//   New         — F=1, R≥4 (одна покупка, недавно)
+//   Hibernating — R≤2 и F≤2 и M≤2
+//   Casual      — остальные
+//
+// Cohort retention: для клиентов появившихся в каждый месяц 2024-2026,
+// сколько вернулись в последующие N месяцев (table month-by-month).
+//
+// Cities: разбивка sales по городам (через sales.city).
+//
+export async function getSegmentation(req) {
+  const sb = pickClient(req);
+
+  // 1. Все sales c customer_id
+  let sales = [];
+  let off = 0;
+  while (true) {
+    const { data } = await sb.from('sales')
+      .select('customer_id, sale_date, total_amount, city, sale_items(category)')
+      .not('customer_id', 'is', null)
+      .range(off, off + 999);
+    if (!data || data.length === 0) break;
+    sales.push(...data);
+    if (data.length < 1000) break;
+    off += 1000;
+  }
+
+  const today = new Date();
+  const todayMs = today.getTime();
+
+  // 2. Aggregate per customer
+  const byCust = {};
+  for (const s of sales) {
+    if (!s.customer_id || !s.sale_date) continue;
+    if (!byCust[s.customer_id]) byCust[s.customer_id] = {
+      orders: 0, revenue: 0, last_date: null, first_date: null, has_filter: false,
+    };
+    const c = byCust[s.customer_id];
+    c.orders++;
+    c.revenue += s.total_amount || 0;
+    if (!c.last_date || s.sale_date > c.last_date) c.last_date = s.sale_date;
+    if (!c.first_date || s.sale_date < c.first_date) c.first_date = s.sale_date;
+    if ((s.sale_items || []).some(i => i.category === 'water_filter')) c.has_filter = true;
+  }
+
+  // 3. RFM scoring (quintiles)
+  const customers = Object.entries(byCust).map(([id, v]) => {
+    const recency_days = v.last_date
+      ? Math.floor((todayMs - new Date(v.last_date).getTime()) / (1000 * 60 * 60 * 24))
+      : null;
+    return { customer_id: id, ...v, recency_days };
+  });
+  // Quintile thresholds (manually for stability)
+  const sortedByR = [...customers].sort((a, b) => (a.recency_days || 1e9) - (b.recency_days || 1e9));
+  const sortedByF = [...customers].sort((a, b) => b.orders - a.orders);
+  const sortedByM = [...customers].sort((a, b) => b.revenue - a.revenue);
+  const Q = customers.length / 5;
+  function rankOf(arr, id) {
+    const idx = arr.findIndex(c => c.customer_id === id);
+    return Math.min(5, Math.max(1, 5 - Math.floor(idx / Q)));
+  }
+  for (const c of customers) {
+    c.r_score = rankOf(sortedByR, c.customer_id);
+    c.f_score = rankOf(sortedByF, c.customer_id);
+    c.m_score = rankOf(sortedByM, c.customer_id);
+  }
+
+  // 4. Segments
+  function segmentOf(c) {
+    const r = c.r_score, f = c.f_score, m = c.m_score;
+    if (r >= 4 && f >= 4 && m >= 4) return 'champions';
+    if (f >= 4) return 'loyal';
+    if (m >= 4) return 'big_spender';
+    if (r <= 2 && f >= 3) return 'at_risk';
+    if (c.orders === 1 && r >= 4) return 'new';
+    if (r <= 2 && f <= 2 && m <= 2) return 'hibernating';
+    return 'casual';
+  }
+  for (const c of customers) c.segment = segmentOf(c);
+
+  // 5. Bucket counts + revenue
+  const segments = {};
+  for (const c of customers) {
+    if (!segments[c.segment]) segments[c.segment] = { name: c.segment, count: 0, revenue: 0 };
+    segments[c.segment].count++;
+    segments[c.segment].revenue += c.revenue;
+  }
+  const segmentList = Object.values(segments).sort((a, b) => b.revenue - a.revenue);
+
+  // 6. Top customers per segment (для UI лент)
+  const topPerSegment = {};
+  for (const seg of Object.keys(segments)) {
+    topPerSegment[seg] = customers
+      .filter(c => c.segment === seg)
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 30)
+      .map(c => ({ ...c, sale_items: undefined }));
+  }
+  // Add names + phone
+  const allTopIds = [...new Set(Object.values(topPerSegment).flat().map(c => c.customer_id))];
+  const { data: contacts } = allTopIds.length > 0
+    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone, agency_id').in('id', allTopIds)
+    : { data: [] };
+  const cMap = new Map((contacts || []).map(c => [c.id, c]));
+  for (const seg of Object.keys(topPerSegment)) {
+    for (const c of topPerSegment[seg]) {
+      const enrich = cMap.get(c.customer_id);
+      c.name = enrich?.canonical_name || '?';
+      c.phone = enrich?.primary_phone || null;
+      c.agency_id = enrich?.agency_id || null;
+    }
+  }
+
+  // 7. Cohort retention: for each cohort_month (when customer first bought),
+  //    what % returned in month +1, +2, +3, ..., +6?
+  const cohorts = {};
+  for (const c of customers) {
+    if (!c.first_date) continue;
+    const cm = c.first_date.slice(0, 7);
+    if (!cohorts[cm]) cohorts[cm] = { cohort_month: cm, size: 0, returns: {} };
+    cohorts[cm].size++;
+  }
+  // For each sale, if it's not the first one — count return offset
+  for (const s of sales) {
+    if (!s.customer_id || !s.sale_date) continue;
+    const c = byCust[s.customer_id];
+    if (!c || s.sale_date === c.first_date) continue;
+    const cm = c.first_date.slice(0, 7);
+    const sm = s.sale_date.slice(0, 7);
+    const offsetMo = monthDiff(cm, sm);
+    if (offsetMo <= 0 || offsetMo > 12) continue;
+    if (!cohorts[cm].returns[offsetMo]) cohorts[cm].returns[offsetMo] = new Set();
+    cohorts[cm].returns[offsetMo].add(s.customer_id);
+  }
+  const cohortList = Object.values(cohorts)
+    .filter(c => c.size >= 5) // фильтр шумных малых
+    .sort((a, b) => a.cohort_month.localeCompare(b.cohort_month))
+    .map(c => ({
+      cohort_month: c.cohort_month,
+      size: c.size,
+      returns_pct: Object.fromEntries(
+        Array.from({ length: 12 }, (_, i) => i + 1).map(off => [
+          off,
+          c.returns[off] ? Math.round((c.returns[off].size / c.size) * 100) : 0,
+        ])
+      ),
+    }));
+
+  // 8. Cities breakdown
+  const cities = {};
+  for (const s of sales) {
+    const city = (s.city || '—').trim() || '—';
+    if (!cities[city]) cities[city] = { city, orders: 0, revenue: 0, customers: new Set() };
+    cities[city].orders++;
+    cities[city].revenue += s.total_amount || 0;
+    if (s.customer_id) cities[city].customers.add(s.customer_id);
+  }
+  const cityList = Object.values(cities)
+    .map(c => ({ ...c, customers: c.customers.size }))
+    .sort((a, b) => b.revenue - a.revenue);
+
+  // 9. New vs repeat by month
+  const monthlyNew = {};
+  for (const c of customers) {
+    if (!c.first_date) continue;
+    const fm = c.first_date.slice(0, 7);
+    if (!monthlyNew[fm]) monthlyNew[fm] = { month: fm, new_customers: 0, repeat_customers: 0 };
+    monthlyNew[fm].new_customers++;
+  }
+  for (const s of sales) {
+    if (!s.customer_id || !s.sale_date) continue;
+    const c = byCust[s.customer_id];
+    if (!c || s.sale_date === c.first_date) continue;
+    const sm = s.sale_date.slice(0, 7);
+    if (!monthlyNew[sm]) monthlyNew[sm] = { month: sm, new_customers: 0, repeat_customers: 0 };
+    monthlyNew[sm].repeat_customers++;
+  }
+  const newRepeatTimeline = Object.values(monthlyNew).sort((a, b) => a.month.localeCompare(b.month));
+
+  return {
+    segments: segmentList,
+    top_per_segment: topPerSegment,
+    cohorts: cohortList,
+    cities: cityList,
+    new_repeat_timeline: newRepeatTimeline,
+    total_customers: customers.length,
+  };
+}
+
+function monthDiff(fromYM, toYM) {
+  const [fy, fm] = fromYM.split('-').map(Number);
+  const [ty, tm] = toYM.split('-').map(Number);
+  return (ty - fy) * 12 + (tm - fm);
+}
+
 // ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
 //
 // По имени или телефону вернуть до 10 контактов с базовыми агрегатами.
