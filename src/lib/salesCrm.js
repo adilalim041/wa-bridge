@@ -1581,6 +1581,79 @@ export async function getForecast(req) {
     });
   }
 
+  // 6. Авто-инсайты по тренду (без AI на бэке — простые правила)
+  const insights = [];
+  const recentAvg = ys.slice(-3).reduce((s, y) => s + y, 0) / 3; // last 3 months
+  const olderAvg = ys.slice(0, 3).reduce((s, y) => s + y, 0) / 3; // first 3 months
+
+  if (slope > 0) {
+    const monthlyGrowthPct = avgRev > 0 ? Math.round(slope / avgRev * 100 * 10) / 10 : 0;
+    insights.push({
+      kind: 'positive',
+      title: `Тренд +${monthlyGrowthPct}% в месяц`,
+      text: `Линейная регрессия показывает рост ${Math.abs(slope).toLocaleString('ru-RU')} ₸/мес. На 6 мес вперёд ожидается ~${Math.round(forecastTimeline.filter(t => t.forecast).reduce((s, t) => s + t.forecast, 0) / 1_000_000)}M ₸ выручки.`,
+    });
+  } else if (slope < 0) {
+    insights.push({
+      kind: 'warning',
+      title: `Тренд −${Math.round(Math.abs(slope) / avgRev * 100 * 10) / 10}% в месяц`,
+      text: `Выручка падает на ${Math.abs(slope).toLocaleString('ru-RU')} ₸/мес. Стоит разобрать: cold-партнёров, упавшие категории, изменение в каналах продаж.`,
+    });
+  }
+
+  // Сезонные пики и провалы
+  const peakIdx = seasonalMult.indexOf(Math.max(...seasonalMult));
+  const lowIdx = seasonalMult.indexOf(Math.min(...seasonalMult));
+  const RU_MONTH = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
+  if (seasonalMult[peakIdx] > 1.15) {
+    insights.push({
+      kind: 'positive',
+      title: `Пиковый месяц: ${RU_MONTH[peakIdx]}`,
+      text: `Исторически в ${RU_MONTH[peakIdx]} выручка на ${Math.round((seasonalMult[peakIdx] - 1) * 100)}% выше среднего. Готовь склад и менеджеров заранее.`,
+    });
+  }
+  if (seasonalMult[lowIdx] < 0.85) {
+    insights.push({
+      kind: 'warning',
+      title: `Низкий месяц: ${RU_MONTH[lowIdx]}`,
+      text: `В ${RU_MONTH[lowIdx]} выручка на ${Math.round((1 - seasonalMult[lowIdx]) * 100)}% ниже. Стоит запускать акции / промо.`,
+    });
+  }
+
+  // Картриджный пайплайн
+  const totalCartridges = cartridgePipeline.reduce((s, p) => s + p.expected_cartridges, 0);
+  if (totalCartridges > 0) {
+    insights.push({
+      kind: 'action',
+      title: `Картриджей на 12 мес: ${totalCartridges}`,
+      text: `Это «программа-минимум» по replacement-циклу. Реальные продажи могут быть выше за счёт upsell. Планируй 1-2 followup-сессии в месяц.`,
+    });
+  } else {
+    insights.push({
+      kind: 'warning',
+      title: 'Картриджный pipeline пуст',
+      text: 'Похоже что фильтры не продавались за последние 6 месяцев. Стоит проверить категоризацию sale_items или подвинуть продажи фильтров.',
+    });
+  }
+
+  // Сравнение recent vs older
+  if (olderAvg > 0 && recentAvg > 0) {
+    const ratio = recentAvg / olderAvg;
+    if (ratio > 1.3) {
+      insights.push({
+        kind: 'positive',
+        title: 'Точка роста: ускорение',
+        text: `Последние 3 месяца в среднем на ${Math.round((ratio - 1) * 100)}% выше первых 3 — бизнес ускоряется. Закрепи через расширение партнёрской базы.`,
+      });
+    } else if (ratio < 0.8) {
+      insights.push({
+        kind: 'warning',
+        title: 'Торможение: −',
+        text: `Последние 3 месяца на ${Math.round((1 - ratio) * 100)}% ниже первых 3. Проверь cold-партнёров и динамику менеджеров.`,
+      });
+    }
+  }
+
   const result = {
     timeline: forecastTimeline,
     next_6_months_revenue: forecastTimeline.filter(t => t.forecast !== null).reduce((s, t) => s + t.forecast, 0),
@@ -1591,6 +1664,119 @@ export async function getForecast(req) {
     })),
     cartridge_pipeline: cartridgePipeline,
     total_pipeline_units: cartridgePipeline.reduce((s, p) => s + p.expected_cartridges, 0),
+    insights,
+  };
+  cacheSet(ck, result);
+  return result;
+}
+
+// ── 7g2. getCityDetail(city) — детальный анализ одного города ───────────────
+//
+// При клике на город в географии — открывается popup с:
+//   - KPI: orders / customers / revenue / avg_check
+//   - B2B vs B2C breakdown
+//   - Топ-категории в этом городе
+//   - Топ-клиентов / партнёров
+//   - Динамика по месяцам
+//
+const cityDetailInput = z.object({
+  city: z.string().min(1).max(100),
+});
+
+export async function getCityDetail(req, params) {
+  const args = cityDetailInput.parse(params);
+  const ck = cacheKey('city-detail', req, args);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, sale_date, total_amount, customer_id, partner_id, manager, partner_raw, customer_raw',
+    { eq: { city: args.city } }
+  );
+
+  if (sales.length === 0) {
+    return { city: args.city, total_orders: 0, total_revenue: 0, b2b_orders: 0, b2c_orders: 0, b2b_revenue: 0, b2c_revenue: 0, top_categories: [], top_customers: [], top_partners: [], timeline: [] };
+  }
+
+  const saleIds = sales.map(s => s.id);
+
+  // Items для категорий
+  const items = [];
+  for (let i = 0; i < saleIds.length; i += 200) {
+    const batch = saleIds.slice(i, i + 200);
+    const { data } = await sb.from('sale_items').select('sale_id, category, qty, amount').in('sale_id', batch);
+    items.push(...(data || []));
+  }
+
+  // Aggregations
+  let b2bOrd = 0, b2cOrd = 0, b2bRev = 0, b2cRev = 0;
+  const monthly = {};
+  const custAgg = {}, partAgg = {};
+  for (const s of sales) {
+    if (s.partner_id) { b2bOrd++; b2bRev += s.total_amount || 0; }
+    else { b2cOrd++; b2cRev += s.total_amount || 0; }
+    if (s.sale_date) {
+      const m = s.sale_date.slice(0, 7);
+      if (!monthly[m]) monthly[m] = { month: m, orders: 0, revenue: 0 };
+      monthly[m].orders++;
+      monthly[m].revenue += s.total_amount || 0;
+    }
+    if (s.customer_id) {
+      if (!custAgg[s.customer_id]) custAgg[s.customer_id] = { orders: 0, revenue: 0 };
+      custAgg[s.customer_id].orders++;
+      custAgg[s.customer_id].revenue += s.total_amount || 0;
+    }
+    if (s.partner_id) {
+      if (!partAgg[s.partner_id]) partAgg[s.partner_id] = { orders: 0, revenue: 0 };
+      partAgg[s.partner_id].orders++;
+      partAgg[s.partner_id].revenue += s.total_amount || 0;
+    }
+  }
+
+  const catAgg = {};
+  for (const it of items) {
+    const c = it.category || 'other';
+    if (!catAgg[c]) catAgg[c] = { category: c, qty: 0, revenue: 0 };
+    catAgg[c].qty += it.qty || 1;
+    catAgg[c].revenue += it.amount || 0;
+  }
+  const topCategories = Object.values(catAgg).sort((a, b) => b.revenue - a.revenue);
+
+  // Имена топ-клиентов/партнёров
+  const topCustIds = Object.entries(custAgg).sort((a, b) => b[1].revenue - a[1].revenue).slice(0, 10);
+  const topPartIds = Object.entries(partAgg).sort((a, b) => b[1].revenue - a[1].revenue).slice(0, 10);
+  const allIds = [...new Set([...topCustIds.map(x => x[0]), ...topPartIds.map(x => x[0])])];
+  const { data: contacts } = allIds.length > 0
+    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone').in('id', allIds)
+    : { data: [] };
+  const cMap = new Map((contacts || []).map(c => [c.id, c]));
+
+  const result = {
+    city: args.city,
+    total_orders: sales.length,
+    total_revenue: sales.reduce((s, x) => s + (x.total_amount || 0), 0),
+    avg_check: sales.length > 0 ? Math.round(sales.reduce((s, x) => s + (x.total_amount || 0), 0) / sales.length) : 0,
+    unique_customers: Object.keys(custAgg).length,
+    b2b_orders: b2bOrd,
+    b2c_orders: b2cOrd,
+    b2b_revenue: b2bRev,
+    b2c_revenue: b2cRev,
+    b2b_pct: (b2bRev + b2cRev) > 0 ? Math.round(b2bRev / (b2bRev + b2cRev) * 100) : 0,
+    top_categories: topCategories,
+    top_customers: topCustIds.map(([id, agg]) => ({
+      contact_id: id,
+      name: cMap.get(id)?.canonical_name || '?',
+      phone: cMap.get(id)?.primary_phone || null,
+      ...agg,
+    })),
+    top_partners: topPartIds.map(([id, agg]) => ({
+      contact_id: id,
+      name: cMap.get(id)?.canonical_name || '?',
+      phone: cMap.get(id)?.primary_phone || null,
+      ...agg,
+    })),
+    timeline: Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month)),
   };
   cacheSet(ck, result);
   return result;

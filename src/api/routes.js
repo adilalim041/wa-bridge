@@ -1671,6 +1671,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/city/:city — детальный анализ одного города
+  router.get('/sales-crm/city/:city', async (req, res) => {
+    try {
+      const r = await salesCrm.getCityDetail(req, { city: req.params.city });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_city_detail_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/geo — города + delivery KPI (Group G)
   router.get('/sales-crm/geo', async (req, res) => {
     try {
