@@ -246,7 +246,74 @@ export async function markFollowupDone(req, followupId, payload = {}) {
   return { ok: true, followup_id: followupId, completed_at: completedAt, action: args.action };
 }
 
-// ── 6. searchPartner (для AI tools / quick lookup) ──────────────────────────
+// ── 6. findPartnerByPhone (cross-link чат → партнёр) ────────────────────────
+//
+// По телефону (raw из jid или из dashboard) найти партнёра в sales-CRM.
+// Возвращает компактную карточку для плашки в ChatView, или null если такого нет.
+//
+// Phone приходит в разных форматах: 77011234567, 77011234567@s.whatsapp.net,
+// +77011234567, 7-701-123-45-67. Нормализуем до 11 digits, primary_phone в БД
+// тоже хранится как 11 digits (7XXXXXXXXX).
+//
+function normalizePhoneForLookup(raw) {
+  if (!raw) return null;
+  const noJid = String(raw).split('@')[0];
+  const digits = noJid.replace(/\D/g, '');
+  if (digits.length < 10) return null;
+  if (digits.length === 11 && digits.startsWith('8')) return '7' + digits.slice(1);
+  if (digits.length === 11 && digits.startsWith('7')) return digits;
+  if (digits.length === 10) return '7' + digits;
+  return digits;
+}
+
+export async function findPartnerByPhone(req, phoneRaw) {
+  const phone = normalizePhoneForLookup(phoneRaw);
+  if (!phone) return null;
+  const sb = pickClient(req);
+
+  const { data, error } = await sb.from('v_partner_full')
+    .select('id, canonical_name, primary_phone, agency_name, roles, orders_count, total_revenue, last_purchase_date')
+    .eq('primary_phone', phone)
+    .gt('orders_count', 0)
+    .maybeSingle();
+
+  if (error) throw new Error(`findPartnerByPhone: ${error.message}`);
+  if (!data) return null;
+
+  // Краткая сводка категорий из последних 20 заказов (для подсказки upsell-а)
+  // Через 2 запроса (customer + partner role), так проще с PostgREST.
+  const [{ data: salesAsCust }, { data: salesAsPart }] = await Promise.all([
+    sb.from('sales').select('id').eq('customer_id', data.id).order('sale_date', { ascending: false }).limit(20),
+    sb.from('sales').select('id').eq('partner_id', data.id).order('sale_date', { ascending: false }).limit(20),
+  ]);
+  const saleIds = [...new Set([...(salesAsCust || []), ...(salesAsPart || [])].map(s => s.id))];
+  const cats = {};
+  if (saleIds.length > 0) {
+    const { data: recentItems } = await sb.from('sale_items')
+      .select('category')
+      .in('sale_id', saleIds);
+    for (const it of recentItems || []) {
+      const c = it.category || 'other';
+      cats[c] = (cats[c] || 0) + 1;
+    }
+  }
+
+  // Ближайший pending followup (например — картридж через месяц)
+  const { data: nextFollowup } = await sb.from('v_followups_due')
+    .select('followup_id, due_date, followup_type, urgency, note')
+    .eq('contact_id', data.id)
+    .order('due_date', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  return {
+    ...data,
+    top_categories: Object.entries(cats).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([cat, n]) => ({ cat, n })),
+    next_followup: nextFollowup || null,
+  };
+}
+
+// ── 7. searchPartner (для AI tools / quick lookup) ──────────────────────────
 //
 // По имени или телефону вернуть до 10 контактов с базовыми агрегатами.
 // Используется когда AI спрашивает «кто такой Бибинур».
