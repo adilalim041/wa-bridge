@@ -33,7 +33,9 @@ function pickClient(req) {
 // Cache-key включает userId (req.user?.userId или '__service__'), чтобы под
 // разными авторизациями не было утечек между tenants.
 //
-const CACHE_TTL_MS = 60 * 1000;
+// 5 минут TTL — данные импортируются раз в день, изменения через merge редкие.
+// invalidateSalesCache() стирает кэш при write-операциях.
+const CACHE_TTL_MS = 5 * 60 * 1000;
 const _cache = new Map();
 // SECURITY: x-api-key path использует serviceClient (RLS bypass).
 // Кэшировать его результаты под общим ключом ОПАСНО — другой запрос
