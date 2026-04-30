@@ -921,6 +921,161 @@ function monthDiff(fromYM, toYM) {
   return (ty - fy) * 12 + (tm - fm);
 }
 
+// ── 7c. getProductInsights — top SKUs + cross-sell + cartridge funnel (Group C) ─
+//
+// 1) top_skus: топ-50 SKU по количеству + сумме продаж (за всё время или период).
+// 2) cross_sell: пары SKU которые часто берут вместе (для рекомендаций менеджерам).
+// 3) cartridge_funnel: для каждого месяца — сколько фильтров продали → сколько
+//    картриджей должно продаться через 6 мес → сколько реально продали (gap).
+// 4) seasonality: heatmap "месяц × категория" — пиковые месяцы по каждой кат.
+//
+export async function getProductInsights(req) {
+  const sb = pickClient(req);
+
+  // Все sale_items + sales (для дат)
+  let items = [];
+  let off = 0;
+  while (true) {
+    const { data } = await sb.from('sale_items')
+      .select('sale_id, sku, raw_name, qty, amount, category')
+      .range(off, off + 999);
+    if (!data || data.length === 0) break;
+    items.push(...data);
+    if (data.length < 1000) break;
+    off += 1000;
+  }
+  let sales = [];
+  off = 0;
+  while (true) {
+    const { data } = await sb.from('sales').select('id, sale_date, customer_id').range(off, off + 999);
+    if (!data || data.length === 0) break;
+    sales.push(...data);
+    if (data.length < 1000) break;
+    off += 1000;
+  }
+  const salesById = new Map(sales.map(s => [s.id, s]));
+
+  // 1. Top SKUs (агрегируем по SKU; если SKU отсутствует — по raw_name)
+  const skuAgg = {};
+  for (const it of items) {
+    const key = it.sku || `noskus:${(it.raw_name || '').slice(0, 60)}`;
+    if (!skuAgg[key]) skuAgg[key] = {
+      sku: it.sku || null,
+      name: it.raw_name || '?',
+      category: it.category || 'other',
+      qty_sold: 0,
+      orders: new Set(),
+      revenue: 0,
+    };
+    skuAgg[key].qty_sold += it.qty || 1;
+    skuAgg[key].revenue += it.amount || 0;
+    skuAgg[key].orders.add(it.sale_id);
+  }
+  const topSkus = Object.values(skuAgg)
+    .map(s => ({ ...s, orders: s.orders.size }))
+    .sort((a, b) => b.qty_sold - a.qty_sold)
+    .slice(0, 50);
+
+  // 2. Cross-sell pairs (SKU A + SKU B в одном заказе → counter)
+  const itemsBySale = {};
+  for (const it of items) {
+    if (!it.sku) continue;
+    if (!itemsBySale[it.sale_id]) itemsBySale[it.sale_id] = new Set();
+    itemsBySale[it.sale_id].add(it.sku);
+  }
+  const pairCount = {};
+  for (const [saleId, skuSet] of Object.entries(itemsBySale)) {
+    const arr = [...skuSet];
+    if (arr.length < 2) continue;
+    for (let i = 0; i < arr.length; i++) {
+      for (let j = i + 1; j < arr.length; j++) {
+        const key = arr[i] < arr[j] ? `${arr[i]}|${arr[j]}` : `${arr[j]}|${arr[i]}`;
+        pairCount[key] = (pairCount[key] || 0) + 1;
+      }
+    }
+  }
+  const skuNames = new Map();
+  for (const s of topSkus) if (s.sku) skuNames.set(s.sku, s.name);
+  // Тоже — для всех skus используя last seen name
+  for (const it of items) if (it.sku && !skuNames.has(it.sku)) skuNames.set(it.sku, it.raw_name || it.sku);
+
+  const crossSell = Object.entries(pairCount)
+    .filter(([_, c]) => c >= 5)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+    .map(([key, count]) => {
+      const [a, b] = key.split('|');
+      return {
+        sku_a: a, sku_b: b,
+        name_a: skuNames.get(a) || a,
+        name_b: skuNames.get(b) || b,
+        count,
+      };
+    });
+
+  // 3. Cartridge funnel: for each month, count water_filter sold → expected
+  //    cartridges in (month + 6mo). Compare to actual cartridges sold that month.
+  const filterByMonth = {};
+  const cartridgeByMonth = {};
+  for (const it of items) {
+    const sale = salesById.get(it.sale_id);
+    if (!sale?.sale_date) continue;
+    const m = sale.sale_date.slice(0, 7);
+    if (it.category === 'water_filter') {
+      filterByMonth[m] = (filterByMonth[m] || 0) + (it.qty || 1);
+    }
+    if (it.category === 'cartridge') {
+      cartridgeByMonth[m] = (cartridgeByMonth[m] || 0) + (it.qty || 1);
+    }
+  }
+  const allMonths = [...new Set([...Object.keys(filterByMonth), ...Object.keys(cartridgeByMonth)])].sort();
+  function addMonths(ym, n) {
+    const [y, m] = ym.split('-').map(Number);
+    const d = new Date(y, m - 1 + n, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
+  const cartridgeFunnel = allMonths.map(m => ({
+    month: m,
+    filters_sold: filterByMonth[m] || 0,
+    expected_cartridges_at_plus6: filterByMonth[addMonths(m, -6)] || 0,
+    actual_cartridges_sold: cartridgeByMonth[m] || 0,
+    gap: (filterByMonth[addMonths(m, -6)] || 0) - (cartridgeByMonth[m] || 0),
+  }));
+
+  // 4. Seasonality (категория × месяц)
+  const seasonality = {};
+  for (const it of items) {
+    const sale = salesById.get(it.sale_id);
+    if (!sale?.sale_date) continue;
+    const monthIdx = parseInt(sale.sale_date.slice(5, 7), 10); // 1-12
+    const cat = it.category || 'other';
+    if (!seasonality[cat]) seasonality[cat] = Array.from({ length: 12 }, () => 0);
+    seasonality[cat][monthIdx - 1] += it.qty || 1;
+  }
+  const seasonalityList = Object.entries(seasonality)
+    .map(([category, monthly]) => ({ category, monthly }))
+    .sort((a, b) => b.monthly.reduce((s, x) => s + x, 0) - a.monthly.reduce((s, x) => s + x, 0));
+
+  // 5. Bundle stats
+  const itemsCountBySale = {};
+  for (const it of items) {
+    itemsCountBySale[it.sale_id] = (itemsCountBySale[it.sale_id] || 0) + 1;
+  }
+  const bundleStats = {
+    avg_items_per_sale: items.length / Math.max(1, sales.length),
+    one_item_sales: Object.values(itemsCountBySale).filter(n => n === 1).length,
+    multi_item_sales: Object.values(itemsCountBySale).filter(n => n > 1).length,
+  };
+
+  return {
+    top_skus: topSkus,
+    cross_sell: crossSell,
+    cartridge_funnel: cartridgeFunnel,
+    seasonality: seasonalityList,
+    bundle_stats: bundleStats,
+  };
+}
+
 // ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
 //
 // По имени или телефону вернуть до 10 контактов с базовыми агрегатами.
