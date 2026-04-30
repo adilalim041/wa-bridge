@@ -1565,6 +1565,30 @@ export function setupRoutes(app) {
     }
   });
 
+  // POST /sales-crm/partners/:id/merge   { target_id }
+  // Сливает текущий контакт в target. Все заказы/followups перейдут на target.
+  // Source-контакт удаляется. Откатить нельзя без переимпорта.
+  router.post('/sales-crm/partners/:id/merge', async (req, res) => {
+    try {
+      const r = await salesCrm.mergePartners(req, req.params.id, req.body || {});
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_merge_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // POST /sales-crm/partners/:id/agency   { agency_id: uuid|null }
+  router.post('/sales-crm/partners/:id/agency', async (req, res) => {
+    try {
+      const r = await salesCrm.updatePartnerAgency(req, req.params.id, req.body || {});
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_agency_update_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // POST /sales-crm/followups/:id/done   { action, note? }
   router.post('/sales-crm/followups/:id/done', async (req, res) => {
     try {
