@@ -1188,6 +1188,116 @@ export async function getProductInsights(req) {
   return result;
 }
 
+// ── 6c. getPartnerJourney(contactId) — единая хронология событий клиента ────
+//
+// Собирает все события клиента/партнёра в timeline:
+//   - sale          — он что-то купил
+//   - chat_in       — пришло сообщение в WhatsApp от него
+//   - chat_out      — менеджер ответил
+//   - chat_ai       — система проанализировала диалог
+//   - followup_due  — должно было быть напоминание (для ретроспективы)
+//   - followup_done — followup отмечен выполненным
+//
+// Сортировка по timestamp DESC (свежее сверху). Limit 200 событий.
+// Используется в карточке партнёра (Customer Journey).
+//
+export async function getPartnerJourney(req, contactId) {
+  if (!isUuid(contactId)) throw new Error('invalid contact id');
+  const sb = pickClient(req);
+
+  // 1. Контакт + linked_chat_jids
+  const { data: contact } = await sb.from('partner_contacts')
+    .select('id, canonical_name, primary_phone, linked_chat_jids, agency_id')
+    .eq('id', contactId)
+    .maybeSingle();
+  if (!contact) return { events: [] };
+
+  const jids = contact.linked_chat_jids || [];
+
+  // 2. Параллельно: sales / messages / chat_ai / followups
+  const [salesAsCust, salesAsPart, messages, chatAi, followups] = await Promise.all([
+    sb.from('sales').select('id, sale_date, total_amount, customer_raw, partner_raw, source_file, order_num, manager').eq('customer_id', contactId).order('sale_date', { ascending: false }).limit(50),
+    sb.from('sales').select('id, sale_date, total_amount, customer_raw, partner_raw, source_file, order_num, manager').eq('partner_id', contactId).order('sale_date', { ascending: false }).limit(50),
+    jids.length > 0
+      ? sb.from('messages').select('id, session_id, remote_jid, body, from_me, timestamp, message_type').in('remote_jid', jids).order('timestamp', { ascending: false }).limit(80)
+      : Promise.resolve({ data: [] }),
+    jids.length > 0
+      ? sb.from('chat_ai').select('id, analyzed_at, intent, lead_temperature, deal_stage, summary_ru, manager_issues, risk_flags, session_id, remote_jid').in('remote_jid', jids).order('analyzed_at', { ascending: false }).limit(20)
+      : Promise.resolve({ data: [] }),
+    sb.from('followups').select('id, due_date, type, note, completed_at, related_sale_id').eq('contact_id', contactId).order('due_date', { ascending: false }).limit(40),
+  ]);
+
+  // 3. Преобразуем в единый формат event'ов
+  const events = [];
+
+  for (const s of (salesAsCust.data || [])) {
+    events.push({
+      type: 'sale',
+      role: 'customer',
+      ts: s.sale_date ? `${s.sale_date}T12:00:00Z` : null,
+      sale_id: s.id,
+      title: `Купил на ${(s.total_amount || 0).toLocaleString('ru-RU')} ₸`,
+      meta: { order_num: s.order_num, source_file: s.source_file, manager: s.manager, partner_raw: s.partner_raw, customer_raw: s.customer_raw },
+    });
+  }
+  for (const s of (salesAsPart.data || [])) {
+    events.push({
+      type: 'sale',
+      role: 'partner',
+      ts: s.sale_date ? `${s.sale_date}T12:00:00Z` : null,
+      sale_id: s.id,
+      title: `Привёл клиента на ${(s.total_amount || 0).toLocaleString('ru-RU')} ₸`,
+      meta: { order_num: s.order_num, source_file: s.source_file, manager: s.manager, customer_raw: s.customer_raw, partner_raw: s.partner_raw },
+    });
+  }
+  for (const m of (messages.data || [])) {
+    events.push({
+      type: m.from_me ? 'chat_out' : 'chat_in',
+      ts: m.timestamp,
+      message_id: m.id,
+      title: m.from_me ? 'Менеджер написал' : 'Клиент написал',
+      meta: { session_id: m.session_id, remote_jid: m.remote_jid, body: (m.body || '').slice(0, 240), message_type: m.message_type },
+    });
+  }
+  for (const a of (chatAi.data || [])) {
+    events.push({
+      type: 'chat_ai',
+      ts: a.analyzed_at,
+      ai_id: a.id,
+      title: `AI-анализ: ${a.intent || '—'} · ${a.lead_temperature || '—'} · ${a.deal_stage || '—'}`,
+      meta: { summary: a.summary_ru, issues: a.manager_issues, risks: a.risk_flags, session_id: a.session_id, remote_jid: a.remote_jid },
+    });
+  }
+  for (const f of (followups.data || [])) {
+    events.push({
+      type: f.completed_at ? 'followup_done' : 'followup_due',
+      ts: f.completed_at || (f.due_date ? `${f.due_date}T09:00:00Z` : null),
+      followup_id: f.id,
+      title: f.completed_at ? `Followup выполнен: ${f.type}` : `Запланировано напоминание: ${f.type}`,
+      meta: { note: f.note, due_date: f.due_date, related_sale_id: f.related_sale_id },
+    });
+  }
+
+  // Sort by timestamp DESC, drop events without ts
+  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+
+  return {
+    contact: {
+      id: contact.id,
+      canonical_name: contact.canonical_name,
+      primary_phone: contact.primary_phone,
+      has_chat: jids.length > 0,
+    },
+    events: events.slice(0, 200),
+    counts: {
+      sales: (salesAsCust.data?.length || 0) + (salesAsPart.data?.length || 0),
+      messages: messages.data?.length || 0,
+      chat_ai: chatAi.data?.length || 0,
+      followups: followups.data?.length || 0,
+    },
+  };
+}
+
 // ── 7c-extra. getCategoryDrilldown(category) — детальный анализ одной категории ─
 //
 // При клике на категорию в Продуктах — открывается drill-down:

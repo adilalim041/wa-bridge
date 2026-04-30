@@ -1516,6 +1516,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/partners/:id/journey — Customer journey timeline
+  router.get('/sales-crm/partners/:id/journey', async (req, res) => {
+    try {
+      const r = await salesCrm.getPartnerJourney(req, req.params.id);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_journey_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners/:id  — full card
   router.get('/sales-crm/partners/:id', async (req, res) => {
     try {
