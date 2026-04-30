@@ -432,18 +432,39 @@ export async function listAgencies(req) {
 
 // ── 7. getSalesAnalytics ────────────────────────────────────────────────────
 //
-// Агрегаты для дашборда «Аналитика продаж»:
-//   - timeline: выручка/кол-во заказов по месяцам
-//   - top_studios: топ-15 студий с выручкой
-//   - top_partners: топ-15 партнёров с выручкой
-//   - categories: распределение позиций по категориям
-//   - segments: разовые vs повторные клиенты, фильтр-покупатели
-//   - kpi: общие цифры (revenue YTD, заказов в этом месяце, средний чек)
+// Расширенные агрегаты для дашборда «Аналитика продаж».
+//
+// Группа A (расширения 2026-04-30):
+//   - timeline: выручка + средний чек по месяцам
+//   - kpi с PoP/YoY дельтами (current_month vs previous_month / prev_year)
+//   - movers: топ-5 best / worst (партнёры с наибольшим Δ за период)
+//   - pareto: концентрация выручки (для графика Лоренца)
+//   - top_studios/partners теперь со sparkline (12-мес миник по выручке)
+//
+// Принимает date_from / date_to для фильтрации; если не задано — всё время.
 //
 const analyticsInput = z.object({
   date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
+
+// Helper: добавляем 1 месяц к YYYY-MM
+function nextMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+}
+function prevMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`;
+}
+function yoyMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return `${y - 1}-${String(m).padStart(2, '0')}`;
+}
+function pctDelta(curr, prev) {
+  if (!prev) return null;
+  return Math.round(((curr - prev) / prev) * 1000) / 10;
+}
 
 export async function getSalesAnalytics(req, params = {}) {
   const args = analyticsInput.parse(params);
@@ -480,6 +501,10 @@ export async function getSalesAnalytics(req, params = {}) {
     monthly[m].orders++;
     monthly[m].revenue += s.total_amount || 0;
     totalRevenue += s.total_amount || 0;
+  }
+  // Average check per month
+  for (const m of Object.values(monthly)) {
+    m.avg_check = m.orders > 0 ? Math.round(m.revenue / m.orders) : 0;
   }
   const timeline = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month));
 
@@ -566,15 +591,129 @@ export async function getSalesAnalytics(req, params = {}) {
     filter_buyers: filterCustomerIds.size,
   };
 
-  // 6. KPI
+  // 6. KPI с PoP/YoY деltas
+  // Берём «текущий» месяц = последний месяц с заказами в timeline.
+  // Сравниваем с предыдущим (PoP) и тем же месяцем год назад (YoY).
+  const currMonth = timeline[timeline.length - 1]?.month || null;
+  const prevMo = currMonth ? prevMonth(currMonth) : null;
+  const yoyMo = currMonth ? yoyMonth(currMonth) : null;
+  const m_curr = currMonth ? monthly[currMonth] : null;
+  const m_prev = prevMo ? monthly[prevMo] : null;
+  const m_yoy  = yoyMo ? monthly[yoyMo] : null;
+
   const kpi = {
     total_orders: sales.length,
     total_revenue: totalRevenue,
     avg_check: sales.length > 0 ? Math.round(totalRevenue / sales.length) : 0,
     months_covered: timeline.length,
+    current_month: currMonth,
+    current_month_orders: m_curr?.orders || 0,
+    current_month_revenue: m_curr?.revenue || 0,
+    current_month_avg_check: m_curr?.avg_check || 0,
+    pop_orders_pct: m_curr && m_prev ? pctDelta(m_curr.orders, m_prev.orders) : null,
+    pop_revenue_pct: m_curr && m_prev ? pctDelta(m_curr.revenue, m_prev.revenue) : null,
+    pop_avg_check_pct: m_curr && m_prev ? pctDelta(m_curr.avg_check, m_prev.avg_check) : null,
+    yoy_orders_pct: m_curr && m_yoy ? pctDelta(m_curr.orders, m_yoy.orders) : null,
+    yoy_revenue_pct: m_curr && m_yoy ? pctDelta(m_curr.revenue, m_yoy.revenue) : null,
   };
 
-  return { timeline, top_studios, top_partners, categories, segments, kpi };
+  // 7. Movers — top-5 best & worst партнёры по дельте текущий vs прошлый месяц.
+  // Считаем выручку каждого партнёра в curr и prev, ранжируем.
+  let movers_top = [], movers_bottom = [];
+  if (currMonth && prevMo) {
+    const byPartnerCurr = {}, byPartnerPrev = {};
+    const cFrom = `${currMonth}-01`, cTo = nextMonth(currMonth) + '-01';
+    const pFrom = `${prevMo}-01`, pTo = nextMonth(prevMo) + '-01';
+    for (const s of sales) {
+      const id = s.partner_id || s.customer_id;
+      if (!id || !s.sale_date) continue;
+      if (s.sale_date >= cFrom && s.sale_date < cTo) {
+        byPartnerCurr[id] = (byPartnerCurr[id] || 0) + (s.total_amount || 0);
+      } else if (s.sale_date >= pFrom && s.sale_date < pTo) {
+        byPartnerPrev[id] = (byPartnerPrev[id] || 0) + (s.total_amount || 0);
+      }
+    }
+    const allIds = new Set([...Object.keys(byPartnerCurr), ...Object.keys(byPartnerPrev)]);
+    const movers = [...allIds].map(id => ({
+      contact_id: id,
+      curr_revenue: byPartnerCurr[id] || 0,
+      prev_revenue: byPartnerPrev[id] || 0,
+      delta: (byPartnerCurr[id] || 0) - (byPartnerPrev[id] || 0),
+    })).filter(m => m.curr_revenue >= 100000 || m.prev_revenue >= 100000); // нерелевантную мелочь убираем
+
+    // Нужны имена
+    const moverIds = movers.map(m => m.contact_id);
+    const { data: moverContacts } = moverIds.length > 0
+      ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone').in('id', moverIds)
+      : { data: [] };
+    const mcMap = new Map((moverContacts || []).map(c => [c.id, c]));
+    for (const m of movers) {
+      m.name = mcMap.get(m.contact_id)?.canonical_name || '?';
+      m.phone = mcMap.get(m.contact_id)?.primary_phone || null;
+    }
+
+    movers_top = movers.filter(m => m.delta > 0).sort((a, b) => b.delta - a.delta).slice(0, 5);
+    movers_bottom = movers.filter(m => m.delta < 0).sort((a, b) => a.delta - b.delta).slice(0, 5);
+  }
+
+  // 8. Pareto — % выручки от топ-N% партнёров (для curve).
+  const allPartnerRevenues = Object.values(byContact).map(p => p.revenue).sort((a, b) => b - a);
+  const totalPartnerRevenue = allPartnerRevenues.reduce((s, x) => s + x, 0);
+  const pareto = [];
+  let cumPct = 0;
+  for (let i = 0; i < allPartnerRevenues.length; i++) {
+    cumPct += allPartnerRevenues[i] / (totalPartnerRevenue || 1) * 100;
+    const partnerPct = ((i + 1) / allPartnerRevenues.length) * 100;
+    if (i % Math.max(1, Math.floor(allPartnerRevenues.length / 50)) === 0 || i === allPartnerRevenues.length - 1) {
+      pareto.push({
+        partner_pct: Math.round(partnerPct * 10) / 10,
+        revenue_pct: Math.round(cumPct * 10) / 10,
+      });
+    }
+  }
+
+  // 9. Sparkline data для топ-15 партнёров и студий — 12-мес массив выручки.
+  // Ограничиваем последними 12 месяцами от curr_month (или today).
+  const sparkLastN = 12;
+  const sparkMonths = [];
+  if (currMonth) {
+    let m = currMonth;
+    for (let i = 0; i < sparkLastN; i++) {
+      sparkMonths.unshift(m);
+      m = prevMonth(m);
+    }
+  }
+  const sparkByContact = {};
+  const sparkByAgency = {};
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const m = s.sale_date.slice(0, 7);
+    if (!sparkMonths.includes(m)) continue;
+    for (const id of [s.customer_id, s.partner_id].filter(Boolean)) {
+      if (!sparkByContact[id]) sparkByContact[id] = {};
+      sparkByContact[id][m] = (sparkByContact[id][m] || 0) + (s.total_amount || 0);
+    }
+    if (s.agency_id) {
+      if (!sparkByAgency[s.agency_id]) sparkByAgency[s.agency_id] = {};
+      sparkByAgency[s.agency_id][m] = (sparkByAgency[s.agency_id][m] || 0) + (s.total_amount || 0);
+    }
+  }
+  for (const p of top_partners) {
+    p.sparkline = sparkMonths.map(m => sparkByContact[p.contact_id]?.[m] || 0);
+  }
+  for (const a of top_studios) {
+    a.sparkline = sparkMonths.map(m => sparkByAgency[a.agency_id]?.[m] || 0);
+  }
+
+  return {
+    timeline,
+    top_studios, top_partners,
+    categories,
+    segments, kpi,
+    movers_top, movers_bottom,
+    pareto,
+    spark_months: sparkMonths,
+  };
 }
 
 // ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
