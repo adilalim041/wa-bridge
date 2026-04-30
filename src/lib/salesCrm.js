@@ -1076,6 +1076,152 @@ export async function getProductInsights(req) {
   };
 }
 
+// ── 7d. getPartnerInsights — cold/rising/ROI (Group D) ──────────────────────
+//
+// Глубокий анализ партнёров (роль = 'partner', т.е. дизайнеры/посредники):
+// 1) cold_partners: партнёры которые приводили клиентов раньше, но не за последние 60+ дней
+// 2) rising_stars: партнёры в топ-30 по выручке за последние 90 дней,
+//    которых не было в топ-30 ранее (растущие)
+// 3) roi: парсим commission_text из заказов (часто текст "10%", "50000",
+//    "дозатор в подарок") → грубая оценка стоимости каждого партнёра
+// 4) studio_vs_independent: % выручки от партнёров со студией vs одиночек
+// 5) journey_per_partner: для каждого топ-партнёра — список месяцев с активностью
+//
+export async function getPartnerInsights(req) {
+  const sb = pickClient(req);
+
+  const today = new Date();
+  const todayMs = today.getTime();
+  const cold_threshold_ms = 60 * 24 * 60 * 60 * 1000; // 60 дней
+  const cutoff_90 = new Date(todayMs - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const cutoff_180 = new Date(todayMs - 180 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  // 1. Все sales где партнёр заполнен
+  let sales = [];
+  let off = 0;
+  while (true) {
+    const { data } = await sb.from('sales')
+      .select('id, partner_id, sale_date, total_amount, customer_id, agency_id, commission_text')
+      .not('partner_id', 'is', null)
+      .range(off, off + 999);
+    if (!data || data.length === 0) break;
+    sales.push(...data);
+    if (data.length < 1000) break;
+    off += 1000;
+  }
+
+  // 2. Aggregate per partner
+  const byPartner = {};
+  for (const s of sales) {
+    if (!byPartner[s.partner_id]) byPartner[s.partner_id] = {
+      partner_id: s.partner_id,
+      orders: 0, revenue: 0, last_date: null, first_date: null,
+      revenue_recent_90: 0, revenue_prev_90_180: 0,
+      commission_total: 0, commission_pct_avg: 0, commission_text_count: 0,
+      unique_customers: new Set(),
+    };
+    const p = byPartner[s.partner_id];
+    p.orders++;
+    p.revenue += s.total_amount || 0;
+    if (!p.last_date || s.sale_date > p.last_date) p.last_date = s.sale_date;
+    if (!p.first_date || s.sale_date < p.first_date) p.first_date = s.sale_date;
+    if (s.sale_date >= cutoff_90) p.revenue_recent_90 += s.total_amount || 0;
+    else if (s.sale_date >= cutoff_180) p.revenue_prev_90_180 += s.total_amount || 0;
+    if (s.customer_id) p.unique_customers.add(s.customer_id);
+
+    // Commission parser (грубо)
+    const ct = (s.commission_text || '').toString();
+    if (ct) {
+      p.commission_text_count++;
+      // Попробуем найти %
+      const pctMatch = ct.match(/(\d{1,2})\s*%/);
+      if (pctMatch) {
+        const pct = parseInt(pctMatch[1]);
+        if (pct > 0 && pct < 50) {
+          p.commission_total += (s.total_amount || 0) * pct / 100;
+          p.commission_pct_avg += pct;
+        }
+      } else {
+        // Прямое число
+        const numMatch = ct.match(/(\d{4,7})/);
+        if (numMatch) p.commission_total += parseInt(numMatch[1]);
+      }
+    }
+  }
+
+  // Финализируем агрегаты
+  const partners = Object.values(byPartner).map(p => ({
+    ...p,
+    unique_customers: p.unique_customers.size,
+    commission_pct_avg: p.commission_text_count > 0
+      ? Math.round(p.commission_pct_avg / p.commission_text_count)
+      : null,
+    days_since_last: p.last_date
+      ? Math.floor((todayMs - new Date(p.last_date).getTime()) / (1000 * 60 * 60 * 24))
+      : null,
+    roi_ratio: p.commission_total > 0 && p.revenue > 0
+      ? Math.round((p.revenue / p.commission_total) * 10) / 10
+      : null,
+  }));
+
+  // Имена + студия
+  const partnerIds = partners.map(p => p.partner_id);
+  const { data: contacts } = partnerIds.length > 0
+    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone, agency_id').in('id', partnerIds)
+    : { data: [] };
+  const cMap = new Map((contacts || []).map(c => [c.id, c]));
+
+  const { data: agencies } = await sb.from('agencies').select('id, canonical_name');
+  const aMap = new Map((agencies || []).map(a => [a.id, a.canonical_name]));
+
+  for (const p of partners) {
+    const c = cMap.get(p.partner_id);
+    p.name = c?.canonical_name || '?';
+    p.phone = c?.primary_phone || null;
+    p.agency_id = c?.agency_id || null;
+    p.agency_name = c?.agency_id ? aMap.get(c.agency_id) || null : null;
+  }
+
+  // 3. Cold partners (>=60 дней без активности, при revenue >= 500K за всё время)
+  const cold_partners = partners
+    .filter(p => p.days_since_last !== null && p.days_since_last >= 60 && p.revenue >= 500000)
+    .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 30);
+
+  // 4. Rising stars: revenue_recent_90 >= 200K, при этом revenue_prev_90_180 < revenue_recent_90 / 2
+  const rising_stars = partners
+    .filter(p => p.revenue_recent_90 >= 200000 && p.revenue_prev_90_180 < p.revenue_recent_90 * 0.5)
+    .sort((a, b) => b.revenue_recent_90 - a.revenue_recent_90)
+    .slice(0, 20);
+
+  // 5. ROI ranking — топ по revenue / commission
+  const roi_ranking = partners
+    .filter(p => p.commission_total > 0 && p.revenue >= 500000)
+    .sort((a, b) => b.roi_ratio - a.roi_ratio)
+    .slice(0, 20);
+
+  // 6. Studio vs Independent
+  let with_studio = { partners: 0, revenue: 0 };
+  let independent = { partners: 0, revenue: 0 };
+  for (const p of partners) {
+    if (p.agency_id) {
+      with_studio.partners++;
+      with_studio.revenue += p.revenue;
+    } else {
+      independent.partners++;
+      independent.revenue += p.revenue;
+    }
+  }
+
+  return {
+    cold_partners,
+    rising_stars,
+    roi_ranking,
+    studio_vs_independent: { with_studio, independent },
+    total_partners: partners.length,
+  };
+}
+
 // ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
 //
 // По имени или телефону вернуть до 10 контактов с базовыми агрегатами.
