@@ -1448,6 +1448,100 @@ export async function getCategoryDrilldown(req, params) {
   return result;
 }
 
+// ── 7d-extra. getManagerPerformance — performance review (Group F) ──────────
+//
+// Аналитика по менеджерам (поле sales.manager — текстовое имя):
+// - leaderboard: total_revenue / total_orders / avg_check / first_purchase_date
+// - timeline: revenue по месяцам по каждому менеджеру (multi-line)
+// - segments_per_manager: разрез B2B/B2C
+// - response_time (если есть в manager_analytics): средний secs до ответа
+//
+export async function getManagerPerformance(req) {
+  const ck = cacheKey('manager-perf', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, sale_date, total_amount, manager, partner_id, customer_id'
+  );
+
+  const byManager = {};
+  for (const s of sales) {
+    const m = (s.manager || '—').toString().trim() || '—';
+    if (!byManager[m]) byManager[m] = {
+      name: m, orders: 0, revenue: 0, b2b_orders: 0, b2c_orders: 0,
+      first_date: null, last_date: null, by_month: {},
+    };
+    const x = byManager[m];
+    x.orders++;
+    x.revenue += s.total_amount || 0;
+    if (s.partner_id) x.b2b_orders++;
+    else x.b2c_orders++;
+    if (s.sale_date) {
+      if (!x.first_date || s.sale_date < x.first_date) x.first_date = s.sale_date;
+      if (!x.last_date || s.sale_date > x.last_date) x.last_date = s.sale_date;
+      const ym = s.sale_date.slice(0, 7);
+      if (!x.by_month[ym]) x.by_month[ym] = { revenue: 0, orders: 0 };
+      x.by_month[ym].revenue += s.total_amount || 0;
+      x.by_month[ym].orders++;
+    }
+  }
+
+  // Сборка timeline для multi-line chart (последние 12 мес)
+  const allMonths = [...new Set(sales.map(s => s.sale_date?.slice(0, 7)).filter(Boolean))].sort();
+  const last12 = allMonths.slice(-12);
+  const timeline = last12.map(m => {
+    const row = { month: m };
+    for (const mname of Object.keys(byManager)) {
+      row[mname] = byManager[mname].by_month[m]?.revenue || 0;
+    }
+    return row;
+  });
+
+  const leaderboard = Object.values(byManager)
+    .filter(m => m.name !== '—' && m.orders >= 5) // мусорные/однораз. убираем
+    .map(m => ({
+      ...m,
+      avg_check: m.orders > 0 ? Math.round(m.revenue / m.orders) : 0,
+      b2b_pct: m.orders > 0 ? Math.round(m.b2b_orders / m.orders * 100) : 0,
+      // sparkline 12 месяцев
+      sparkline: last12.map(ym => m.by_month[ym]?.revenue || 0),
+    }))
+    .sort((a, b) => b.revenue - a.revenue)
+    .map(m => { delete m.by_month; return m; });
+
+  // Response time (если manager_analytics существует — try-catch)
+  let responseTimes = [];
+  try {
+    const { data } = await sb.from('manager_analytics')
+      .select('manager_session_id, response_time_seconds, customer_message_at')
+      .not('response_time_seconds', 'is', null)
+      .order('customer_message_at', { ascending: false })
+      .limit(10000);
+    if (data && data.length > 0) {
+      const bySession = {};
+      for (const r of data) {
+        const sid = r.manager_session_id || '—';
+        if (!bySession[sid]) bySession[sid] = { total: 0, count: 0 };
+        bySession[sid].total += r.response_time_seconds || 0;
+        bySession[sid].count++;
+      }
+      responseTimes = Object.entries(bySession).map(([sid, v]) => ({
+        session_id: sid,
+        avg_response_seconds: v.count > 0 ? Math.round(v.total / v.count) : 0,
+        sample_count: v.count,
+      })).sort((a, b) => a.avg_response_seconds - b.avg_response_seconds);
+    }
+  } catch (e) {
+    // manager_analytics может не существовать — это OK
+  }
+
+  const result = { leaderboard, timeline, response_times: responseTimes };
+  cacheSet(ck, result);
+  return result;
+}
+
 // ── 7d. getPartnerInsights — cold/rising/ROI (Group D) ──────────────────────
 //
 // Глубокий анализ партнёров (роль = 'partner', т.е. дизайнеры/посредники):

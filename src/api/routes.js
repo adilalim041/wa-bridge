@@ -1660,6 +1660,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/manager-performance — leaderboard + timeline + response times (Group F)
+  router.get('/sales-crm/manager-performance', async (req, res) => {
+    try {
+      const r = await salesCrm.getManagerPerformance(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_manager_perf_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners-insights — cold/rising/ROI (Group D)
   router.get('/sales-crm/partners-insights', async (req, res) => {
     try {
