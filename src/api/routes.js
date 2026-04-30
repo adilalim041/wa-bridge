@@ -1660,6 +1660,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/geo — города + delivery KPI (Group G)
+  router.get('/sales-crm/geo', async (req, res) => {
+    try {
+      const r = await salesCrm.getGeoStats(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_geo_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/auto-insights — автогенерация фактов дня (Group H)
   router.get('/sales-crm/auto-insights', async (req, res) => {
     try {

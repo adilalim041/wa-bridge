@@ -1448,6 +1448,89 @@ export async function getCategoryDrilldown(req, params) {
   return result;
 }
 
+// ── 7g. getGeoStats — города + доставка (Group G) ───────────────────────────
+//
+// Группировка sales по городу:
+// - revenue / orders / clients / avg_check
+// - delivery KPI: % delivered / refused / pending (из delivery_status)
+// - средние дни доставки (sale_date → delivery_date)
+//
+export async function getGeoStats(req) {
+  const ck = cacheKey('geo', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  const sales = await loadAllParallel(sb, 'sales',
+    'sale_date, total_amount, customer_id, city, delivery_status, delivery_date'
+  );
+
+  const byCity = {};
+  let totalDelivered = 0, totalRefused = 0, totalPending = 0, totalNoStatus = 0;
+  let deliveryDaysSum = 0, deliveryDaysCount = 0;
+
+  for (const s of sales) {
+    const city = (s.city || '—').toString().trim() || '—';
+    if (!byCity[city]) byCity[city] = {
+      city, orders: 0, revenue: 0, customers: new Set(),
+      delivered: 0, refused: 0, pending: 0, no_status: 0,
+      delivery_days_sum: 0, delivery_days_count: 0,
+    };
+    const c = byCity[city];
+    c.orders++;
+    c.revenue += s.total_amount || 0;
+    if (s.customer_id) c.customers.add(s.customer_id);
+
+    if (s.delivery_status === 'delivered') { c.delivered++; totalDelivered++; }
+    else if (s.delivery_status === 'refused') { c.refused++; totalRefused++; }
+    else if (s.delivery_status === 'pending') { c.pending++; totalPending++; }
+    else { c.no_status++; totalNoStatus++; }
+
+    if (s.sale_date && s.delivery_date) {
+      const days = Math.round(
+        (new Date(s.delivery_date).getTime() - new Date(s.sale_date).getTime()) / (1000 * 60 * 60 * 24)
+      );
+      if (days >= 0 && days <= 90) {
+        c.delivery_days_sum += days;
+        c.delivery_days_count++;
+        deliveryDaysSum += days;
+        deliveryDaysCount++;
+      }
+    }
+  }
+
+  const cities = Object.values(byCity).map(c => ({
+    city: c.city,
+    orders: c.orders,
+    revenue: c.revenue,
+    customers: c.customers.size,
+    avg_check: c.orders > 0 ? Math.round(c.revenue / c.orders) : 0,
+    delivered: c.delivered,
+    refused: c.refused,
+    pending: c.pending,
+    no_status: c.no_status,
+    delivery_rate_pct: c.orders > 0 ? Math.round(c.delivered / c.orders * 100) : 0,
+    avg_delivery_days: c.delivery_days_count > 0 ? Math.round(c.delivery_days_sum / c.delivery_days_count) : null,
+  })).sort((a, b) => b.revenue - a.revenue);
+
+  const total = sales.length;
+  const result = {
+    cities,
+    delivery_kpi: {
+      total_orders: total,
+      delivered: totalDelivered,
+      refused: totalRefused,
+      pending: totalPending,
+      no_status: totalNoStatus,
+      delivered_pct: total > 0 ? Math.round(totalDelivered / total * 100) : 0,
+      refused_pct: total > 0 ? Math.round(totalRefused / total * 100) : 0,
+      avg_delivery_days: deliveryDaysCount > 0 ? Math.round(deliveryDaysSum / deliveryDaysCount) : null,
+    },
+  };
+  cacheSet(ck, result);
+  return result;
+}
+
 // ── 7f. getAutoInsights — автоматические инсайты (Group H) ──────────────────
 //
 // Автоматически вычисляемые «факты дня» для главной страницы:
