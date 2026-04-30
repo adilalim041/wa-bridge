@@ -1606,7 +1606,8 @@ export function setupRoutes(app) {
       const r = await salesCrm.getSalesAnalytics(req, {
         date_from: req.query.date_from,
         date_to: req.query.date_to,
-        channel: req.query.channel, // фикс: раньше параметр игнорировался → B2B/B2C filter не работал
+        channel: req.query.channel,
+        compare_month: req.query.compare_month, // YYYY-MM для movers picker
       });
       res.json(r);
     } catch (e) {

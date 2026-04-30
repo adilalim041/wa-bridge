@@ -538,6 +538,9 @@ const analyticsInput = z.object({
   date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   channel:   z.enum(['all', 'b2b', 'b2c']).default('all'),
+  // YYYY-MM — целевой месяц для расчёта movers (this vs previous).
+  // Если не указан — используется последний месяц с данными (default).
+  compare_month: z.string().regex(/^\d{4}-\d{2}$/).optional(),
 });
 
 // Helper: добавляем 1 месяц к YYYY-MM
@@ -671,9 +674,9 @@ export async function getSalesAnalytics(req, params = {}) {
   };
 
   // 6. KPI с PoP/YoY деltas
-  // Берём «текущий» месяц = последний месяц с заказами в timeline.
-  // Сравниваем с предыдущим (PoP) и тем же месяцем год назад (YoY).
-  const currMonth = timeline[timeline.length - 1]?.month || null;
+  // По умолчанию «текущий» месяц = последний месяц с заказами в timeline.
+  // Если указан compare_month — используем его (для произвольного сравнения).
+  const currMonth = args.compare_month || timeline[timeline.length - 1]?.month || null;
   const prevMo = currMonth ? prevMonth(currMonth) : null;
   const yoyMo = currMonth ? yoyMonth(currMonth) : null;
   const m_curr = currMonth ? monthly[currMonth] : null;
@@ -811,12 +814,18 @@ export async function getSalesAnalytics(req, params = {}) {
   }
   const b2b_timeline = Object.values(b2bMonthly).sort((a, b) => a.month.localeCompare(b.month));
 
+  // Список доступных месяцев для UI-picker (последние 18 от сегодняшнего)
+  const availableMonths = Object.keys(monthly).sort().reverse().slice(0, 18);
+
   const result = {
     timeline,
     top_studios, top_partners,
     categories,
     segments, kpi,
     movers_top, movers_bottom,
+    movers_compare_month: currMonth,
+    movers_prev_month: prevMo,
+    available_months: availableMonths,
     pareto,
     spark_months: sparkMonths,
     channel_breakdown: {
