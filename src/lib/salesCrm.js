@@ -1454,6 +1454,30 @@ export async function getCategoryDrilldown(req, params) {
     ...agg,
   }));
 
+  // 5. Группировка SKU по «семействам» — первое значимое слово в raw_name
+  // (например, "Мойка Omi 53" / "Мойка Omi 76" → семейство "Omi")
+  // Цель: внутри категории "Мойки" увидеть какие модельные ряды лидируют.
+  function familyKey(name) {
+    if (!name) return '?';
+    // Убираем тип-префикс (Мойка/Смеситель/Дозатор/...) и берём первое латинское слово
+    const cleaned = String(name).replace(/^(Мойка|Смеситель|Дозатор|Измельчитель|Ролл-мат|Сушка|Картридж|Декоративная|Перелив|Сменный|Отводная|Подставка|Точилка|Кнопка|Стакан)\s*/i, '');
+    const m = cleaned.match(/[A-Za-z][A-Za-z0-9-]+/);
+    return m ? m[0] : cleaned.split(/\s+/)[0] || '?';
+  }
+  const families = {};
+  for (const it of items) {
+    const fam = familyKey(it.raw_name);
+    if (!families[fam]) families[fam] = { family: fam, qty: 0, revenue: 0, orders: new Set(), sample_names: new Set() };
+    families[fam].qty += it.qty || 1;
+    families[fam].revenue += it.amount || 0;
+    families[fam].orders.add(it.sale_id);
+    if (families[fam].sample_names.size < 5) families[fam].sample_names.add(it.raw_name);
+  }
+  const familiesList = Object.values(families)
+    .map(f => ({ ...f, orders: f.orders.size, sample_names: [...f.sample_names] }))
+    .sort((a, b) => b.qty - a.qty)
+    .slice(0, 20);
+
   const result = {
     category: args.category,
     total_qty: items.reduce((s, x) => s + (x.qty || 1), 0),
@@ -1463,6 +1487,7 @@ export async function getCategoryDrilldown(req, params) {
     top_skus: topSkus,
     top_customers: topCustomers,
     top_partners: topPartners,
+    families: familiesList,
   };
   cacheSet(ck, result);
   return result;
