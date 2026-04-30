@@ -1660,6 +1660,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/auto-insights — автогенерация фактов дня (Group H)
+  router.get('/sales-crm/auto-insights', async (req, res) => {
+    try {
+      const r = await salesCrm.getAutoInsights(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_auto_insights_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/lead-funnel — chat_ai → sales conversion (Group E)
   router.get('/sales-crm/lead-funnel', async (req, res) => {
     try {

@@ -1448,6 +1448,201 @@ export async function getCategoryDrilldown(req, params) {
   return result;
 }
 
+// ── 7f. getAutoInsights — автоматические инсайты (Group H) ──────────────────
+//
+// Автоматически вычисляемые «факты дня» для главной страницы:
+// 1. Сравнение PoP/YoY текущего месяца → если ярко плохо/хорошо
+// 2. Топ-партнёр месяца с динамикой
+// 3. Концентрация выручки (если 80%/<20% — alert)
+// 4. Картриджный gap (сколько followups в эту неделю)
+// 5. Cold partners count
+// 6. Резкий drop студии (если -30%+)
+// 7. Лидер по новым клиентам месяца
+// 8. Конверсия из chat_ai (если есть данные)
+//
+export async function getAutoInsights(req) {
+  const ck = cacheKey('auto-insights', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, sale_date, total_amount, partner_id, customer_id, agency_id'
+  );
+
+  const insights = [];
+  const today = new Date();
+  const todayStr = today.toISOString().slice(0, 10);
+
+  // 1. Текущий месяц vs предыдущий
+  const monthly = {};
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const m = s.sale_date.slice(0, 7);
+    if (!monthly[m]) monthly[m] = { revenue: 0, orders: 0 };
+    monthly[m].revenue += s.total_amount || 0;
+    monthly[m].orders++;
+  }
+  const months = Object.keys(monthly).sort();
+  const currM = months[months.length - 1];
+  const prevM = months[months.length - 2];
+  const yoyM = currM ? `${parseInt(currM.slice(0, 4)) - 1}-${currM.slice(5)}` : null;
+
+  if (currM && prevM) {
+    const dRev = monthly[currM].revenue - monthly[prevM].revenue;
+    const dPct = monthly[prevM].revenue > 0 ? Math.round(dRev / monthly[prevM].revenue * 100) : 0;
+    if (Math.abs(dPct) >= 15) {
+      insights.push({
+        kind: dPct > 0 ? 'positive' : 'negative',
+        priority: Math.abs(dPct) >= 30 ? 1 : 2,
+        title: `${currM}: выручка ${dPct > 0 ? 'выросла' : 'упала'} на ${Math.abs(dPct)}%`,
+        text: `${monthly[currM].revenue.toLocaleString('ru-RU')} ₸ vs ${monthly[prevM].revenue.toLocaleString('ru-RU')} ₸ в ${prevM}.`,
+      });
+    }
+  }
+  if (currM && yoyM && monthly[yoyM]) {
+    const dRev = monthly[currM].revenue - monthly[yoyM].revenue;
+    const dPct = monthly[yoyM].revenue > 0 ? Math.round(dRev / monthly[yoyM].revenue * 100) : 0;
+    if (Math.abs(dPct) >= 25) {
+      insights.push({
+        kind: dPct > 0 ? 'positive' : 'negative',
+        priority: 2,
+        title: `Год-к-году ${yoyM} → ${currM}: ${dPct > 0 ? '+' : ''}${dPct}%`,
+        text: `${monthly[currM].revenue.toLocaleString('ru-RU')} vs ${monthly[yoyM].revenue.toLocaleString('ru-RU')} ₸.`,
+      });
+    }
+  }
+
+  // 2. Концентрация (Pareto)
+  const byPartner = {};
+  for (const s of sales) {
+    const id = s.partner_id || s.customer_id;
+    if (!id) continue;
+    byPartner[id] = (byPartner[id] || 0) + (s.total_amount || 0);
+  }
+  const pSorted = Object.values(byPartner).sort((a, b) => b - a);
+  const totalRev = pSorted.reduce((s, x) => s + x, 0);
+  let cum = 0;
+  let k80 = 0;
+  for (let i = 0; i < pSorted.length; i++) {
+    cum += pSorted[i];
+    if (cum / totalRev >= 0.8) { k80 = i + 1; break; }
+  }
+  const k80pct = pSorted.length > 0 ? Math.round(k80 / pSorted.length * 100) : 0;
+  if (k80pct < 20 && pSorted.length >= 30) {
+    insights.push({
+      kind: 'warning',
+      priority: 1,
+      title: `Высокая зависимость: 80% выручки от ${k80pct}% партнёров`,
+      text: `Всего ${k80} топ-партнёров делают 80% выручки. Если уйдут — будет резкий провал. Стоит расширять базу.`,
+    });
+  } else if (k80pct >= 40) {
+    insights.push({
+      kind: 'positive',
+      priority: 3,
+      title: `Распределённая выручка: 80% делают ${k80pct}% партнёров`,
+      text: `Бизнес устойчивый — нет критической зависимости от 5-10 топов.`,
+    });
+  }
+
+  // 3. Cold partners
+  const cutoff60 = new Date(today.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const partnerLastSale = {};
+  const partnerTotalRev = {};
+  for (const s of sales) {
+    if (!s.partner_id || !s.sale_date) continue;
+    if (!partnerLastSale[s.partner_id] || s.sale_date > partnerLastSale[s.partner_id]) {
+      partnerLastSale[s.partner_id] = s.sale_date;
+    }
+    partnerTotalRev[s.partner_id] = (partnerTotalRev[s.partner_id] || 0) + (s.total_amount || 0);
+  }
+  const coldCount = Object.keys(partnerLastSale).filter(id =>
+    partnerLastSale[id] < cutoff60 && (partnerTotalRev[id] || 0) >= 500000
+  ).length;
+  if (coldCount >= 5) {
+    insights.push({
+      kind: 'warning',
+      priority: 2,
+      title: `${coldCount} партнёров не приводили клиентов >60 дней`,
+      text: `Каждый из них исторически принёс ≥500K ₸. Открой «Аналитика → Инсайты → Холодные партнёры» для списка.`,
+    });
+  }
+
+  // 4. Картриджный gap (followups due соседние недели)
+  const next14 = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { count: dueFollowups } = await sb.from('followups')
+    .select('*', { count: 'exact', head: true })
+    .is('completed_at', null)
+    .lte('due_date', next14);
+  if ((dueFollowups || 0) >= 10) {
+    insights.push({
+      kind: 'action',
+      priority: 1,
+      title: `${dueFollowups} напоминаний на следующие 2 недели`,
+      text: `Откройте «Партнёры» → ленту followups, или используйте виджет на главной странице.`,
+    });
+  }
+
+  // 5. Топ-движение текущего месяца
+  if (currM && prevM) {
+    const cFrom = `${currM}-01`, cTo = nextMonth(currM) + '-01';
+    const pFrom = `${prevM}-01`, pTo = nextMonth(prevM) + '-01';
+    const byCurr = {}, byPrev = {};
+    for (const s of sales) {
+      const id = s.partner_id || s.customer_id;
+      if (!id) continue;
+      if (s.sale_date >= cFrom && s.sale_date < cTo) byCurr[id] = (byCurr[id] || 0) + (s.total_amount || 0);
+      else if (s.sale_date >= pFrom && s.sale_date < pTo) byPrev[id] = (byPrev[id] || 0) + (s.total_amount || 0);
+    }
+    const movers = Object.keys({ ...byCurr, ...byPrev }).map(id => ({
+      id, curr: byCurr[id] || 0, prev: byPrev[id] || 0, delta: (byCurr[id] || 0) - (byPrev[id] || 0),
+    }));
+    const topUp = movers.sort((a, b) => b.delta - a.delta)[0];
+    const topDown = movers.sort((a, b) => a.delta - b.delta)[0];
+    if (topUp && topUp.delta >= 500000) {
+      const { data: c } = await sb.from('partner_contacts').select('canonical_name').eq('id', topUp.id).maybeSingle();
+      insights.push({
+        kind: 'positive',
+        priority: 3,
+        title: `★ Звезда месяца: ${c?.canonical_name || '?'}`,
+        text: `Принёс +${topUp.delta.toLocaleString('ru-RU')} ₸ к ${prevM} (${topUp.prev.toLocaleString('ru-RU')} → ${topUp.curr.toLocaleString('ru-RU')}).`,
+      });
+    }
+    if (topDown && topDown.delta <= -500000) {
+      const { data: c } = await sb.from('partner_contacts').select('canonical_name').eq('id', topDown.id).maybeSingle();
+      insights.push({
+        kind: 'warning',
+        priority: 2,
+        title: `Просел: ${c?.canonical_name || '?'}`,
+        text: `Принёс на ${(-topDown.delta).toLocaleString('ru-RU')} ₸ меньше чем в ${prevM}. Стоит написать.`,
+      });
+    }
+  }
+
+  // 6. Картриджный gap по фактическим данным (последние 6 мес)
+  const start6m = new Date(today.getTime() - 6 * 31 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data: recentItems } = await sb.from('sale_items')
+    .select('category, qty, sale_id')
+    .eq('category', 'water_filter')
+    .order('id', { ascending: false })
+    .limit(5000);
+  if (recentItems && recentItems.length > 0) {
+    insights.push({
+      kind: 'action',
+      priority: 2,
+      title: `База re-engage: ${recentItems.length} проданных фильтров`,
+      text: `Картриджи нужно менять каждые 6 мес. Проверь «Аналитика → Продукты → Картриджная воронка».`,
+    });
+  }
+
+  // Sort by priority
+  insights.sort((a, b) => a.priority - b.priority);
+
+  const result = { insights, generated_at: new Date().toISOString(), period: currM };
+  cacheSet(ck, result);
+  return result;
+}
+
 // ── 7e. getLeadFunnel — lead→sale conversion (Group E) ──────────────────────
 //
 // Соединяет chat_ai (там есть intent / lead_temperature / deal_stage)
