@@ -1660,6 +1660,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/lead-funnel — chat_ai → sales conversion (Group E)
+  router.get('/sales-crm/lead-funnel', async (req, res) => {
+    try {
+      const r = await salesCrm.getLeadFunnel(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_lead_funnel_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/manager-performance — leaderboard + timeline + response times (Group F)
   router.get('/sales-crm/manager-performance', async (req, res) => {
     try {

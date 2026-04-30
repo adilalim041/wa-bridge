@@ -1448,6 +1448,144 @@ export async function getCategoryDrilldown(req, params) {
   return result;
 }
 
+// ── 7e. getLeadFunnel — lead→sale conversion (Group E) ──────────────────────
+//
+// Соединяет chat_ai (там есть intent / lead_temperature / deal_stage)
+// с sales через jid → partner_contact_id → продажи этого контакта.
+//
+// Lead = строка в chat_ai (диалог с потенциальным клиентом).
+// Считаем converted = была ли продажа этому контакту в окне ±30 дней от analyzed_at.
+//
+// Группируем:
+// - by_intent: price_inquiry / consultation / complaint / collaboration / small_talk
+// - by_temperature: hot / warm / cold / dead
+// - by_deal_stage: first_contact → consultation → ... → completed/refused
+// - by_source: instagram / altyn_agash / unknown
+// - by_session: per manager session
+//
+export async function getLeadFunnel(req) {
+  const ck = cacheKey('lead-funnel', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  // 1. Все chat_ai с jid (limit 5000 last)
+  const { data: aiData } = await sb.from('chat_ai')
+    .select('id, analyzed_at, intent, lead_temperature, deal_stage, lead_source, session_id, remote_jid, customer_type, dialog_session_id')
+    .order('analyzed_at', { ascending: false })
+    .limit(5000);
+  const ai = aiData || [];
+
+  // 2. Все partner_contacts с jid (для матча)
+  const contacts = await loadAllParallel(sb, 'partner_contacts',
+    'id, primary_phone, linked_chat_jids',
+    { notNull: ['linked_chat_jids'] }
+  );
+  const contactByJid = new Map();
+  for (const c of contacts) {
+    for (const j of c.linked_chat_jids || []) contactByJid.set(j, c.id);
+  }
+
+  // 3. Все sales — для проверки конверсии
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, sale_date, customer_id, partner_id, total_amount'
+  );
+  const salesByContact = new Map();
+  for (const s of sales) {
+    for (const id of [s.customer_id, s.partner_id].filter(Boolean)) {
+      if (!salesByContact.has(id)) salesByContact.set(id, []);
+      salesByContact.get(id).push(s);
+    }
+  }
+
+  // 4. Аннотируем каждый AI-record
+  const leads = [];
+  for (const a of ai) {
+    const contactId = contactByJid.get(a.remote_jid);
+    let converted = false;
+    let convertedRevenue = 0;
+    if (contactId && a.analyzed_at) {
+      const aTime = new Date(a.analyzed_at).getTime();
+      const wnd = 30 * 24 * 60 * 60 * 1000; // 30 дней
+      for (const s of salesByContact.get(contactId) || []) {
+        if (!s.sale_date) continue;
+        const sTime = new Date(s.sale_date).getTime();
+        if (Math.abs(sTime - aTime) <= wnd) {
+          converted = true;
+          convertedRevenue += s.total_amount || 0;
+          break;
+        }
+      }
+    }
+    leads.push({
+      ...a,
+      contact_id: contactId,
+      has_contact: Boolean(contactId),
+      converted,
+      converted_revenue: convertedRevenue,
+    });
+  }
+
+  // 5. Bucket aggregations
+  function bucket(field, label_field = field) {
+    const buckets = {};
+    for (const l of leads) {
+      const v = l[field] || '—';
+      if (!buckets[v]) buckets[v] = { name: v, total: 0, converted: 0, revenue: 0 };
+      buckets[v].total++;
+      if (l.converted) {
+        buckets[v].converted++;
+        buckets[v].revenue += l.converted_revenue;
+      }
+    }
+    return Object.values(buckets)
+      .map(b => ({ ...b, conversion_pct: b.total > 0 ? Math.round(b.converted / b.total * 100) : 0 }))
+      .sort((a, b) => b.total - a.total);
+  }
+
+  // 6. Per session
+  const bySession = bucket('session_id');
+  // Per intent
+  const byIntent = bucket('intent');
+  // Per temperature
+  const byTemp = bucket('lead_temperature');
+  // Per deal stage
+  const byStage = bucket('deal_stage');
+  // Per source
+  const bySource = bucket('lead_source');
+
+  // 7. Funnel (deal_stage в порядке voronka)
+  const stageOrder = ['first_contact', 'consultation', 'model_selection', 'price_negotiation', 'payment', 'delivery', 'completed', 'refused', 'needs_review'];
+  const funnel = stageOrder.map(stage => {
+    const b = byStage.find(x => x.name === stage);
+    return { stage, total: b?.total || 0, converted: b?.converted || 0, conversion_pct: b?.conversion_pct || 0 };
+  });
+
+  // 8. Aggregate KPI
+  const totalLeads = leads.length;
+  const totalConverted = leads.filter(l => l.converted).length;
+  const totalRevenue = leads.reduce((s, l) => s + (l.converted_revenue || 0), 0);
+  const overallConversion = totalLeads > 0 ? Math.round(totalConverted / totalLeads * 100) : 0;
+
+  const result = {
+    kpi: {
+      total_leads: totalLeads,
+      converted: totalConverted,
+      conversion_pct: overallConversion,
+      total_revenue: totalRevenue,
+      contacts_matched: leads.filter(l => l.has_contact).length,
+    },
+    by_intent: byIntent.slice(0, 10),
+    by_temperature: byTemp.slice(0, 10),
+    by_deal_stage: byStage.slice(0, 10),
+    by_source: bySource.slice(0, 10),
+    by_session: bySession.slice(0, 10),
+    funnel,
+  };
+  cacheSet(ck, result);
+  return result;
+}
+
 // ── 7d-extra. getManagerPerformance — performance review (Group F) ──────────
 //
 // Аналитика по менеджерам (поле sales.manager — текстовое имя):
