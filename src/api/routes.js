@@ -1636,6 +1636,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/category/:cat — drill-down detailed view of one category
+  router.get('/sales-crm/category/:cat', async (req, res) => {
+    try {
+      const r = await salesCrm.getCategoryDrilldown(req, { category: req.params.cat });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_category_drilldown_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners-insights — cold/rising/ROI (Group D)
   router.get('/sales-crm/partners-insights', async (req, res) => {
     try {

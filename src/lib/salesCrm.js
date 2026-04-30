@@ -1076,6 +1076,151 @@ export async function getProductInsights(req) {
   };
 }
 
+// ── 7c-extra. getCategoryDrilldown(category) — детальный анализ одной категории ─
+//
+// При клике на категорию в Продуктах — открывается drill-down:
+//   - Динамика продаж этой категории по месяцам (qty + revenue)
+//   - Топ SKU внутри категории (с qty, orders, revenue)
+//   - Топ клиентов покупавших эту категорию
+//   - Топ-партнёров приведших клиентов на эту категорию
+//
+const drilldownInput = z.object({
+  category: z.string().min(1).max(50),
+});
+
+export async function getCategoryDrilldown(req, params) {
+  const args = drilldownInput.parse(params);
+  const sb = pickClient(req);
+
+  // Загружаем все sale_items этой категории + их sales
+  let items = [];
+  let off = 0;
+  while (true) {
+    const { data } = await sb.from('sale_items')
+      .select('sale_id, sku, raw_name, qty, amount, category')
+      .eq('category', args.category)
+      .range(off, off + 999);
+    if (!data || data.length === 0) break;
+    items.push(...data);
+    if (data.length < 1000) break;
+    off += 1000;
+  }
+
+  if (items.length === 0) {
+    return {
+      category: args.category,
+      total_qty: 0, total_revenue: 0, total_orders: 0,
+      timeline: [], top_skus: [], top_customers: [], top_partners: [],
+    };
+  }
+
+  const saleIds = [...new Set(items.map(it => it.sale_id))];
+  // Грузим связанные sales батчами
+  const sales = [];
+  for (let i = 0; i < saleIds.length; i += 200) {
+    const batch = saleIds.slice(i, i + 200);
+    const { data } = await sb.from('sales')
+      .select('id, sale_date, total_amount, customer_id, partner_id, agency_id')
+      .in('id', batch);
+    sales.push(...(data || []));
+  }
+  const salesById = new Map(sales.map(s => [s.id, s]));
+
+  // 1. Timeline по месяцам
+  const monthly = {};
+  for (const it of items) {
+    const sale = salesById.get(it.sale_id);
+    if (!sale?.sale_date) continue;
+    const m = sale.sale_date.slice(0, 7);
+    if (!monthly[m]) monthly[m] = { month: m, qty: 0, revenue: 0, orders: new Set() };
+    monthly[m].qty += it.qty || 1;
+    monthly[m].revenue += it.amount || 0;
+    monthly[m].orders.add(it.sale_id);
+  }
+  const timeline = Object.values(monthly)
+    .map(m => ({ ...m, orders: m.orders.size }))
+    .sort((a, b) => a.month.localeCompare(b.month));
+
+  // 2. Top SKUs
+  const skuAgg = {};
+  for (const it of items) {
+    const key = it.sku || `noskus:${(it.raw_name || '').slice(0, 60)}`;
+    if (!skuAgg[key]) skuAgg[key] = {
+      sku: it.sku || null, name: it.raw_name || '?',
+      qty: 0, revenue: 0, orders: new Set(),
+    };
+    skuAgg[key].qty += it.qty || 1;
+    skuAgg[key].revenue += it.amount || 0;
+    skuAgg[key].orders.add(it.sale_id);
+  }
+  const topSkus = Object.values(skuAgg)
+    .map(s => ({ ...s, orders: s.orders.size }))
+    .sort((a, b) => b.qty - a.qty)
+    .slice(0, 30);
+
+  // 3. Top customers (по revenue этой категории)
+  const custAgg = {};
+  for (const it of items) {
+    const sale = salesById.get(it.sale_id);
+    if (!sale?.customer_id) continue;
+    if (!custAgg[sale.customer_id]) custAgg[sale.customer_id] = { qty: 0, revenue: 0, orders: 0 };
+    custAgg[sale.customer_id].qty += it.qty || 1;
+    custAgg[sale.customer_id].revenue += it.amount || 0;
+    custAgg[sale.customer_id].orders++;
+  }
+  const topCustEntries = Object.entries(custAgg)
+    .sort((a, b) => b[1].revenue - a[1].revenue)
+    .slice(0, 15);
+  const custIds = topCustEntries.map(([id]) => id);
+  const { data: custContacts } = custIds.length > 0
+    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone').in('id', custIds)
+    : { data: [] };
+  const cMap = new Map((custContacts || []).map(c => [c.id, c]));
+  const topCustomers = topCustEntries.map(([id, agg]) => ({
+    customer_id: id,
+    name: cMap.get(id)?.canonical_name || '?',
+    phone: cMap.get(id)?.primary_phone || null,
+    ...agg,
+  }));
+
+  // 4. Top partners
+  const partAgg = {};
+  for (const it of items) {
+    const sale = salesById.get(it.sale_id);
+    if (!sale?.partner_id) continue;
+    if (!partAgg[sale.partner_id]) partAgg[sale.partner_id] = { qty: 0, revenue: 0, orders: 0 };
+    partAgg[sale.partner_id].qty += it.qty || 1;
+    partAgg[sale.partner_id].revenue += it.amount || 0;
+    partAgg[sale.partner_id].orders++;
+  }
+  const topPartEntries = Object.entries(partAgg)
+    .sort((a, b) => b[1].revenue - a[1].revenue)
+    .slice(0, 15);
+  const partIds = topPartEntries.map(([id]) => id);
+  const { data: partContacts } = partIds.length > 0
+    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone, agency_id').in('id', partIds)
+    : { data: [] };
+  const pMap = new Map((partContacts || []).map(p => [p.id, p]));
+  const topPartners = topPartEntries.map(([id, agg]) => ({
+    partner_id: id,
+    name: pMap.get(id)?.canonical_name || '?',
+    phone: pMap.get(id)?.primary_phone || null,
+    agency_id: pMap.get(id)?.agency_id || null,
+    ...agg,
+  }));
+
+  return {
+    category: args.category,
+    total_qty: items.reduce((s, x) => s + (x.qty || 1), 0),
+    total_revenue: items.reduce((s, x) => s + (x.amount || 0), 0),
+    total_orders: saleIds.length,
+    timeline,
+    top_skus: topSkus,
+    top_customers: topCustomers,
+    top_partners: topPartners,
+  };
+}
+
 // ── 7d. getPartnerInsights — cold/rising/ROI (Group D) ──────────────────────
 //
 // Глубокий анализ партнёров (роль = 'partner', т.е. дизайнеры/посредники):
