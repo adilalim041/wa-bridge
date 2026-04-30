@@ -817,6 +817,24 @@ export async function getSalesAnalytics(req, params = {}) {
   // Список доступных месяцев для UI-picker (последние 18 от сегодняшнего)
   const availableMonths = Object.keys(monthly).sort().reverse().slice(0, 18);
 
+  // Multi-year overlay: для каждого месяца года (Янв..Дек) — точка на каждый год
+  // [{month_idx: 1, "2024": 21M, "2025": 22M, "2026": 33M}, ...]
+  const yearMonthly = {};
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const y = s.sale_date.slice(0, 4);
+    const m = parseInt(s.sale_date.slice(5, 7), 10);
+    if (!yearMonthly[m]) yearMonthly[m] = { month: m };
+    yearMonthly[m][y] = (yearMonthly[m][y] || 0) + (s.total_amount || 0);
+  }
+  const RU_MONTH = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+  const overlay_by_year = Array.from({ length: 12 }, (_, i) => ({
+    month: RU_MONTH[i],
+    month_idx: i + 1,
+    ...(yearMonthly[i + 1] || {}),
+  }));
+  const yearsAvailable = [...new Set(sales.map(s => s.sale_date?.slice(0, 4)).filter(Boolean))].sort();
+
   const result = {
     timeline,
     top_studios, top_partners,
@@ -835,6 +853,8 @@ export async function getSalesAnalytics(req, params = {}) {
         ? Math.round((b2b_revenue / (b2b_revenue + b2c_revenue)) * 100) : 0,
     },
     b2b_timeline,
+    overlay_by_year,
+    years_available: yearsAvailable,
   };
 
   cacheSet(ck, result);
@@ -1852,6 +1872,115 @@ export async function getAutoInsights(req) {
   const result = { insights, generated_at: new Date().toISOString(), period: currM };
   cacheSet(ck, result);
   return result;
+}
+
+// ── 7e2. getSalesWithChats — продажи которые имеют WhatsApp-диалоги ─────────
+//
+// Adil-овая фича: показать список продаж + связанные WhatsApp-диалоги
+// (читать как покупка прошла). Базовая фильтрация — только sales где
+// у contact (customer or partner) есть linked_chat_jids.
+//
+export async function getSalesWithChats(req, params = {}) {
+  const sb = pickClient(req);
+  const limit = Math.min(parseInt(params.limit) || 100, 500);
+  const offset = Math.max(parseInt(params.offset) || 0, 0);
+
+  // Все contacts с jids
+  const linked = await loadAllParallel(sb, 'partner_contacts',
+    'id, canonical_name, primary_phone, linked_chat_jids',
+    { notNull: ['linked_chat_jids'] }
+  );
+  const contactsMap = new Map();
+  for (const c of linked) {
+    if ((c.linked_chat_jids || []).length > 0) {
+      contactsMap.set(c.id, c);
+    }
+  }
+  const linkedIds = [...contactsMap.keys()];
+
+  if (linkedIds.length === 0) {
+    return { items: [], total: 0 };
+  }
+
+  // Sales где customer_id или partner_id ∈ linkedIds, sorted by date desc
+  // (через 2 запроса customer + partner с пагинацией)
+  const [byCust, byPart] = await Promise.all([
+    sb.from('sales')
+      .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
+      .in('customer_id', linkedIds.slice(0, 500))
+      .order('sale_date', { ascending: false })
+      .limit(limit + offset),
+    sb.from('sales')
+      .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
+      .in('partner_id', linkedIds.slice(0, 500))
+      .order('sale_date', { ascending: false })
+      .limit(limit + offset),
+  ]);
+  const merged = new Map();
+  for (const s of (byCust.data || [])) merged.set(s.id, s);
+  for (const s of (byPart.data || [])) if (!merged.has(s.id)) merged.set(s.id, s);
+  const sortedSales = [...merged.values()]
+    .sort((a, b) => (b.sale_date || '').localeCompare(a.sale_date || ''))
+    .slice(offset, offset + limit);
+
+  // Для каждой sale — quickly fetch top-3 messages around sale_date
+  const result = [];
+  for (const s of sortedSales) {
+    const linkedContact = (s.customer_id && contactsMap.get(s.customer_id))
+      || (s.partner_id && contactsMap.get(s.partner_id));
+    const jids = linkedContact?.linked_chat_jids || [];
+
+    let recentMessages = [];
+    let chatAi = null;
+    if (jids.length > 0 && s.sale_date) {
+      // ±14 дней окно вокруг sale_date
+      const fromDate = new Date(new Date(s.sale_date).getTime() - 14 * 24 * 3600 * 1000).toISOString();
+      const toDate = new Date(new Date(s.sale_date).getTime() + 7 * 24 * 3600 * 1000).toISOString();
+      const [msgs, ai] = await Promise.all([
+        sb.from('messages')
+          .select('id, body, from_me, timestamp, session_id')
+          .in('remote_jid', jids)
+          .gte('timestamp', fromDate)
+          .lte('timestamp', toDate)
+          .order('timestamp', { ascending: false })
+          .limit(20),
+        sb.from('chat_ai')
+          .select('id, intent, lead_temperature, deal_stage, summary_ru, manager_issues, risk_flags, analyzed_at')
+          .in('remote_jid', jids)
+          .gte('analyzed_at', fromDate)
+          .lte('analyzed_at', toDate)
+          .order('analyzed_at', { ascending: false })
+          .limit(1),
+      ]);
+      recentMessages = (msgs.data || []).reverse(); // chronological
+      chatAi = ai.data?.[0] || null;
+    }
+
+    result.push({
+      sale_id: s.id,
+      sale_date: s.sale_date,
+      total_amount: s.total_amount,
+      source_file: s.source_file,
+      order_num: s.order_num,
+      customer_raw: s.customer_raw,
+      partner_raw: s.partner_raw,
+      manager: s.manager,
+      contact: linkedContact ? {
+        id: linkedContact.id,
+        name: linkedContact.canonical_name,
+        phone: linkedContact.primary_phone,
+        jids,
+      } : null,
+      messages_in_window: recentMessages.length,
+      messages_sample: recentMessages.slice(0, 6).map(m => ({
+        id: m.id, body: (m.body || '').slice(0, 200),
+        from_me: m.from_me, ts: m.timestamp, session_id: m.session_id,
+      })),
+      chat_ai: chatAi,
+    });
+  }
+
+  return { items: result, total: merged.size };
 }
 
 // ── 7e. getLeadFunnel — lead→sale conversion (Group E) ──────────────────────

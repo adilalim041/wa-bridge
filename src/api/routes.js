@@ -1693,6 +1693,19 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/sales-with-chats?limit=&offset= — продажи с диалогами (Group E rebuild)
+  router.get('/sales-crm/sales-with-chats', async (req, res) => {
+    try {
+      const r = await salesCrm.getSalesWithChats(req, {
+        limit: req.query.limit, offset: req.query.offset,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_sales_with_chats_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/lead-funnel — chat_ai → sales conversion (Group E)
   router.get('/sales-crm/lead-funnel', async (req, res) => {
     try {
