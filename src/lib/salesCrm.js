@@ -2350,23 +2350,21 @@ export async function getManagerPerformance(req) {
     'id, sale_date, total_amount, manager, partner_id, customer_id'
   );
 
-  // Парсер manager-строки: расщепляем "Айтжан/Нурсултан" → ["Айтжан", "Нурсултан"]
-  // Допустимые разделители: / \ , ; и +
-  // Каждый менеджер получает 1/N доли заказа и выручки.
-  // Известные имена нормализуем (убираем "ассистент Х", "стажёр Х", и т.п.)
+  // ТОЛЬКО 4 активных менеджера. Все остальные имена (Сания, Алим, Асель, Саги, ...)
+  // НЕ попадают в leaderboard. Их заказы остаются в БД, но не учитываются здесь.
   const ACTIVE_MANAGERS = ['Айтжан', 'Нурсултан', 'Мади', 'Ренат'];
-  const KNOWN_FORMER = ['Сания', 'Алим']; // ушедшие, считаем но помечаем
 
   function normalizeManagerName(raw) {
     if (!raw) return null;
     const s = String(raw).trim();
-    // Нормализация по совпадению с известными именами (case-insensitive substring)
-    for (const m of [...ACTIVE_MANAGERS, ...KNOWN_FORMER]) {
+    for (const m of ACTIVE_MANAGERS) {
       if (s.toLowerCase().includes(m.toLowerCase())) return m;
     }
-    return s; // unknown — оставляем как есть для аудита
+    return null; // unknown — отбрасываем
   }
 
+  // Расщепляем "Айтжан/Нурсултан" → ["Айтжан", "Нурсултан"]
+  // Каждому достаётся 1/N доли заказа и выручки.
   function splitManagers(raw) {
     if (!raw) return [];
     return String(raw)
@@ -2386,10 +2384,9 @@ export async function getManagerPerformance(req) {
     for (const m of managers) {
       if (!byManager[m]) byManager[m] = {
         name: m,
-        is_active: ACTIVE_MANAGERS.includes(m),
         orders: 0, revenue: 0, b2b_orders: 0, b2c_orders: 0,
         first_date: null, last_date: null, by_month: {},
-        shared_orders: 0,  // сколько раз было пополам с другими
+        shared_orders: 0,
       };
       const x = byManager[m];
       x.orders += share;
