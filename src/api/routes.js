@@ -1611,6 +1611,18 @@ export function setupRoutes(app) {
     }
   });
 
+  // POST /sales-crm/cache/invalidate — вручную сбросить аналитический кэш.
+  // Для офлайн-импортов: после `node scripts/import_sales_v3.js` дёрнуть это
+  // и UI увидит свежие цифры (вместо ожидания 24h TTL или рестарта Bridge).
+  router.post('/sales-crm/cache/invalidate', async (req, res) => {
+    try {
+      salesCrm.invalidateSalesCache();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&channel=all|b2b|b2c
   router.get('/sales-crm/analytics', async (req, res) => {
     try {
