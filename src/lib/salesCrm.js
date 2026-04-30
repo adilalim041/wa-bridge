@@ -35,17 +35,22 @@ function pickClient(req) {
 //
 const CACHE_TTL_MS = 60 * 1000;
 const _cache = new Map();
+// SECURITY: x-api-key path использует serviceClient (RLS bypass).
+// Кэшировать его результаты под общим ключом ОПАСНО — другой запрос
+// под JWT user может получить service-level данные. Кэш ТОЛЬКО для JWT-юзеров.
 function cacheKey(name, req, paramsObj) {
-  const userId = req?.user?.userId || '__service__';
-  return `${name}|${userId}|${JSON.stringify(paramsObj || {})}`;
+  if (!req?.user?.userId) return null; // service-role / no-auth → не кэшируем
+  return `${name}|${req.user.userId}|${JSON.stringify(paramsObj || {})}`;
 }
 function cacheGet(key) {
+  if (!key) return null;
   const e = _cache.get(key);
   if (!e) return null;
   if (Date.now() > e.expiresAt) { _cache.delete(key); return null; }
   return e.data;
 }
 function cacheSet(key, data) {
+  if (!key) return; // service-role bypass — не сохраняем
   _cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
   // light cleanup чтобы Map не разрастался
   if (_cache.size > 200) {
@@ -92,6 +97,13 @@ async function loadAllParallel(sb, table, selectFields, filters = {}) {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isUuid(s) { return typeof s === 'string' && UUID_RE.test(s); }
 
+// PostgREST .or() filter injection — экранируем символы которые ломают синтаксис.
+// PostgREST или-фильтры разделяются запятыми и точкой, а скобки/звёздочки имеют особое значение в ilike.
+// Удаляем всё что может изменить логику фильтра, оставляем только буквы/цифры/пробелы/дефис.
+function safeFilterValue(s) {
+  return String(s || '').replace(/[,()*\\%]/g, ' ').slice(0, 100).trim();
+}
+
 // ── 1. listPartners ─────────────────────────────────────────────────────────
 //
 // Возвращает список партнёров с агрегатами. Поддерживает фильтры и поиск.
@@ -133,9 +145,9 @@ export async function listPartners(req, params = {}) {
   }
 
   if (args.q) {
-    const s = args.q.trim();
-    // ilike по имени или телефону
-    q = q.or(`canonical_name.ilike.%${s}%,primary_phone.ilike.%${s}%`);
+    // Экранируем — PostgREST .or() уязвим к injection через запятые/скобки
+    const s = safeFilterValue(args.q);
+    if (s) q = q.or(`canonical_name.ilike.%${s}%,primary_phone.ilike.%${s}%`);
   }
 
   // Sort
@@ -314,6 +326,7 @@ export async function markFollowupDone(req, followupId, payload = {}) {
     .update({ completed_at: completedAt, note: newNote })
     .eq('id', followupId);
   if (error) throw new Error(`markFollowupDone: ${error.message}`);
+  invalidateSalesCache();
   return { ok: true, followup_id: followupId, completed_at: completedAt, action: args.action };
 }
 
@@ -445,6 +458,7 @@ export async function mergePartners(req, sourceId, payload) {
   const { error: ed } = await sb.from('partner_contacts').delete().eq('id', sourceId);
   if (ed) throw new Error(`merge delete source: ${ed.message}`);
 
+  invalidateSalesCache(); // данные изменились — стираем кэш чтобы UI увидел свежее
   return { ok: true, merged_into: args.target_id };
 }
 
@@ -462,6 +476,7 @@ export async function updatePartnerAgency(req, contactId, payload) {
     .update({ agency_id: args.agency_id || null })
     .eq('id', contactId);
   if (error) throw new Error(`updatePartnerAgency: ${error.message}`);
+  invalidateSalesCache();
   return { ok: true };
 }
 
@@ -1470,7 +1485,8 @@ const searchInput = z.object({
 export async function searchPartner(req, params) {
   const args = searchInput.parse(params);
   const sb = pickClient(req);
-  const s = args.q.trim();
+  const s = safeFilterValue(args.q);
+  if (!s) return { items: [] };
 
   const { data, error } = await sb.from('v_partner_full')
     .select('id, canonical_name, primary_phone, agency_name, orders_count, total_revenue, last_purchase_date, total_messages')

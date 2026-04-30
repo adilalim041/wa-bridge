@@ -1600,12 +1600,13 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+  // GET /sales-crm/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&channel=all|b2b|b2c
   router.get('/sales-crm/analytics', async (req, res) => {
     try {
       const r = await salesCrm.getSalesAnalytics(req, {
         date_from: req.query.date_from,
         date_to: req.query.date_to,
+        channel: req.query.channel, // фикс: раньше параметр игнорировался → B2B/B2C filter не работал
       });
       res.json(r);
     } catch (e) {
