@@ -1529,26 +1529,18 @@ export async function getForecast(req) {
   }
 
   // 5. Картриджный пайплайн на 12 мес вперёд (фильтры -6 мес назад)
+  // Использую loadAllParallel чтобы не упереться в default 1000 rows.
   const filterByMonth = {};
   const cartridgeByMonth = {};
-  let filterItems = [];
-  // Грузим только water_filter и cartridge — быстро через filter
-  const { data: fItems } = await sb.from('sale_items')
-    .select('category, qty, sale_id')
-    .in('category', ['water_filter', 'cartridge'])
-    .limit(10000);
-  filterItems = fItems || [];
-  // Map sale_id → date через sales
-  const salesIdToDate = new Map(sales.filter(s => s.sale_date).map(s => [s.sale_date, s.sale_date])); // hmm
-  // Re-organise — у нас уже есть sales
-  // Группируем по sale_id
-  const salesById = new Map();
-  for (const s of sales) {
-    if (!s.sale_date) continue;
-    // sales у нас без id! Перезагрузим с id
-  }
-  // Получим sale_id → date более направлено
-  const { data: salesIdDate } = await sb.from('sales').select('id, sale_date').limit(10000);
+  const [filterItems, salesIdDate] = await Promise.all([
+    // sale_items с фильтрами по category
+    (async () => {
+      const a = await loadAllParallel(sb, 'sale_items', 'category, qty, sale_id', { eq: { category: 'water_filter' } });
+      const b = await loadAllParallel(sb, 'sale_items', 'category, qty, sale_id', { eq: { category: 'cartridge' } });
+      return [...a, ...b];
+    })(),
+    loadAllParallel(sb, 'sales', 'id, sale_date'),
+  ]);
   const idToDate = new Map((salesIdDate || []).map(s => [s.id, s.sale_date]));
   for (const it of filterItems) {
     const date = idToDate.get(it.sale_id);
@@ -2018,25 +2010,61 @@ export async function getManagerPerformance(req) {
     'id, sale_date, total_amount, manager, partner_id, customer_id'
   );
 
+  // Парсер manager-строки: расщепляем "Айтжан/Нурсултан" → ["Айтжан", "Нурсултан"]
+  // Допустимые разделители: / \ , ; и +
+  // Каждый менеджер получает 1/N доли заказа и выручки.
+  // Известные имена нормализуем (убираем "ассистент Х", "стажёр Х", и т.п.)
+  const ACTIVE_MANAGERS = ['Айтжан', 'Нурсултан', 'Мади', 'Ренат'];
+  const KNOWN_FORMER = ['Сания', 'Алим']; // ушедшие, считаем но помечаем
+
+  function normalizeManagerName(raw) {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    // Нормализация по совпадению с известными именами (case-insensitive substring)
+    for (const m of [...ACTIVE_MANAGERS, ...KNOWN_FORMER]) {
+      if (s.toLowerCase().includes(m.toLowerCase())) return m;
+    }
+    return s; // unknown — оставляем как есть для аудита
+  }
+
+  function splitManagers(raw) {
+    if (!raw) return [];
+    return String(raw)
+      .split(/[/\\,;+]/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(normalizeManagerName)
+      .filter(Boolean);
+  }
+
   const byManager = {};
   for (const s of sales) {
-    const m = (s.manager || '—').toString().trim() || '—';
-    if (!byManager[m]) byManager[m] = {
-      name: m, orders: 0, revenue: 0, b2b_orders: 0, b2c_orders: 0,
-      first_date: null, last_date: null, by_month: {},
-    };
-    const x = byManager[m];
-    x.orders++;
-    x.revenue += s.total_amount || 0;
-    if (s.partner_id) x.b2b_orders++;
-    else x.b2c_orders++;
-    if (s.sale_date) {
-      if (!x.first_date || s.sale_date < x.first_date) x.first_date = s.sale_date;
-      if (!x.last_date || s.sale_date > x.last_date) x.last_date = s.sale_date;
-      const ym = s.sale_date.slice(0, 7);
-      if (!x.by_month[ym]) x.by_month[ym] = { revenue: 0, orders: 0 };
-      x.by_month[ym].revenue += s.total_amount || 0;
-      x.by_month[ym].orders++;
+    const managers = splitManagers(s.manager);
+    if (managers.length === 0) continue;
+    const share = 1 / managers.length;
+
+    for (const m of managers) {
+      if (!byManager[m]) byManager[m] = {
+        name: m,
+        is_active: ACTIVE_MANAGERS.includes(m),
+        orders: 0, revenue: 0, b2b_orders: 0, b2c_orders: 0,
+        first_date: null, last_date: null, by_month: {},
+        shared_orders: 0,  // сколько раз было пополам с другими
+      };
+      const x = byManager[m];
+      x.orders += share;
+      x.revenue += (s.total_amount || 0) * share;
+      if (managers.length > 1) x.shared_orders++;
+      if (s.partner_id) x.b2b_orders += share;
+      else x.b2c_orders += share;
+      if (s.sale_date) {
+        if (!x.first_date || s.sale_date < x.first_date) x.first_date = s.sale_date;
+        if (!x.last_date || s.sale_date > x.last_date) x.last_date = s.sale_date;
+        const ym = s.sale_date.slice(0, 7);
+        if (!x.by_month[ym]) x.by_month[ym] = { revenue: 0, orders: 0 };
+        x.by_month[ym].revenue += (s.total_amount || 0) * share;
+        x.by_month[ym].orders += share;
+      }
     }
   }
 
@@ -2052,12 +2080,15 @@ export async function getManagerPerformance(req) {
   });
 
   const leaderboard = Object.values(byManager)
-    .filter(m => m.name !== '—' && m.orders >= 5) // мусорные/однораз. убираем
+    .filter(m => m.orders >= 1)
     .map(m => ({
       ...m,
+      orders: Math.round(m.orders * 10) / 10, // округляем (могут быть half-orders из split)
+      revenue: Math.round(m.revenue),
+      b2b_orders: Math.round(m.b2b_orders * 10) / 10,
+      b2c_orders: Math.round(m.b2c_orders * 10) / 10,
       avg_check: m.orders > 0 ? Math.round(m.revenue / m.orders) : 0,
       b2b_pct: m.orders > 0 ? Math.round(m.b2b_orders / m.orders * 100) : 0,
-      // sparkline 12 месяцев
       sparkline: last12.map(ym => m.by_month[ym]?.revenue || 0),
     }))
     .sort((a, b) => b.revenue - a.revenue)
@@ -2177,12 +2208,22 @@ export async function getPartnerInsights(req) {
       : null,
   }));
 
-  // Имена + студия
+  // Имена + студия — параллельная пагинация по 200 ID за раз
+  // (PostgREST .in() имеет лимит на длину URL и default 1000 rows)
   const partnerIds = partners.map(p => p.partner_id);
-  const { data: contacts } = partnerIds.length > 0
-    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone, agency_id').in('id', partnerIds)
-    : { data: [] };
-  const cMap = new Map((contacts || []).map(c => [c.id, c]));
+  const cMap = new Map();
+  if (partnerIds.length > 0) {
+    const batches = [];
+    for (let i = 0; i < partnerIds.length; i += 200) batches.push(partnerIds.slice(i, i + 200));
+    const results = await Promise.all(
+      batches.map(batch =>
+        sb.from('partner_contacts').select('id, canonical_name, primary_phone, agency_id').in('id', batch)
+      )
+    );
+    for (const r of results) {
+      for (const c of (r.data || [])) cMap.set(c.id, c);
+    }
+  }
 
   const { data: agencies } = await sb.from('agencies').select('id, canonical_name');
   const aMap = new Map((agencies || []).map(a => [a.id, a.canonical_name]));
