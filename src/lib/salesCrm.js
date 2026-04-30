@@ -1448,6 +1448,142 @@ export async function getCategoryDrilldown(req, params) {
   return result;
 }
 
+// ── 7h. getForecast — прогноз выручки + картриджного пайплайна ──────────────
+//
+// Простой forecast по линейной регрессии последних 12 месяцев + сезонный
+// adjustment (среднее по месяцу года из всех годов).
+//
+// Также — картриджный пайплайн: для каждого месяца вперёд (12 мес)
+// считаем сколько фильтров было продано 6 мес назад → должны иметь столько
+// followups готовых к отправке.
+//
+export async function getForecast(req) {
+  const ck = cacheKey('forecast', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  // 1. Sales по месяцам — для линейного прогноза
+  const sales = await loadAllParallel(sb, 'sales',
+    'sale_date, total_amount'
+  );
+  const monthlyRev = {};
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const m = s.sale_date.slice(0, 7);
+    monthlyRev[m] = (monthlyRev[m] || 0) + (s.total_amount || 0);
+  }
+  const months = Object.keys(monthlyRev).sort();
+  if (months.length < 6) {
+    return { error: 'Недостаточно данных для прогноза (нужно минимум 6 мес)' };
+  }
+
+  // 2. Линейная регрессия last 12 (или все если меньше)
+  const last12 = months.slice(-12);
+  const xs = last12.map((_, i) => i);
+  const ys = last12.map(m => monthlyRev[m]);
+  const n = xs.length;
+  const sumX = xs.reduce((s, x) => s + x, 0);
+  const sumY = ys.reduce((s, y) => s + y, 0);
+  const sumXY = xs.reduce((s, x, i) => s + x * ys[i], 0);
+  const sumX2 = xs.reduce((s, x) => s + x * x, 0);
+  const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+  const intercept = (sumY - slope * sumX) / n;
+
+  // 3. Сезонный коэффициент (multiplier по месяцам года)
+  const seasonal = Array.from({ length: 12 }, () => ({ sum: 0, count: 0 }));
+  for (const m of months) {
+    const monthIdx = parseInt(m.slice(5, 7)) - 1; // 0..11
+    seasonal[monthIdx].sum += monthlyRev[m];
+    seasonal[monthIdx].count++;
+  }
+  const avgRev = sumY / n;
+  const seasonalMult = seasonal.map(s =>
+    s.count > 0 && avgRev > 0 ? (s.sum / s.count) / avgRev : 1
+  );
+
+  // 4. Forecast следующих 6 мес
+  const lastMonth = months[months.length - 1];
+  function addMonths(ym, k) {
+    const [y, mo] = ym.split('-').map(Number);
+    const d = new Date(y, mo - 1 + k, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  const forecastTimeline = [];
+  // historical (last 12)
+  for (const m of last12) {
+    forecastTimeline.push({
+      month: m, actual: monthlyRev[m], forecast: null,
+    });
+  }
+  // future (next 6)
+  for (let k = 1; k <= 6; k++) {
+    const fm = addMonths(lastMonth, k);
+    const monthIdx = parseInt(fm.slice(5, 7)) - 1;
+    const linear = intercept + slope * (n + k - 1);
+    const adjusted = Math.max(0, linear * seasonalMult[monthIdx]);
+    forecastTimeline.push({
+      month: fm, actual: null, forecast: Math.round(adjusted),
+    });
+  }
+
+  // 5. Картриджный пайплайн на 12 мес вперёд (фильтры -6 мес назад)
+  const filterByMonth = {};
+  const cartridgeByMonth = {};
+  let filterItems = [];
+  // Грузим только water_filter и cartridge — быстро через filter
+  const { data: fItems } = await sb.from('sale_items')
+    .select('category, qty, sale_id')
+    .in('category', ['water_filter', 'cartridge'])
+    .limit(10000);
+  filterItems = fItems || [];
+  // Map sale_id → date через sales
+  const salesIdToDate = new Map(sales.filter(s => s.sale_date).map(s => [s.sale_date, s.sale_date])); // hmm
+  // Re-organise — у нас уже есть sales
+  // Группируем по sale_id
+  const salesById = new Map();
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    // sales у нас без id! Перезагрузим с id
+  }
+  // Получим sale_id → date более направлено
+  const { data: salesIdDate } = await sb.from('sales').select('id, sale_date').limit(10000);
+  const idToDate = new Map((salesIdDate || []).map(s => [s.id, s.sale_date]));
+  for (const it of filterItems) {
+    const date = idToDate.get(it.sale_id);
+    if (!date) continue;
+    const m = date.slice(0, 7);
+    if (it.category === 'water_filter') filterByMonth[m] = (filterByMonth[m] || 0) + (it.qty || 1);
+    else if (it.category === 'cartridge') cartridgeByMonth[m] = (cartridgeByMonth[m] || 0) + (it.qty || 1);
+  }
+
+  const cartridgePipeline = [];
+  for (let k = 1; k <= 12; k++) {
+    const targetMonth = addMonths(lastMonth, k);
+    const sourceMonth = addMonths(targetMonth, -6); // фильтры за 6 мес до target
+    cartridgePipeline.push({
+      target_month: targetMonth,
+      filters_sold_6mo_ago: filterByMonth[sourceMonth] || 0,
+      expected_cartridges: filterByMonth[sourceMonth] || 0, // 1:1 предположение
+    });
+  }
+
+  const result = {
+    timeline: forecastTimeline,
+    next_6_months_revenue: forecastTimeline.filter(t => t.forecast !== null).reduce((s, t) => s + t.forecast, 0),
+    trend_slope: Math.round(slope), // ₸/мес тренд
+    seasonality: seasonalMult.map((m, i) => ({
+      month_idx: i + 1,
+      multiplier: Math.round(m * 100) / 100,
+    })),
+    cartridge_pipeline: cartridgePipeline,
+    total_pipeline_units: cartridgePipeline.reduce((s, p) => s + p.expected_cartridges, 0),
+  };
+  cacheSet(ck, result);
+  return result;
+}
+
 // ── 7g. getGeoStats — города + доставка (Group G) ───────────────────────────
 //
 // Группировка sales по городу:

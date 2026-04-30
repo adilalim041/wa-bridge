@@ -1660,6 +1660,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/forecast — линейный прогноз + картриджный pipeline
+  router.get('/sales-crm/forecast', async (req, res) => {
+    try {
+      const r = await salesCrm.getForecast(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_forecast_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/geo — города + delivery KPI (Group G)
   router.get('/sales-crm/geo', async (req, res) => {
     try {
