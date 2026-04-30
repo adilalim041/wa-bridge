@@ -313,6 +313,42 @@ export async function findPartnerByPhone(req, phoneRaw) {
   };
 }
 
+// ── 6b. listAgencies ────────────────────────────────────────────────────────
+//
+// Список всех студий с агрегатами по продажам. Используется в Studios page.
+//
+export async function listAgencies(req) {
+  const sb = pickClient(req);
+
+  // Все agencies + sales-aggregates через 2 запроса
+  const [{ data: agencies }, { data: salesAgg }, { data: contactsAgg }] = await Promise.all([
+    sb.from('agencies').select('id, canonical_name, city, notes'),
+    sb.from('sales').select('agency_id, total_amount').not('agency_id', 'is', null),
+    sb.from('partner_contacts').select('id, agency_id').not('agency_id', 'is', null),
+  ]);
+
+  const byAgency = {};
+  for (const s of salesAgg || []) {
+    if (!byAgency[s.agency_id]) byAgency[s.agency_id] = { orders: 0, revenue: 0 };
+    byAgency[s.agency_id].orders++;
+    byAgency[s.agency_id].revenue += s.total_amount || 0;
+  }
+  const contactsByAgency = {};
+  for (const c of contactsAgg || []) {
+    contactsByAgency[c.agency_id] = (contactsByAgency[c.agency_id] || 0) + 1;
+  }
+
+  const items = (agencies || []).map(a => ({
+    ...a,
+    orders: byAgency[a.id]?.orders || 0,
+    revenue: byAgency[a.id]?.revenue || 0,
+    contacts: contactsByAgency[a.id] || 0,
+  })).filter(a => a.orders > 0 || a.contacts > 0)
+    .sort((a, b) => b.revenue - a.revenue);
+
+  return { items };
+}
+
 // ── 7. getSalesAnalytics ────────────────────────────────────────────────────
 //
 // Агрегаты для дашборда «Аналитика продаж»:

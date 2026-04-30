@@ -1528,6 +1528,17 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/agencies  — list of all studios with aggregates
+  router.get('/sales-crm/agencies', async (req, res) => {
+    try {
+      const r = await salesCrm.listAgencies(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_list_agencies_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/agencies/:id  — studio card
   router.get('/sales-crm/agencies/:id', async (req, res) => {
     try {
