@@ -20,6 +20,7 @@ import { uploadReportPdf } from '../reports/uploadPdfToCloudinary.js';
 import { resolveSender } from '../reports/routing.js';
 import { isSentryEnabled } from '../observability/sentry.js';
 import { runCloudinaryCleanup, getCleanupConfig } from '../cleanup/cloudinaryCleanup.js';
+import * as salesCrm from '../lib/salesCrm.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -1494,6 +1495,90 @@ export function setupRoutes(app) {
 
   // W1.1 Phase 1: auth plumbing probe.
   // Confirms the JWT path sets req.user and req.userClient correctly.
+  // ───────────────────────────────────────────────────────────────────────
+  // Sales CRM endpoints (Omoikiri-only — миграции 0011/0012/0015).
+  // Тонкие обёртки вокруг src/lib/salesCrm.js, который содержит всю логику.
+  // ───────────────────────────────────────────────────────────────────────
+
+  // GET /sales-crm/partners?filter=&q=&limit=&offset=
+  router.get('/sales-crm/partners', async (req, res) => {
+    try {
+      const r = await salesCrm.listPartners(req, {
+        filter: req.query.filter,
+        q: req.query.q || '',
+        limit: req.query.limit ? Number(req.query.limit) : undefined,
+        offset: req.query.offset ? Number(req.query.offset) : undefined,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_list_partners_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/partners/:id  — full card
+  router.get('/sales-crm/partners/:id', async (req, res) => {
+    try {
+      const r = await salesCrm.getPartnerCard(req, req.params.id);
+      if (!r) return res.status(404).json({ error: 'partner not found' });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_partner_card_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/agencies/:id  — studio card
+  router.get('/sales-crm/agencies/:id', async (req, res) => {
+    try {
+      const r = await salesCrm.getStudioCard(req, req.params.id);
+      if (!r) return res.status(404).json({ error: 'agency not found' });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_studio_card_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/followups/due?window_days=30
+  router.get('/sales-crm/followups/due', async (req, res) => {
+    try {
+      const r = await salesCrm.getDueFollowups(req, {
+        window_days: req.query.window_days ? Number(req.query.window_days) : undefined,
+        limit: req.query.limit ? Number(req.query.limit) : undefined,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_followups_due_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // POST /sales-crm/followups/:id/done   { action, note? }
+  router.post('/sales-crm/followups/:id/done', async (req, res) => {
+    try {
+      const r = await salesCrm.markFollowupDone(req, req.params.id, req.body || {});
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_mark_done_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/search?q=...   — quick lookup by name/phone
+  router.get('/sales-crm/search', async (req, res) => {
+    try {
+      const r = await salesCrm.searchPartner(req, {
+        q: req.query.q || '',
+        limit: req.query.limit ? Number(req.query.limit) : undefined,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_search_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // Used as smoke-test after deploy + Phase 2 migration-in-progress checks.
   router.get('/health/auth', async (req, res) => {
     res.json({
