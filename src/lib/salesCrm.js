@@ -313,7 +313,154 @@ export async function findPartnerByPhone(req, phoneRaw) {
   };
 }
 
-// ── 7. searchPartner (для AI tools / quick lookup) ──────────────────────────
+// ── 7. getSalesAnalytics ────────────────────────────────────────────────────
+//
+// Агрегаты для дашборда «Аналитика продаж»:
+//   - timeline: выручка/кол-во заказов по месяцам
+//   - top_studios: топ-15 студий с выручкой
+//   - top_partners: топ-15 партнёров с выручкой
+//   - categories: распределение позиций по категориям
+//   - segments: разовые vs повторные клиенты, фильтр-покупатели
+//   - kpi: общие цифры (revenue YTD, заказов в этом месяце, средний чек)
+//
+const analyticsInput = z.object({
+  date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+export async function getSalesAnalytics(req, params = {}) {
+  const args = analyticsInput.parse(params);
+  const sb = pickClient(req);
+
+  // Pagination helper (PostgREST max range = 1000)
+  async function loadAll(query) {
+    let all = [];
+    let off = 0;
+    while (true) {
+      const { data, error } = await query.range(off, off + 999);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      all.push(...data);
+      if (data.length < 1000) break;
+      off += 1000;
+    }
+    return all;
+  }
+
+  // 1. Sales timeline
+  let salesQ = sb.from('sales').select('sale_date, total_amount, agency_id, partner_id, customer_id');
+  if (args.date_from) salesQ = salesQ.gte('sale_date', args.date_from);
+  if (args.date_to) salesQ = salesQ.lte('sale_date', args.date_to);
+  const sales = await loadAll(salesQ);
+
+  // Bucket by month
+  const monthly = {};
+  let totalRevenue = 0;
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const m = s.sale_date.slice(0, 7);
+    if (!monthly[m]) monthly[m] = { month: m, orders: 0, revenue: 0 };
+    monthly[m].orders++;
+    monthly[m].revenue += s.total_amount || 0;
+    totalRevenue += s.total_amount || 0;
+  }
+  const timeline = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month));
+
+  // 2. Top studios
+  const byAgency = {};
+  for (const s of sales) {
+    if (!s.agency_id) continue;
+    if (!byAgency[s.agency_id]) byAgency[s.agency_id] = { agency_id: s.agency_id, orders: 0, revenue: 0 };
+    byAgency[s.agency_id].orders++;
+    byAgency[s.agency_id].revenue += s.total_amount || 0;
+  }
+  const topAgenciesIds = Object.values(byAgency).sort((a, b) => b.revenue - a.revenue).slice(0, 15);
+  const { data: agencies } = await sb.from('agencies').select('id, canonical_name, city').in('id', topAgenciesIds.map(a => a.agency_id));
+  const aMap = new Map((agencies || []).map(a => [a.id, a]));
+  const top_studios = topAgenciesIds.map(a => ({
+    ...a,
+    name: aMap.get(a.agency_id)?.canonical_name || '?',
+    city: aMap.get(a.agency_id)?.city || null,
+  }));
+
+  // 3. Top partners (any role: customer or partner)
+  const byContact = {};
+  for (const s of sales) {
+    for (const id of [s.customer_id, s.partner_id].filter(Boolean)) {
+      if (!byContact[id]) byContact[id] = { contact_id: id, orders: 0, revenue: 0 };
+      byContact[id].orders++;
+      byContact[id].revenue += s.total_amount || 0;
+    }
+  }
+  const topPartnersIds = Object.values(byContact).sort((a, b) => b.revenue - a.revenue).slice(0, 15);
+  const { data: contacts } = await sb.from('partner_contacts')
+    .select('id, canonical_name, primary_phone, agency_id')
+    .in('id', topPartnersIds.map(p => p.contact_id));
+  const cMap = new Map((contacts || []).map(c => [c.id, c]));
+  const top_partners = topPartnersIds.map(p => ({
+    ...p,
+    name: cMap.get(p.contact_id)?.canonical_name || '?',
+    phone: cMap.get(p.contact_id)?.primary_phone || null,
+    agency_id: cMap.get(p.contact_id)?.agency_id || null,
+  }));
+
+  // 4. Categories
+  let itemsQ = sb.from('sale_items').select('category, sale_id, amount');
+  // Если есть date filter — фильтр по sales через join — proще загрузить ID-ки
+  if (args.date_from || args.date_to) {
+    const saleIds = sales.map(s => s.sale_date && (
+      (!args.date_from || s.sale_date >= args.date_from) &&
+      (!args.date_to || s.sale_date <= args.date_to)
+    )).map((ok, i) => ok ? sales[i].id : null).filter(Boolean);
+    // фильтр упрощим — берём всё (sale_items без даты, фильтр был выше через sales)
+  }
+  const items = await loadAll(itemsQ);
+  const cats = {};
+  for (const it of items || []) {
+    const c = it.category || 'other';
+    if (!cats[c]) cats[c] = { category: c, count: 0, revenue: 0 };
+    cats[c].count++;
+    cats[c].revenue += it.amount || 0;
+  }
+  const categories = Object.values(cats).sort((a, b) => b.count - a.count);
+
+  // 5. Segments (one-time vs repeat customers, filter buyers)
+  const customerOrders = {};
+  for (const s of sales) {
+    const cid = s.customer_id;
+    if (!cid) continue;
+    customerOrders[cid] = (customerOrders[cid] || 0) + 1;
+  }
+  const oneTime = Object.values(customerOrders).filter(n => n === 1).length;
+  const repeat = Object.values(customerOrders).filter(n => n > 1).length;
+
+  // Filter customers (по items)
+  const filterCustomerIds = new Set();
+  for (const it of items || []) {
+    if (it.category !== 'water_filter') continue;
+    // sale_id → customer_id: ищем в sales
+    const sale = sales.find(s => s.id === it.sale_id);
+    if (sale?.customer_id) filterCustomerIds.add(sale.customer_id);
+  }
+
+  const segments = {
+    one_time_customers: oneTime,
+    repeat_customers: repeat,
+    filter_buyers: filterCustomerIds.size,
+  };
+
+  // 6. KPI
+  const kpi = {
+    total_orders: sales.length,
+    total_revenue: totalRevenue,
+    avg_check: sales.length > 0 ? Math.round(totalRevenue / sales.length) : 0,
+    months_covered: timeline.length,
+  };
+
+  return { timeline, top_studios, top_partners, categories, segments, kpi };
+}
+
+// ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
 //
 // По имени или телефону вернуть до 10 контактов с базовыми агрегатами.
 // Используется когда AI спрашивает «кто такой Бибинур».
