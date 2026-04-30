@@ -24,6 +24,39 @@ function pickClient(req) {
   return req?.userClient || serviceClient;
 }
 
+// ─── Простой in-memory кэш с TTL для тяжёлых аналитик-запросов ──────────────
+//
+// Аналитика по 2200+ заказам пересчитывается 1-3 секунды каждый раз.
+// Кэшируем результаты на 60s (для одинаковых params), чтобы повторные запросы
+// дашборда (refresh, переключение вкладок) шли мгновенно.
+//
+// Cache-key включает userId (req.user?.userId или '__service__'), чтобы под
+// разными авторизациями не было утечек между tenants.
+//
+const CACHE_TTL_MS = 60 * 1000;
+const _cache = new Map();
+function cacheKey(name, req, paramsObj) {
+  const userId = req?.user?.userId || '__service__';
+  return `${name}|${userId}|${JSON.stringify(paramsObj || {})}`;
+}
+function cacheGet(key) {
+  const e = _cache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { _cache.delete(key); return null; }
+  return e.data;
+}
+function cacheSet(key, data) {
+  _cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+  // light cleanup чтобы Map не разрастался
+  if (_cache.size > 200) {
+    const cutoff = Date.now();
+    for (const [k, v] of _cache) if (v.expiresAt < cutoff) _cache.delete(k);
+  }
+}
+export function invalidateSalesCache() {
+  _cache.clear();
+}
+
 // UUID v4 — простая валидация (не строгая, но достаточная для SQL safety)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isUuid(s) { return typeof s === 'string' && UUID_RE.test(s); }
@@ -48,6 +81,11 @@ const listPartnersInput = z.object({
 
 export async function listPartners(req, params = {}) {
   const args = listPartnersInput.parse(params);
+  // Кэшируем по полному набору параметров — limit/offset включены, чтобы pagination работал
+  const ck = cacheKey('list-partners', req, args);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
   const sb = pickClient(req);
 
   let q = sb.from('v_partner_full').select('*');
@@ -77,7 +115,9 @@ export async function listPartners(req, params = {}) {
 
   const { data, error } = await q;
   if (error) throw new Error(`listPartners: ${error.message}`);
-  return { items: data || [], limit: args.limit, offset: args.offset };
+  const result = { items: data || [], limit: args.limit, offset: args.offset };
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 2. getPartnerCard ───────────────────────────────────────────────────────
@@ -399,6 +439,9 @@ export async function updatePartnerAgency(req, contactId, payload) {
 // Список всех студий с агрегатами по продажам. Используется в Studios page.
 //
 export async function listAgencies(req) {
+  const ck = cacheKey('list-agencies', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
   const sb = pickClient(req);
 
   // Все agencies + sales-aggregates через 2 запроса
@@ -427,7 +470,9 @@ export async function listAgencies(req) {
   })).filter(a => a.orders > 0 || a.contacts > 0)
     .sort((a, b) => b.revenue - a.revenue);
 
-  return { items };
+  const result = { items };
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 7. getSalesAnalytics ────────────────────────────────────────────────────
@@ -446,6 +491,7 @@ export async function listAgencies(req) {
 const analyticsInput = z.object({
   date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  channel:   z.enum(['all', 'b2b', 'b2c']).default('all'),
 });
 
 // Helper: добавляем 1 месяц к YYYY-MM
@@ -468,6 +514,12 @@ function pctDelta(curr, prev) {
 
 export async function getSalesAnalytics(req, params = {}) {
   const args = analyticsInput.parse(params);
+
+  // Кэш проверяем ДО любой работы
+  const ck = cacheKey('analytics', req, args);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
   const sb = pickClient(req);
 
   // Pagination helper (PostgREST max range = 1000)
@@ -486,9 +538,14 @@ export async function getSalesAnalytics(req, params = {}) {
   }
 
   // 1. Sales timeline
-  let salesQ = sb.from('sales').select('sale_date, total_amount, agency_id, partner_id, customer_id');
+  let salesQ = sb.from('sales').select('id, sale_date, total_amount, agency_id, partner_id, customer_id');
   if (args.date_from) salesQ = salesQ.gte('sale_date', args.date_from);
   if (args.date_to) salesQ = salesQ.lte('sale_date', args.date_to);
+  // B2B/B2C channel filter:
+  //   B2B = есть partner_id (заказ через дизайнера/посредника)
+  //   B2C = partner_id IS NULL (прямой клиент)
+  if (args.channel === 'b2b') salesQ = salesQ.not('partner_id', 'is', null);
+  if (args.channel === 'b2c') salesQ = salesQ.is('partner_id', null);
   const sales = await loadAll(salesQ);
 
   // Bucket by month
@@ -705,7 +762,34 @@ export async function getSalesAnalytics(req, params = {}) {
     a.sparkline = sparkMonths.map(m => sparkByAgency[a.agency_id]?.[m] || 0);
   }
 
-  return {
+  // 10. B2B vs B2C breakdown (всегда, независимо от channel-фильтра — для KPI)
+  // Считаем по фильтрованной выборке (sales уже отфильтрованы channel)
+  let b2b_orders = 0, b2b_revenue = 0, b2c_orders = 0, b2c_revenue = 0;
+  for (const s of sales) {
+    if (s.partner_id) {
+      b2b_orders++; b2b_revenue += s.total_amount || 0;
+    } else {
+      b2c_orders++; b2c_revenue += s.total_amount || 0;
+    }
+  }
+
+  // 11. B2B/B2C по месяцам — stacked timeline
+  const b2bMonthly = {};
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const m = s.sale_date.slice(0, 7);
+    if (!b2bMonthly[m]) b2bMonthly[m] = { month: m, b2b_revenue: 0, b2c_revenue: 0, b2b_orders: 0, b2c_orders: 0 };
+    if (s.partner_id) {
+      b2bMonthly[m].b2b_revenue += s.total_amount || 0;
+      b2bMonthly[m].b2b_orders++;
+    } else {
+      b2bMonthly[m].b2c_revenue += s.total_amount || 0;
+      b2bMonthly[m].b2c_orders++;
+    }
+  }
+  const b2b_timeline = Object.values(b2bMonthly).sort((a, b) => a.month.localeCompare(b.month));
+
+  const result = {
     timeline,
     top_studios, top_partners,
     categories,
@@ -713,7 +797,17 @@ export async function getSalesAnalytics(req, params = {}) {
     movers_top, movers_bottom,
     pareto,
     spark_months: sparkMonths,
+    channel_breakdown: {
+      b2b_orders, b2b_revenue,
+      b2c_orders, b2c_revenue,
+      b2b_pct: (b2b_revenue + b2c_revenue) > 0
+        ? Math.round((b2b_revenue / (b2b_revenue + b2c_revenue)) * 100) : 0,
+    },
+    b2b_timeline,
   };
+
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 7b. getSegmentation — RFM + cohorts + cities (Group B) ──────────────────
@@ -737,6 +831,10 @@ export async function getSalesAnalytics(req, params = {}) {
 // Cities: разбивка sales по городам (через sales.city).
 //
 export async function getSegmentation(req) {
+  const ck = cacheKey('segmentation', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
   const sb = pickClient(req);
 
   // 1. Все sales c customer_id
@@ -905,7 +1003,7 @@ export async function getSegmentation(req) {
   }
   const newRepeatTimeline = Object.values(monthlyNew).sort((a, b) => a.month.localeCompare(b.month));
 
-  return {
+  const result = {
     segments: segmentList,
     top_per_segment: topPerSegment,
     cohorts: cohortList,
@@ -913,6 +1011,8 @@ export async function getSegmentation(req) {
     new_repeat_timeline: newRepeatTimeline,
     total_customers: customers.length,
   };
+  cacheSet(ck, result);
+  return result;
 }
 
 function monthDiff(fromYM, toYM) {
@@ -930,6 +1030,9 @@ function monthDiff(fromYM, toYM) {
 // 4) seasonality: heatmap "месяц × категория" — пиковые месяцы по каждой кат.
 //
 export async function getProductInsights(req) {
+  const ck = cacheKey('products', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
   const sb = pickClient(req);
 
   // Все sale_items + sales (для дат)
@@ -1067,13 +1170,15 @@ export async function getProductInsights(req) {
     multi_item_sales: Object.values(itemsCountBySale).filter(n => n > 1).length,
   };
 
-  return {
+  const result = {
     top_skus: topSkus,
     cross_sell: crossSell,
     cartridge_funnel: cartridgeFunnel,
     seasonality: seasonalityList,
     bundle_stats: bundleStats,
   };
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 7c-extra. getCategoryDrilldown(category) — детальный анализ одной категории ─
@@ -1090,6 +1195,9 @@ const drilldownInput = z.object({
 
 export async function getCategoryDrilldown(req, params) {
   const args = drilldownInput.parse(params);
+  const ck = cacheKey('category', req, args);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
   const sb = pickClient(req);
 
   // Загружаем все sale_items этой категории + их sales
@@ -1209,7 +1317,7 @@ export async function getCategoryDrilldown(req, params) {
     ...agg,
   }));
 
-  return {
+  const result = {
     category: args.category,
     total_qty: items.reduce((s, x) => s + (x.qty || 1), 0),
     total_revenue: items.reduce((s, x) => s + (x.amount || 0), 0),
@@ -1219,6 +1327,8 @@ export async function getCategoryDrilldown(req, params) {
     top_customers: topCustomers,
     top_partners: topPartners,
   };
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 7d. getPartnerInsights — cold/rising/ROI (Group D) ──────────────────────
@@ -1233,6 +1343,9 @@ export async function getCategoryDrilldown(req, params) {
 // 5) journey_per_partner: для каждого топ-партнёра — список месяцев с активностью
 //
 export async function getPartnerInsights(req) {
+  const ck = cacheKey('partner-insights', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
   const sb = pickClient(req);
 
   const today = new Date();
@@ -1358,13 +1471,15 @@ export async function getPartnerInsights(req) {
     }
   }
 
-  return {
+  const result = {
     cold_partners,
     rising_stars,
     roi_ranking,
     studio_vs_independent: { with_studio, independent },
     total_partners: partners.length,
   };
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
