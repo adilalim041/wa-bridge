@@ -787,7 +787,8 @@ export async function getSalesAnalytics(req, params = {}) {
   // Список доступных месяцев для UI-picker (последние 18 от сегодняшнего)
   const availableMonths = Object.keys(monthly).sort().reverse().slice(0, 18);
 
-  // Multi-year overlay: для каждого месяца года (Янв..Дек) — точка на каждый год
+  // Multi-year overlay (legacy, для старого графика): для каждого месяца года —
+  // точка на каждый год. Только revenue, без channel breakdown.
   // [{month_idx: 1, "2024": 21M, "2025": 22M, "2026": 33M}, ...]
   const yearMonthly = {};
   for (const s of sales) {
@@ -804,6 +805,52 @@ export async function getSalesAnalytics(req, params = {}) {
     ...(yearMonthly[i + 1] || {}),
   }));
   const yearsAvailable = [...new Set(sales.map(s => s.sale_date?.slice(0, 4)).filter(Boolean))].sort();
+
+  // Расширенный multi-year breakdown: (year, month, channel) → revenue + orders + avg_check.
+  // Wide-format для Recharts: каждая точка X (Jan-Dec) хранит все ключи "{year}__{channel}__{metric}".
+  // Frontend делает multi-select по (year, channel, metric) и просто берёт нужные dataKey.
+  //
+  // ВАЖНО: используем sales БЕЗ channel-фильтра (только date_from/date_to),
+  // иначе при args.channel='b2b' breakdown потеряет b2c данные. Это
+  // независимый под-график со своим фильтром каналов.
+  let salesForBreakdown = sales;
+  if (args.channel === 'b2b' || args.channel === 'b2c') {
+    const breakdownFilters = {};
+    if (args.date_from) breakdownFilters.gte = { sale_date: args.date_from };
+    if (args.date_to) breakdownFilters.lte = { sale_date: args.date_to };
+    salesForBreakdown = await loadAllParallel(sb, 'sales',
+      'sale_date, total_amount, partner_id',
+      breakdownFilters
+    );
+  }
+  const yearChannelMonthly = {};
+  for (const s of salesForBreakdown) {
+    if (!s.sale_date) continue;
+    const y = s.sale_date.slice(0, 4);
+    const m = parseInt(s.sale_date.slice(5, 7), 10);
+    const ch = s.partner_id ? 'b2b' : 'b2c';
+    if (!yearChannelMonthly[m]) yearChannelMonthly[m] = {};
+    const buckets = yearChannelMonthly[m];
+    // 2 канала + 'all' (агрегатный)
+    for (const channel of [ch, 'all']) {
+      const key = `${y}__${channel}`;
+      if (!buckets[key]) buckets[key] = { revenue: 0, orders: 0 };
+      buckets[key].revenue += s.total_amount || 0;
+      buckets[key].orders += 1;
+    }
+  }
+  const multi_year_breakdown = Array.from({ length: 12 }, (_, i) => {
+    const idx = i + 1;
+    const row = { month_idx: idx, month: RU_MONTH[i] };
+    const buckets = yearChannelMonthly[idx] || {};
+    for (const [key, v] of Object.entries(buckets)) {
+      const avgCheck = v.orders > 0 ? Math.round(v.revenue / v.orders) : 0;
+      row[`${key}__revenue`] = v.revenue;
+      row[`${key}__orders`] = v.orders;
+      row[`${key}__avg_check`] = avgCheck;
+    }
+    return row;
+  });
 
   const result = {
     timeline,
@@ -825,6 +872,7 @@ export async function getSalesAnalytics(req, params = {}) {
     b2b_timeline,
     overlay_by_year,
     years_available: yearsAvailable,
+    multi_year_breakdown,
   };
 
   cacheSet(ck, result);
