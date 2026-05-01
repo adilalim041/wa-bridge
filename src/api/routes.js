@@ -1778,18 +1778,29 @@ export function setupRoutes(app) {
 
   // GET /sales-crm/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&channel=all|b2b|b2c&city=Алматы|Астана|all
   // NOTE: multi_year_breakdown включён в этот же endpoint — city фильтрует и его.
-  // При ?cities=Алматы,Астана — legacy single-city аналитика (multi-city breakdown только в /multi_year_breakdown).
+  // При ?cities=Алматы,Астана (mode='multi') → byCity breakdown: { byCity: { 'Алматы': {...}, 'Астана': {...} }, mode: 'multi', cities: [...] }
+  // При одном city или all → как раньше (без byCity обёртки, backward compat).
   router.get('/sales-crm/analytics', async (req, res) => {
     try {
       const cp = parseCitiesQueryRoute(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
-      const r = await salesCrm.getSalesAnalytics(req, {
+
+      const baseOpts = {
         date_from: req.query.date_from,
         date_to: req.query.date_to,
         channel: req.query.channel,
         compare_month: req.query.compare_month, // YYYY-MM для movers picker
-        city: cp.city,
-      });
+      };
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getSalesAnalytics(req, { ...baseOpts, city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getSalesAnalytics(req, { ...baseOpts, city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_analytics_failed');
