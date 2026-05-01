@@ -1611,10 +1611,19 @@ export function setupRoutes(app) {
     }
   });
 
-  // POST /sales-crm/cache/invalidate — вручную сбросить аналитический кэш.
+  // POST /admin/sales-crm/cache/invalidate — вручную сбросить аналитический кэш.
   // Для офлайн-импортов: после `node scripts/import_sales_v3.js` дёрнуть это
   // и UI увидит свежие цифры (вместо ожидания 24h TTL или рестарта Bridge).
-  router.post('/sales-crm/cache/invalidate', async (req, res) => {
+  //
+  // SECURITY: admin-only. Кэш на 24h, любой authenticated user способен бы
+  // циклично дёргать invalidate → forced recompute (~3sec, full-table load
+  // из 2200 sales). В SaaS это DoS amplifier на shared Postgres.
+  // Гард: если req.user заполнен → пришли через JWT-юзера → 403.
+  // Только x-api-key path (Adil руками или import-script с BRIDGE_API_KEY).
+  router.post('/admin/sales-crm/cache/invalidate', async (req, res) => {
+    if (req.user) {
+      return res.status(403).json({ error: 'admin-only endpoint (x-api-key required)' });
+    }
     try {
       salesCrm.invalidateSalesCache();
       res.json({ ok: true });

@@ -412,59 +412,24 @@ const mergeInput = z.object({
   target_id: z.string().regex(UUID_RE),
 });
 
+// Атомарный merge через Postgres RPC `merge_partners` (миграция 0016).
+// Раньше делали 5 sequential UPDATE через PostgREST без error-check'ов на 3
+// из 5 — mid-flight failure оставлял половину переехавшими. RPC выполняется
+// в одной транзакции, любой RAISE откатывает всё.
 export async function mergePartners(req, sourceId, payload) {
   if (!isUuid(sourceId)) throw new Error('invalid source id');
   const args = mergeInput.parse(payload);
   if (args.target_id === sourceId) throw new Error('source and target are the same');
   const sb = pickClient(req);
 
-  const [{ data: source }, { data: target }] = await Promise.all([
-    sb.from('partner_contacts').select('*').eq('id', sourceId).maybeSingle(),
-    sb.from('partner_contacts').select('*').eq('id', args.target_id).maybeSingle(),
-  ]);
-  if (!source) throw new Error('source contact not found');
-  if (!target) throw new Error('target contact not found');
+  const { data, error } = await sb.rpc('merge_partners', {
+    source_id: sourceId,
+    target_id: args.target_id,
+  });
+  if (error) throw new Error(`mergePartners: ${error.message}`);
 
-  // Объединяем поля
-  const mergedAliases = [...new Set([
-    ...(target.aliases || []),
-    ...(source.aliases || []),
-    source.canonical_name,
-  ].filter(Boolean))];
-  const mergedRoles = [...new Set([...(target.roles || []), ...(source.roles || [])])];
-  const mergedPhones = [...new Set([
-    ...(target.phones || []),
-    ...(source.phones || []),
-    target.primary_phone, source.primary_phone,
-  ].filter(Boolean))];
-  const mergedJids = [...new Set([
-    ...(target.linked_chat_jids || []),
-    ...(source.linked_chat_jids || []),
-  ])];
-
-  const update = {
-    aliases: mergedAliases,
-    roles: mergedRoles,
-    phones: mergedPhones,
-    linked_chat_jids: mergedJids,
-  };
-  if (!target.primary_phone && source.primary_phone) update.primary_phone = source.primary_phone;
-  if (!target.agency_id && source.agency_id) update.agency_id = source.agency_id;
-
-  const { error: ut } = await sb.from('partner_contacts').update(update).eq('id', args.target_id);
-  if (ut) throw new Error(`merge target update: ${ut.message}`);
-
-  // Перепривязываем sales и followups
-  await sb.from('sales').update({ customer_id: args.target_id }).eq('customer_id', sourceId);
-  await sb.from('sales').update({ partner_id: args.target_id }).eq('partner_id', sourceId);
-  await sb.from('followups').update({ contact_id: args.target_id }).eq('contact_id', sourceId);
-
-  // Удаляем source
-  const { error: ed } = await sb.from('partner_contacts').delete().eq('id', sourceId);
-  if (ed) throw new Error(`merge delete source: ${ed.message}`);
-
-  invalidateSalesCache(); // данные изменились — стираем кэш чтобы UI увидел свежее
-  return { ok: true, merged_into: args.target_id };
+  invalidateSalesCache();
+  return data; // { ok, merged_into, sales_customer_moved, sales_partner_moved, followups_moved }
 }
 
 // ── 5c. updatePartnerAgency ─────────────────────────────────────────────────
