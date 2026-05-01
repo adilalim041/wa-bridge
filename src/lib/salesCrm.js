@@ -109,6 +109,130 @@ function safeFilterValue(s) {
   return String(s || '').replace(/[,()*\\%]/g, ' ').slice(0, 100).trim();
 }
 
+// ── City filter ──────────────────────────────────────────────────────────────
+//
+// Whitelist строго — только три значения. Zod enum для routes.js.
+// applyCity() работает с PostgREST query-объектами и loadAllParallel-фильтрами.
+//
+// Использование с PostgREST:
+//   q = applyCity(sb.from('sales').select('*'), city);
+//
+// Использование с loadAllParallel filters:
+//   const filters = {};
+//   if (city && city !== 'all') filters.eq = { ...filters.eq, city };
+//   (или вызвать addCityFilter(filters, city))
+//
+export const CITY_ENUM = ['Алматы', 'Астана', 'all'];
+export const citySchema = z.enum(['Алматы', 'Астана', 'all']).default('all');
+
+/** Применяет .eq('city', city) к PostgREST query, если city != 'all'. */
+function applyCity(query, city) {
+  if (city && city !== 'all') return query.eq('city', city);
+  return query;
+}
+
+/** Добавляет city в loadAllParallel-совместимый filters.eq объект. */
+function addCityFilter(filters, city) {
+  if (!city || city === 'all') return filters;
+  return { ...filters, eq: { ...(filters.eq || {}), city } };
+}
+
+// ── Multi-city query parsing ──────────────────────────────────────────────────
+//
+// ?cities=Алматы,Астана  →  { mode: 'multi', cities: ['Алматы', 'Астана'] }
+// ?cities=Алматы         →  { mode: 'single', cities: ['Алматы'] }
+// ?city=Алматы           →  { mode: 'single', cities: ['Алматы'] }  (backward compat)
+// (nothing)              →  { mode: 'all', cities: [] }
+//
+// Zod whitelist: только 'Алматы' и 'Астана'. 'all' — специальное значение, в cities[] не кладём.
+//
+const VALID_CITIES = new Set(['Алматы', 'Астана']);
+
+/**
+ * Парсит ?cities= (CSV) или fallback ?city= из query string.
+ * Возвращает { ok, mode, cities, error }.
+ *
+ * mode:
+ *   'all'    — фильтр не задан, данные по всем городам суммарно
+ *   'single' — один конкретный город (использует старый path через opts.city)
+ *   'multi'  — два города, нужен breakdown (разные цвета на графике)
+ *
+ * Используется routes.js как единая точка разбора query params.
+ */
+export function parseCitiesQuery(query) {
+  // Новый параметр ?cities= имеет приоритет над ?city=
+  const rawCities = query.cities;
+  const rawCity = query.city;
+
+  if (rawCities !== undefined && rawCities !== null && rawCities !== '') {
+    const parts = String(rawCities)
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    // Whitelist — отбрасываем невалидные значения
+    const invalid = parts.filter(p => !VALID_CITIES.has(p) && p !== 'all');
+    if (invalid.length > 0) {
+      return { ok: false, mode: null, cities: [], error: `invalid cities: ${invalid.join(', ')}. Allowed: Алматы, Астана` };
+    }
+
+    // 'all' в списке → treated as no-filter
+    const cities = parts.filter(p => p !== 'all');
+
+    if (cities.length === 0) {
+      return { ok: true, mode: 'all', cities: [] };
+    }
+    if (cities.length === 1) {
+      return { ok: true, mode: 'single', cities };
+    }
+    // Deduplicate + sort for stable cache key
+    const unique = [...new Set(cities)].sort();
+    return { ok: true, mode: 'multi', cities: unique };
+  }
+
+  // Fallback: legacy ?city= (backward compat)
+  if (rawCity !== undefined && rawCity !== null && rawCity !== '') {
+    if (rawCity === 'all') return { ok: true, mode: 'all', cities: [] };
+    if (VALID_CITIES.has(rawCity)) {
+      return { ok: true, mode: 'single', cities: [rawCity] };
+    }
+    return { ok: false, mode: null, cities: [], error: 'city must be one of: Алматы, Астана, all' };
+  }
+
+  return { ok: true, mode: 'all', cities: [] };
+}
+
+/**
+ * Запускает helperFn для каждого city в cities[], объединяет результаты.
+ *
+ * Format A (timeline / multi-year): каждый item в data массивах получает поле city.
+ * Используется когда helperFn возвращает { data: [...] } или плоский массив.
+ *
+ * Конкретная функция-потребитель сама выбирает как мёрджить, потому что структура
+ * у всех разная. withCityBreakdown — удобная обёртка для параллельного вызова:
+ *
+ *   const results = await withCityBreakdown(cities, async (c) => getSalesAnalytics(req, {...opts, city: c}));
+ *   // results: { 'Алматы': {...}, 'Астана': {...} }
+ *
+ * Возвращает объект { byCity: { 'Алматы': result, 'Астана': result }, cities }.
+ */
+export async function withCityBreakdown(cities, helperFn) {
+  const results = await Promise.all(cities.map(c => helperFn(c)));
+  const byCity = {};
+  for (let i = 0; i < cities.length; i++) {
+    byCity[cities[i]] = results[i];
+  }
+  return { byCity, cities };
+}
+
+/**
+ * Добавляет поле `city` к каждому item в массиве.
+ * Используется для Format A (timeline items).
+ */
+export function tagItemsWithCity(items, city) {
+  return (items || []).map(item => ({ ...item, city }));
+}
+
 // ── 1. listPartners ─────────────────────────────────────────────────────────
 //
 // Возвращает список партнёров с агрегатами. Поддерживает фильтры и поиск.
@@ -125,6 +249,7 @@ const listPartnersInput = z.object({
   q: z.string().max(200).optional().default(''),
   limit: z.number().int().min(1).max(500).default(100),
   offset: z.number().int().min(0).default(0),
+  city: citySchema,
 });
 
 export async function listPartners(req, params = {}) {
@@ -140,6 +265,12 @@ export async function listPartners(req, params = {}) {
 
   // Common: только с заказами (мусорные сироты должны быть удалены, но защитимся)
   q = q.gt('orders_count', 0);
+
+  // NOTE: v_partner_full — view поверх partner_contacts + sales агрегатов.
+  // city-фильтр на view не имеет смысла (у контакта может быть продажи из двух
+  // городов). Фильтр хранится в cacheKey для cache isolation, но не применяется
+  // к query самого view — это read-only список партнёров независимо от города.
+  // Для city-разбивки используйте /sales-crm/analytics?city=...
 
   if (args.filter === 'with_chat') q = q.gt('total_messages', 0);
   if (args.filter === 'no_phone') q = q.is('primary_phone', null);
@@ -282,6 +413,13 @@ const dueFollowupsInput = z.object({
 
 export async function getDueFollowups(req, params = {}) {
   const args = dueFollowupsInput.parse(params);
+  // NOTE: v_followups_due нет поля city — followups привязаны к partner_contact,
+  // не к городу. city используется только для cache isolation.
+  const city = params.city || 'all';
+  const ck = cacheKey('followups-due', req, { ...args, city });
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
   const sb = pickClient(req);
 
   const cutoff = new Date();
@@ -301,7 +439,9 @@ export async function getDueFollowups(req, params = {}) {
   for (const f of data || []) {
     (buckets[f.urgency] || buckets.later).push(f);
   }
-  return { ...buckets, total: (data || []).length };
+  const result = { ...buckets, total: (data || []).length };
+  cacheSet(ck, result);
+  return result;
 }
 
 // ── 5. markFollowupDone ─────────────────────────────────────────────────────
@@ -454,16 +594,20 @@ export async function updatePartnerAgency(req, contactId, payload) {
 //
 // Список всех студий с агрегатами по продажам. Используется в Studios page.
 //
-export async function listAgencies(req) {
-  const ck = cacheKey('list-agencies', req, {});
+export async function listAgencies(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('list-agencies', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
   // Все agencies + sales-aggregates через 2 запроса
+  // City-фильтр применяется к sales (агрегаты по выручке/заказам из нужного города)
+  let salesQ = sb.from('sales').select('agency_id, total_amount').not('agency_id', 'is', null);
+  salesQ = applyCity(salesQ, city);
   const [{ data: agencies }, { data: salesAgg }, { data: contactsAgg }] = await Promise.all([
     sb.from('agencies').select('id, canonical_name, city, notes'),
-    sb.from('sales').select('agency_id, total_amount').not('agency_id', 'is', null),
+    salesQ,
     sb.from('partner_contacts').select('id, agency_id').not('agency_id', 'is', null),
   ]);
 
@@ -511,6 +655,7 @@ const analyticsInput = z.object({
   // YYYY-MM — целевой месяц для расчёта movers (this vs previous).
   // Если не указан — используется последний месяц с данными (default).
   compare_month: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+  city: citySchema,
 });
 
 // Helper: добавляем 1 месяц к YYYY-MM
@@ -542,11 +687,12 @@ export async function getSalesAnalytics(req, params = {}) {
   const sb = pickClient(req);
 
   // Параллельная пагинация для sales (с фильтрами)
-  const filters = {};
+  let filters = {};
   if (args.date_from) filters.gte = { sale_date: args.date_from };
   if (args.date_to) filters.lte = { sale_date: args.date_to };
   if (args.channel === 'b2b') filters.notNull = ['partner_id'];
   if (args.channel === 'b2c') filters.isNull = ['partner_id'];
+  filters = addCityFilter(filters, args.city);
   const sales = await loadAllParallel(sb, 'sales',
     'id, sale_date, total_amount, agency_id, partner_id, customer_id',
     filters
@@ -810,14 +956,15 @@ export async function getSalesAnalytics(req, params = {}) {
   // Wide-format для Recharts: каждая точка X (Jan-Dec) хранит все ключи "{year}__{channel}__{metric}".
   // Frontend делает multi-select по (year, channel, metric) и просто берёт нужные dataKey.
   //
-  // ВАЖНО: используем sales БЕЗ channel-фильтра (только date_from/date_to),
+  // ВАЖНО: используем sales БЕЗ channel-фильтра (только date_from/date_to + city),
   // иначе при args.channel='b2b' breakdown потеряет b2c данные. Это
   // независимый под-график со своим фильтром каналов.
   let salesForBreakdown = sales;
   if (args.channel === 'b2b' || args.channel === 'b2c') {
-    const breakdownFilters = {};
+    let breakdownFilters = {};
     if (args.date_from) breakdownFilters.gte = { sale_date: args.date_from };
     if (args.date_to) breakdownFilters.lte = { sale_date: args.date_to };
+    breakdownFilters = addCityFilter(breakdownFilters, args.city);
     salesForBreakdown = await loadAllParallel(sb, 'sales',
       'sale_date, total_amount, partner_id',
       breakdownFilters
@@ -899,17 +1046,19 @@ export async function getSalesAnalytics(req, params = {}) {
 //
 // Cities: разбивка sales по городам (через sales.city).
 //
-export async function getSegmentation(req) {
-  const ck = cacheKey('segmentation', req, {});
+export async function getSegmentation(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('segmentation', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
 
   const sb = pickClient(req);
 
   // 1. Все sales c customer_id — параллельная пагинация
+  const salesFilters = addCityFilter({ notNull: ['customer_id'] }, city);
   const sales = await loadAllParallel(sb, 'sales',
     'customer_id, sale_date, total_amount, city, sale_items(category)',
-    { notNull: ['customer_id'] }
+    salesFilters
   );
 
   const today = new Date();
@@ -1090,16 +1239,34 @@ function monthDiff(fromYM, toYM) {
 //    картриджей должно продаться через 6 мес → сколько реально продали (gap).
 // 4) seasonality: heatmap "месяц × категория" — пиковые месяцы по каждой кат.
 //
-export async function getProductInsights(req) {
-  const ck = cacheKey('products', req, {});
+export async function getProductInsights(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('products', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
   // Все sale_items + sales — параллельно (значительно быстрее последовательной pagination)
+  // При city-фильтре: загружаем только sales нужного города, потом берём только их items.
+  const salesFilters = addCityFilter({}, city);
   const [items, sales] = await Promise.all([
-    loadAllParallel(sb, 'sale_items', 'sale_id, sku, raw_name, qty, amount, category'),
-    loadAllParallel(sb, 'sales', 'id, sale_date, customer_id'),
+    city === 'all'
+      ? loadAllParallel(sb, 'sale_items', 'sale_id, sku, raw_name, qty, amount, category')
+      : (async () => {
+          // Сначала получаем sale_ids нужного города, потом items по ним
+          const citySales = await loadAllParallel(sb, 'sales', 'id', salesFilters);
+          const ids = citySales.map(s => s.id);
+          if (ids.length === 0) return [];
+          const batches = [];
+          for (let i = 0; i < ids.length; i += 200) batches.push(ids.slice(i, i + 200));
+          const results = await Promise.all(
+            batches.map(batch =>
+              sb.from('sale_items').select('sale_id, sku, raw_name, qty, amount, category').in('sale_id', batch)
+            )
+          );
+          return results.flatMap(r => r.data || []);
+        })(),
+    loadAllParallel(sb, 'sales', 'id, sale_date, customer_id', salesFilters),
   ]);
   const salesById = new Map(sales.map(s => [s.id, s]));
 
@@ -1346,6 +1513,7 @@ export async function getPartnerJourney(req, contactId) {
 //
 const drilldownInput = z.object({
   category: z.string().min(1).max(50),
+  city: citySchema,
 });
 
 export async function getCategoryDrilldown(req, params) {
@@ -1378,13 +1546,18 @@ export async function getCategoryDrilldown(req, params) {
   }
 
   const saleIds = [...new Set(items.map(it => it.sale_id))];
-  // Грузим связанные sales батчами
+  // Грузим связанные sales батчами. City-фильтр применяется здесь:
+  // если city задан — добавляем .eq('city', city) и только совпавшие sales
+  // попадают в salesById. Items связанных с «чужим» городом окажутся без sale
+  // и отфильтруются в timeline/top-sections через `if (!sale?.sale_date) continue`.
   const sales = [];
   for (let i = 0; i < saleIds.length; i += 200) {
     const batch = saleIds.slice(i, i + 200);
-    const { data } = await sb.from('sales')
+    let q = sb.from('sales')
       .select('id, sale_date, total_amount, customer_id, partner_id, agency_id')
       .in('id', batch);
+    q = applyCity(q, args.city);
+    const { data } = await q;
     sales.push(...(data || []));
   }
   const salesById = new Map(sales.map(s => [s.id, s]));
@@ -1520,15 +1693,19 @@ export async function getCategoryDrilldown(req, params) {
 // считаем сколько фильтров было продано 6 мес назад → должны иметь столько
 // followups готовых к отправке.
 //
-export async function getForecast(req) {
-  const ck = cacheKey('forecast', req, {});
+export async function getForecast(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('forecast', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
-  // 1. Sales по месяцам — для линейного прогноза
+  // 1. Sales по месяцам — для линейного прогноза.
+  // Загружаем id тоже — нужен для city-фильтра картриджного pipeline (section 5).
+  const salesFilters = addCityFilter({}, city);
   const sales = await loadAllParallel(sb, 'sales',
-    'sale_date, total_amount'
+    'id, sale_date, total_amount',
+    salesFilters
   );
   const monthlyRev = {};
   for (const s of sales) {
@@ -1595,14 +1772,32 @@ export async function getForecast(req) {
   // Использую loadAllParallel чтобы не упереться в default 1000 rows.
   const filterByMonth = {};
   const cartridgeByMonth = {};
+  // Для city-фильтра в картриджном pipeline: фильтруем по sale_ids из нужного города.
+  // sale_items не имеют city — матчим через salesIdDate (уже загруженные выше).
+  // Если city='all', грузим все items напрямую.
   const [filterItems, salesIdDate] = await Promise.all([
-    // sale_items с фильтрами по category
-    (async () => {
-      const a = await loadAllParallel(sb, 'sale_items', 'category, qty, sale_id', { eq: { category: 'water_filter' } });
-      const b = await loadAllParallel(sb, 'sale_items', 'category, qty, sale_id', { eq: { category: 'cartridge' } });
-      return [...a, ...b];
-    })(),
-    loadAllParallel(sb, 'sales', 'id, sale_date'),
+    city === 'all'
+      ? (async () => {
+          const a = await loadAllParallel(sb, 'sale_items', 'category, qty, sale_id', { eq: { category: 'water_filter' } });
+          const b = await loadAllParallel(sb, 'sale_items', 'category, qty, sale_id', { eq: { category: 'cartridge' } });
+          return [...a, ...b];
+        })()
+      : (async () => {
+          // Используем уже загруженные city-sales для фильтрации items
+          const saleIds = sales.map(s => s.id);
+          if (saleIds.length === 0) return [];
+          const batches = [];
+          for (let i = 0; i < saleIds.length; i += 200) batches.push(saleIds.slice(i, i + 200));
+          const results = await Promise.all(
+            batches.map(batch =>
+              sb.from('sale_items').select('category, qty, sale_id')
+                .in('sale_id', batch)
+                .in('category', ['water_filter', 'cartridge'])
+            )
+          );
+          return results.flatMap(r => r.data || []);
+        })(),
+    loadAllParallel(sb, 'sales', 'id, sale_date', salesFilters),
   ]);
   const idToDate = new Map((salesIdDate || []).map(s => [s.id, s.sale_date]));
   for (const it of filterItems) {
@@ -1832,14 +2027,17 @@ export async function getCityDetail(req, params) {
 // - delivery KPI: % delivered / refused / pending (из delivery_status)
 // - средние дни доставки (sale_date → delivery_date)
 //
-export async function getGeoStats(req) {
-  const ck = cacheKey('geo', req, {});
+export async function getGeoStats(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('geo', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
+  const geoFilters = addCityFilter({}, city);
   const sales = await loadAllParallel(sb, 'sales',
-    'sale_date, total_amount, customer_id, city, delivery_status, delivery_date'
+    'sale_date, total_amount, customer_id, city, delivery_status, delivery_date',
+    geoFilters
   );
 
   const byCity = {};
@@ -1920,14 +2118,17 @@ export async function getGeoStats(req) {
 // 7. Лидер по новым клиентам месяца
 // 8. Конверсия из chat_ai (если есть данные)
 //
-export async function getAutoInsights(req) {
-  const ck = cacheKey('auto-insights', req, {});
+export async function getAutoInsights(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('auto-insights', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
+  const insightsFilters = addCityFilter({}, city);
   const sales = await loadAllParallel(sb, 'sales',
-    'id, sale_date, total_amount, partner_id, customer_id, agency_id'
+    'id, sale_date, total_amount, partner_id, customer_id, agency_id',
+    insightsFilters
   );
 
   const insights = [];
@@ -2227,8 +2428,9 @@ export async function getSalesWithChats(req, params = {}) {
 // - by_source: instagram / altyn_agash / unknown
 // - by_session: per manager session
 //
-export async function getLeadFunnel(req) {
-  const ck = cacheKey('lead-funnel', req, {});
+export async function getLeadFunnel(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('lead-funnel', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
@@ -2250,9 +2452,11 @@ export async function getLeadFunnel(req) {
     for (const j of c.linked_chat_jids || []) contactByJid.set(j, c.id);
   }
 
-  // 3. Все sales — для проверки конверсии
+  // 3. Все sales — для проверки конверсии (с city-фильтром)
+  const funnelSalesFilters = addCityFilter({}, city);
   const sales = await loadAllParallel(sb, 'sales',
-    'id, sale_date, customer_id, partner_id, total_amount'
+    'id, sale_date, customer_id, partner_id, total_amount',
+    funnelSalesFilters
   );
   const salesByContact = new Map();
   for (const s of sales) {
@@ -2358,14 +2562,17 @@ export async function getLeadFunnel(req) {
 // - segments_per_manager: разрез B2B/B2C
 // - response_time (если есть в manager_analytics): средний secs до ответа
 //
-export async function getManagerPerformance(req) {
-  const ck = cacheKey('manager-perf', req, {});
+export async function getManagerPerformance(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('manager-perf', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
+  const perfFilters = addCityFilter({}, city);
   const sales = await loadAllParallel(sb, 'sales',
-    'id, sale_date, total_amount, manager, partner_id, customer_id'
+    'id, sale_date, total_amount, manager, partner_id, customer_id',
+    perfFilters
   );
 
   // ТОЛЬКО 4 активных менеджера. Все остальные имена (Сания, Алим, Асель, Саги, ...)
@@ -2491,8 +2698,9 @@ export async function getManagerPerformance(req) {
 // 4) studio_vs_independent: % выручки от партнёров со студией vs одиночек
 // 5) journey_per_partner: для каждого топ-партнёра — список месяцев с активностью
 //
-export async function getPartnerInsights(req) {
-  const ck = cacheKey('partner-insights', req, {});
+export async function getPartnerInsights(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('partner-insights', req, { city });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
@@ -2503,10 +2711,11 @@ export async function getPartnerInsights(req) {
   const cutoff_90 = new Date(todayMs - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const cutoff_180 = new Date(todayMs - 180 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  // 1. Все sales где партнёр заполнен — параллельная пагинация
+  // 1. Все sales где партнёр заполнен — параллельная пагинация (с city-фильтром)
+  const piFilters = addCityFilter({ notNull: ['partner_id'] }, city);
   const sales = await loadAllParallel(sb, 'sales',
     'id, partner_id, sale_date, total_amount, customer_id, agency_id, commission_text',
-    { notNull: ['partner_id'] }
+    piFilters
   );
 
   // 2. Aggregate per partner
@@ -2633,6 +2842,66 @@ export async function getPartnerInsights(req) {
   return result;
 }
 
+// ── 9. getCitiesSummary — сводка по городам (count + revenue) ───────────────
+//
+// Возвращает агрегаты отдельно для Алматы / Астаны / null-city (прочие).
+// Используется в combined-view дашборда для переключателя города.
+//
+export async function getCitiesSummary(req) {
+  const ck = cacheKey('cities-summary', req, {});
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+  const sb = pickClient(req);
+
+  const sales = await loadAllParallel(sb, 'sales', 'city, total_amount');
+
+  const byCity = {};
+  for (const s of sales) {
+    const c = (s.city || '').trim() || null;
+    const key = c || '—';
+    if (!byCity[key]) byCity[key] = { city: key, orders: 0, revenue: 0 };
+    byCity[key].orders++;
+    byCity[key].revenue += s.total_amount || 0;
+  }
+
+  // Собираем итог и сводку по основным городам
+  const allCities = Object.values(byCity).sort((a, b) => b.revenue - a.revenue);
+  const total_orders = sales.length;
+  const total_revenue = sales.reduce((s, x) => s + (x.total_amount || 0), 0);
+
+  // Канонические города + прочие
+  const KNOWN_CITIES = ['Алматы', 'Астана'];
+  const summary = KNOWN_CITIES.map(city => ({
+    city,
+    orders: byCity[city]?.orders || 0,
+    revenue: byCity[city]?.revenue || 0,
+    revenue_pct: total_revenue > 0
+      ? Math.round(((byCity[city]?.revenue || 0) / total_revenue) * 100)
+      : 0,
+  }));
+  const other_revenue = allCities
+    .filter(c => !KNOWN_CITIES.includes(c.city))
+    .reduce((s, c) => s + c.revenue, 0);
+  const other_orders = allCities
+    .filter(c => !KNOWN_CITIES.includes(c.city))
+    .reduce((s, c) => s + c.orders, 0);
+  summary.push({
+    city: '—',
+    orders: other_orders,
+    revenue: other_revenue,
+    revenue_pct: total_revenue > 0 ? Math.round((other_revenue / total_revenue) * 100) : 0,
+  });
+
+  const result = {
+    summary,
+    all_cities: allCities,
+    total_orders,
+    total_revenue,
+  };
+  cacheSet(ck, result);
+  return result;
+}
+
 // ── 8. searchPartner (для AI tools / quick lookup) ──────────────────────────
 //
 // По имени или телефону вернуть до 10 контактов с базовыми агрегатами.
@@ -2658,4 +2927,148 @@ export async function searchPartner(req, params) {
 
   if (error) throw new Error(`searchPartner: ${error.message}`);
   return { items: data || [] };
+}
+
+// ── 9. getMultiYearBreakdown — выделенный endpoint для MultiYearChart ─────────
+//
+// Возвращает wide-format данные (year × channel × metric) по месяцам года.
+// Это то же самое что analytics.multi_year_breakdown, но:
+//   a) отдельный endpoint с более коротким TTL на кэш (нет тяжёлых sub-queries)
+//   b) поддерживает multi-city breakdown (?cities=Алматы,Астана)
+//
+// Format A (multi-city, mode='multi'):
+//   data: [
+//     { month_idx: 1, month: 'Янв', city: 'Алматы', '2025__b2b__revenue': 12M, ... },
+//     { month_idx: 1, month: 'Янв', city: 'Астана', '2025__b2b__revenue': 8M, ... },
+//     ...
+//   ]
+//   years_available: ['2023', '2024', '2025', '2026']
+//   cities: ['Алматы', 'Астана']
+//   mode: 'multi'
+//
+// Format B (single city или all, mode='single'|'all'):
+//   data: [
+//     { month_idx: 1, month: 'Янв', '2025__b2b__revenue': 12M, ... },
+//     ...
+//   ]  — без поля city (совместимо со старым getSalesAnalytics.multi_year_breakdown)
+//   years_available: ['2023', '2024', '2025', '2026']
+//   mode: 'single' | 'all'
+//
+const RU_MONTH_SHORT = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+
+/**
+ * Вычисляет multi_year_breakdown для одного city (или 'all').
+ * Используется как внутренний helper — вызывается из getMultiYearBreakdown.
+ */
+async function _computeMultiYearBreakdown(sb, opts = {}) {
+  const { date_from, date_to, city = 'all' } = opts;
+
+  let filters = {};
+  if (date_from) filters.gte = { sale_date: date_from };
+  if (date_to) filters.lte = { sale_date: date_to };
+  filters = addCityFilter(filters, city);
+
+  const sales = await loadAllParallel(sb, 'sales',
+    'sale_date, total_amount, partner_id',
+    filters
+  );
+
+  const yearChannelMonthly = {};
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const y = s.sale_date.slice(0, 4);
+    const m = parseInt(s.sale_date.slice(5, 7), 10);
+    const ch = s.partner_id ? 'b2b' : 'b2c';
+    if (!yearChannelMonthly[m]) yearChannelMonthly[m] = {};
+    const buckets = yearChannelMonthly[m];
+    for (const channel of [ch, 'all']) {
+      const key = `${y}__${channel}`;
+      if (!buckets[key]) buckets[key] = { revenue: 0, orders: 0 };
+      buckets[key].revenue += s.total_amount || 0;
+      buckets[key].orders += 1;
+    }
+  }
+
+  const data = Array.from({ length: 12 }, (_, i) => {
+    const idx = i + 1;
+    const row = { month_idx: idx, month: RU_MONTH_SHORT[i] };
+    const buckets = yearChannelMonthly[idx] || {};
+    for (const [key, v] of Object.entries(buckets)) {
+      const avgCheck = v.orders > 0 ? Math.round(v.revenue / v.orders) : 0;
+      row[`${key}__revenue`] = v.revenue;
+      row[`${key}__orders`] = v.orders;
+      row[`${key}__avg_check`] = avgCheck;
+    }
+    return row;
+  });
+
+  const yearsAvailable = [...new Set(sales.map(s => s.sale_date?.slice(0, 4)).filter(Boolean))].sort();
+  return { data, years_available: yearsAvailable };
+}
+
+export async function getMultiYearBreakdown(req, opts = {}) {
+  // opts может содержать:
+  //   city     — single city или 'all' (legacy compat)
+  //   cities   — string[] (два города) → multi-city breakdown
+  //   date_from, date_to — период
+
+  const { city = 'all', cities, date_from, date_to } = opts;
+  const isMulti = Array.isArray(cities) && cities.length > 1;
+  const isSingleFromCities = Array.isArray(cities) && cities.length === 1;
+
+  // Resolve effective city for single-city path
+  const effectiveCity = isSingleFromCities ? cities[0] : city;
+
+  const ckParams = isMulti
+    ? { cities: [...cities].sort(), date_from, date_to }
+    : { city: effectiveCity, date_from, date_to };
+  const ck = cacheKey('multi-year-breakdown', req, ckParams);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  const sb = pickClient(req);
+
+  if (isMulti) {
+    // Format A: данные для каждого города, items получают поле city
+    const cityResults = await Promise.all(
+      cities.map(c => _computeMultiYearBreakdown(sb, { date_from, date_to, city: c }))
+    );
+
+    // Мёрджим data массивы — каждая точка получает поле city
+    const mergedData = [];
+    for (let i = 0; i < cities.length; i++) {
+      for (const item of cityResults[i].data) {
+        mergedData.push({ ...item, city: cities[i] });
+      }
+    }
+    // Сортировка: month_idx ASC, city ASC (для удобства frontend группировки)
+    mergedData.sort((a, b) => a.month_idx - b.month_idx || a.city.localeCompare(b.city));
+
+    const yearsAvailable = [...new Set(cityResults.flatMap(r => r.years_available))].sort();
+
+    const result = {
+      data: mergedData,
+      years_available: yearsAvailable,
+      cities,
+      mode: 'multi',
+    };
+    cacheSet(ck, result);
+    return result;
+  }
+
+  // Format B: single-city или all — обратная совместимость
+  const { data, years_available } = await _computeMultiYearBreakdown(sb, {
+    date_from,
+    date_to,
+    city: effectiveCity,
+  });
+
+  const result = {
+    data,
+    years_available,
+    cities: effectiveCity !== 'all' ? [effectiveCity] : [],
+    mode: effectiveCity !== 'all' ? 'single' : 'all',
+  };
+  cacheSet(ck, result);
+  return result;
 }

@@ -1501,14 +1501,51 @@ export function setupRoutes(app) {
   // Тонкие обёртки вокруг src/lib/salesCrm.js, который содержит всю логику.
   // ───────────────────────────────────────────────────────────────────────
 
-  // GET /sales-crm/partners?filter=&q=&limit=&offset=
+  /**
+   * Парсит ?city= из query string с Zod whitelist.
+   * Возвращает { ok: true, city } или { ok: false, error }.
+   * R-FW-2: city приходит ТОЛЬКО от UI (req.query.city), не от LLM.
+   *
+   * Legacy helper — для endpoints которые ещё не поддерживают multi-city.
+   * Для новых endpoints используй parseCitiesQueryRoute().
+   */
+  function parseCityQuery(query) {
+    const raw = query.city;
+    if (raw === undefined || raw === null || raw === '') return { ok: true, city: 'all' };
+    const result = salesCrm.citySchema.safeParse(raw);
+    if (!result.success) return { ok: false, error: 'city must be one of: Алматы, Астана, all' };
+    return { ok: true, city: result.data };
+  }
+
+  /**
+   * Парсит ?cities=Алматы,Астана (новый multi-city) или fallback ?city= (legacy).
+   * Возвращает { ok, mode, cities, city, error }.
+   *
+   * city — legacy поле: первый город или 'all' (для передачи в старые helpers).
+   *
+   * mode:
+   *   'all'    — нет фильтра по городу
+   *   'single' — один город (city заполнен)
+   *   'multi'  — два города, cities[] содержит оба, нужен breakdown
+   */
+  function parseCitiesQueryRoute(query) {
+    const parsed = salesCrm.parseCitiesQuery(query);
+    if (!parsed.ok) return parsed;
+    const city = parsed.cities.length === 1 ? parsed.cities[0] : 'all';
+    return { ...parsed, city };
+  }
+
+  // GET /sales-crm/partners?filter=&q=&limit=&offset=&city=Алматы|Астана|all
   router.get('/sales-crm/partners', async (req, res) => {
     try {
+      const cp = parseCityQuery(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
       const r = await salesCrm.listPartners(req, {
         filter: req.query.filter,
         q: req.query.q || '',
         limit: req.query.limit ? Number(req.query.limit) : undefined,
         offset: req.query.offset ? Number(req.query.offset) : undefined,
+        city: cp.city,
       });
       res.json(r);
     } catch (e) {
@@ -1540,10 +1577,12 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/agencies  — list of all studios with aggregates
+  // GET /sales-crm/agencies?city=Алматы|Астана|all  — list of all studios with aggregates
   router.get('/sales-crm/agencies', async (req, res) => {
     try {
-      const r = await salesCrm.listAgencies(req);
+      const cp = parseCityQuery(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+      const r = await salesCrm.listAgencies(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_list_agencies_failed');
@@ -1563,12 +1602,15 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/followups/due?window_days=30
+  // GET /sales-crm/followups/due?window_days=30&city=Алматы|Астана|all
   router.get('/sales-crm/followups/due', async (req, res) => {
     try {
+      const cp = parseCityQuery(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
       const r = await salesCrm.getDueFollowups(req, {
         window_days: req.query.window_days ? Number(req.query.window_days) : undefined,
         limit: req.query.limit ? Number(req.query.limit) : undefined,
+        city: cp.city,
       });
       res.json(r);
     } catch (e) {
@@ -1734,14 +1776,19 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&channel=all|b2b|b2c
+  // GET /sales-crm/analytics?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&channel=all|b2b|b2c&city=Алматы|Астана|all
+  // NOTE: multi_year_breakdown включён в этот же endpoint — city фильтрует и его.
+  // При ?cities=Алматы,Астана — legacy single-city аналитика (multi-city breakdown только в /multi_year_breakdown).
   router.get('/sales-crm/analytics', async (req, res) => {
     try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
       const r = await salesCrm.getSalesAnalytics(req, {
         date_from: req.query.date_from,
         date_to: req.query.date_to,
         channel: req.query.channel,
         compare_month: req.query.compare_month, // YYYY-MM для movers picker
+        city: cp.city,
       });
       res.json(r);
     } catch (e) {
@@ -1750,10 +1797,55 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/segmentation — RFM + cohorts + cities (Group B)
+  // GET /sales-crm/multi_year_breakdown — MultiYearChart endpoint с multi-city support
+  //
+  // ?city=Алматы|Астана|all  — legacy single-city (backward compat)
+  // ?cities=Алматы,Астана    — multi-city: каждая точка данных содержит поле city
+  //
+  // Format A (multi): data = [{ month_idx, month, city, '2025__b2b__revenue': N, ... }, ...]
+  // Format B (single/all): data = [{ month_idx, month, '2025__b2b__revenue': N, ... }, ...]
+  //
+  // Query params: date_from, date_to (YYYY-MM-DD)
+  router.get('/sales-crm/multi_year_breakdown', async (req, res) => {
+    try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      const opts = {
+        date_from: req.query.date_from,
+        date_to: req.query.date_to,
+      };
+
+      if (cp.mode === 'multi') {
+        opts.cities = cp.cities;
+      } else {
+        opts.city = cp.city;
+      }
+
+      const r = await salesCrm.getMultiYearBreakdown(req, opts);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_multi_year_breakdown_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/segmentation?city=Алматы|Астана|all&cities=Алматы,Астана — RFM + cohorts + cities (Group B)
+  // При mode='multi': возвращает byCity: { 'Алматы': {...}, 'Астана': {...} } + total.
   router.get('/sales-crm/segmentation', async (req, res) => {
     try {
-      const r = await salesCrm.getSegmentation(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getSegmentation(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getSegmentation(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_segmentation_failed');
@@ -1761,10 +1853,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/products — top SKUs + cross-sell + cartridge funnel (Group C)
+  // GET /sales-crm/products?city=Алматы|Астана|all&cities=Алматы,Астана — top SKUs + cross-sell + cartridge funnel (Group C)
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/products', async (req, res) => {
     try {
-      const r = await salesCrm.getProductInsights(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getProductInsights(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getProductInsights(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_products_failed');
@@ -1772,10 +1876,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/category/:cat — drill-down detailed view of one category
+  // GET /sales-crm/category/:cat?city=Алматы|Астана|all&cities=Алматы,Астана — drill-down detailed view of one category
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/category/:cat', async (req, res) => {
     try {
-      const r = await salesCrm.getCategoryDrilldown(req, { category: req.params.cat });
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getCategoryDrilldown(req, { category: req.params.cat, city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, category: req.params.cat, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getCategoryDrilldown(req, { category: req.params.cat, city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_category_drilldown_failed');
@@ -1783,10 +1899,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/forecast — линейный прогноз + картриджный pipeline
+  // GET /sales-crm/forecast?city=Алматы|Астана|all&cities=Алматы,Астана — линейный прогноз + картриджный pipeline
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/forecast', async (req, res) => {
     try {
-      const r = await salesCrm.getForecast(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getForecast(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getForecast(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_forecast_failed');
@@ -1794,7 +1922,21 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/cities-summary — сводка по городам (counts + revenue) для combined view
+  // Возвращает агрегаты для Алматы / Астаны / прочих без фильтров.
+  // Multi-city не применяется (endpoint уже по своей природе показывает оба города).
+  router.get('/sales-crm/cities-summary', async (req, res) => {
+    try {
+      const r = await salesCrm.getCitiesSummary(req);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_cities_summary_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/city/:city — детальный анализ одного города
+  // Multi-city не применяется (endpoint принимает город в path param).
   router.get('/sales-crm/city/:city', async (req, res) => {
     try {
       const r = await salesCrm.getCityDetail(req, { city: req.params.city });
@@ -1805,10 +1947,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/geo — города + delivery KPI (Group G)
+  // GET /sales-crm/geo?city=Алматы|Астана|all&cities=Алматы,Астана — города + delivery KPI (Group G)
+  // geo — уже city-breakdown по природе. При mode='multi' — дополнительно оборачиваем в byCity.
   router.get('/sales-crm/geo', async (req, res) => {
     try {
-      const r = await salesCrm.getGeoStats(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getGeoStats(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getGeoStats(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_geo_failed');
@@ -1816,10 +1970,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/auto-insights — автогенерация фактов дня (Group H)
+  // GET /sales-crm/auto-insights?city=Алматы|Астана|all&cities=Алматы,Астана — автогенерация фактов дня (Group H)
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/auto-insights', async (req, res) => {
     try {
-      const r = await salesCrm.getAutoInsights(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getAutoInsights(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getAutoInsights(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_auto_insights_failed');
@@ -1828,6 +1994,7 @@ export function setupRoutes(app) {
   });
 
   // GET /sales-crm/sales-with-chats?limit=&offset= — продажи с диалогами (Group E rebuild)
+  // Multi-city не применяется (list endpoint, pagination-based).
   router.get('/sales-crm/sales-with-chats', async (req, res) => {
     try {
       const r = await salesCrm.getSalesWithChats(req, {
@@ -1840,10 +2007,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/lead-funnel — chat_ai → sales conversion (Group E)
+  // GET /sales-crm/lead-funnel?city=Алматы|Астана|all&cities=Алматы,Астана — chat_ai → sales conversion (Group E)
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/lead-funnel', async (req, res) => {
     try {
-      const r = await salesCrm.getLeadFunnel(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getLeadFunnel(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getLeadFunnel(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_lead_funnel_failed');
@@ -1851,10 +2030,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/manager-performance — leaderboard + timeline + response times (Group F)
+  // GET /sales-crm/manager-performance?city=Алматы|Астана|all&cities=Алматы,Астана — leaderboard + timeline + response times (Group F)
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/manager-performance', async (req, res) => {
     try {
-      const r = await salesCrm.getManagerPerformance(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getManagerPerformance(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getManagerPerformance(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_manager_perf_failed');
@@ -1862,10 +2053,22 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/partners-insights — cold/rising/ROI (Group D)
+  // GET /sales-crm/partners-insights?city=Алматы|Астана|all&cities=Алматы,Астана — cold/rising/ROI (Group D)
+  // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/partners-insights', async (req, res) => {
     try {
-      const r = await salesCrm.getPartnerInsights(req);
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getPartnerInsights(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getPartnerInsights(req, { city: cp.city });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_partner_insights_failed');
