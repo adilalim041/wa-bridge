@@ -19,6 +19,7 @@
 
 import { supabase } from '../storage/supabase.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
+import { applyAutoTag } from '../ai/aiWorker.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // 1. autoDismissResolved
@@ -108,60 +109,97 @@ export async function getRecentFeedback(limit = 50) {
 // 3. getPendingDialogs
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Возвращает dialog_sessions без записи в chat_ai. Сначала active sessions,
-// потом для каждой — последние N диалогов с >=2 сообщениями.
-export async function getPendingDialogs({ limit = 100, sessionId } = {}) {
+// Возвращает диалоги С НОВОЙ АКТИВНОСТЬЮ за окно since_hours (default 24h).
+// Включает 2 кейса:
+//   1. NEW       — нет записи в chat_ai (первый анализ)
+//   2. RE-ANALYZE — chat_ai есть, но `messages.timestamp > chat_ai.analyzed_at`
+//                   (теги/intent могли устареть — нужно пере-проанализировать)
+//
+// Раньше (2026-05-01 предыдущая итерация): возвращало ВСЕ pending за всю
+// историю → 109 диалогов из которых половина — мёртвые first_contact и
+// colleague-чаты годовой давности. Adil: «зачем ты читал все непрочитанные?»
+// Теперь — окно по `last_message_at`.
+export async function getPendingDialogs({
+  limit = 100,
+  sessionId,
+  sinceHours = 24,
+} = {}) {
   const cap = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
+  const hours = Math.min(Math.max(parseInt(sinceHours) || 24, 1), 24 * 30); // max 30 days
+  const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 
   let sessQ = supabase.from('session_config').select('session_id').eq('is_active', true);
   if (sessionId) sessQ = sessQ.eq('session_id', sessionId);
   const { data: sessions, error: sessErr } = await sessQ;
   if (sessErr) throw new Error(`getPendingDialogs sessions: ${sessErr.message}`);
-  if (!sessions || sessions.length === 0) return { count: 0, dialogs: [] };
+  if (!sessions || sessions.length === 0) return { count: 0, dialogs: [], since: cutoff };
 
-  const allPending = [];
+  const out = [];
+  let newCount = 0, reCount = 0;
 
   for (const s of sessions) {
+    // Только диалоги с активностью в окне
     const { data: dialogs } = await supabase
       .from('dialog_sessions')
       .select('id, remote_jid, last_message_at, message_count, started_at')
       .eq('session_id', s.session_id)
       .gte('message_count', 2)
+      .gte('last_message_at', cutoff)
       .order('last_message_at', { ascending: false })
-      .limit(100);
+      .limit(cap);
     if (!dialogs || dialogs.length === 0) continue;
 
+    // Какие из них уже в chat_ai (и когда последний анализ)
     const dialogIds = dialogs.map((d) => d.id);
     const { data: analyzed } = await supabase
       .from('chat_ai')
-      .select('dialog_session_id')
+      .select('dialog_session_id, analyzed_at')
       .in('dialog_session_id', dialogIds);
+    const analyzedMap = new Map((analyzed || []).map((a) => [a.dialog_session_id, a.analyzed_at]));
 
-    const analyzedSet = new Set((analyzed || []).map((a) => a.dialog_session_id));
     for (const d of dialogs) {
-      if (!analyzedSet.has(d.id)) {
-        allPending.push({ ...d, session_id: s.session_id });
-        if (allPending.length >= cap) break;
+      const lastAnalyzedAt = analyzedMap.get(d.id);
+      if (!lastAnalyzedAt) {
+        out.push({ ...d, session_id: s.session_id, reason: 'new' });
+        newCount++;
+      } else if (new Date(d.last_message_at) > new Date(lastAnalyzedAt)) {
+        // Новые сообщения пришли после прошлого анализа → re-analyze для свежих тегов
+        out.push({ ...d, session_id: s.session_id, reason: 're_analyze', last_analyzed_at: lastAnalyzedAt });
+        reCount++;
       }
+      if (out.length >= cap) break;
     }
-    if (allPending.length >= cap) break;
+    if (out.length >= cap) break;
   }
 
-  return { count: allPending.length, dialogs: allPending };
+  return {
+    count: out.length,
+    new_count: newCount,
+    re_analyze_count: reCount,
+    since: cutoff,
+    since_hours: hours,
+    dialogs: out,
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // 4. saveAnalysis
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Batch insert проанализированных диалогов в chat_ai.
-// `dialog_session_id` имеет UNIQUE constraint, но без явного name —
-// PostgREST не сматчит onConflict. Используем insert + per-record
-// fallback на update если попался дубль (idempotent re-run).
-// getPendingDialogs возвращает только непроанализированные → дубли редки.
+// Batch insert проанализированных диалогов в chat_ai + опционально:
+//   - inline auto-tagging (по customer_type) — chats.tags обновляются СРАЗУ,
+//     отдельный /ai/backfill-tags больше не нужен
+//   - mark_as_read=true: помечает messages.read_at = NOW() ТОЛЬКО для тех
+//     (session_id, remote_jid) которые попали в этот save (stealth — без WA
+//     read-receipts). Не трогает остальные unread.
+//
+// Раньше (2026-05-01 предыдущая итерация): отдельный шаг backfill-tags
+// зависал на >60s, и отдельный read-all loop помечал ВСЕ 3905 unread
+// (включая чаты которые мы НЕ анализировали). Adil: «зачем ты читал все».
+// Теперь оба действия — внутри save-analysis с явным flag.
 const REQUIRED_FIELDS = ['session_id', 'remote_jid', 'dialog_session_id', 'intent', 'lead_temperature'];
 
-export async function saveAnalysis(records) {
+export async function saveAnalysis(records, { markAsRead = false } = {}) {
   if (!Array.isArray(records)) throw new Error('records must be an array');
   if (records.length === 0) return { saved: 0, ids: [] };
   if (records.length > 100) throw new Error('max 100 records per batch');
@@ -174,49 +212,86 @@ export async function saveAnalysis(records) {
     if (!r.analyzed_at) r.analyzed_at = nowIso;
   }
 
-  // Try bulk insert first.
-  const { data, error } = await supabase
+  // Step 1: bulk insert; на 23505 — per-record fallback на update.
+  let savedCount = 0, updatedCount = 0;
+  const ids = [];
+  const { data: bulkData, error: bulkErr } = await supabase
     .from('chat_ai')
     .insert(records)
     .select('id, dialog_session_id');
 
-  if (!error) {
-    return { saved: data?.length || 0, ids: (data || []).map((d) => d.id), updated: 0 };
-  }
-
-  // 23505 = unique_violation — есть дубли, делаем per-record с fallback на update
-  if (error.code !== '23505') {
-    throw new Error(`saveAnalysis: ${error.message}`);
-  }
-
-  let saved = 0, updated = 0;
-  const ids = [];
-  for (const r of records) {
-    const { data: ins, error: insErr } = await supabase
-      .from('chat_ai')
-      .insert(r)
-      .select('id, dialog_session_id')
-      .maybeSingle();
-    if (!insErr && ins) {
-      saved++;
-      ids.push(ins.id);
-      continue;
-    }
-    if (insErr?.code === '23505') {
-      // Уже есть запись — апдейтим по dialog_session_id
-      const { data: upd, error: updErr } = await supabase
+  if (!bulkErr) {
+    savedCount = bulkData?.length || 0;
+    ids.push(...(bulkData || []).map((d) => d.id));
+  } else if (bulkErr.code === '23505') {
+    for (const r of records) {
+      const { data: ins, error: insErr } = await supabase
         .from('chat_ai')
-        .update(r)
-        .eq('dialog_session_id', r.dialog_session_id)
+        .insert(r)
         .select('id, dialog_session_id')
         .maybeSingle();
-      if (!updErr && upd) {
-        updated++;
-        ids.push(upd.id);
+      if (!insErr && ins) {
+        savedCount++;
+        ids.push(ins.id);
+        continue;
+      }
+      if (insErr?.code === '23505') {
+        const { data: upd, error: updErr } = await supabase
+          .from('chat_ai')
+          .update(r)
+          .eq('dialog_session_id', r.dialog_session_id)
+          .select('id, dialog_session_id')
+          .maybeSingle();
+        if (!updErr && upd) {
+          updatedCount++;
+          ids.push(upd.id);
+        }
+      }
+    }
+  } else {
+    throw new Error(`saveAnalysis: ${bulkErr.message}`);
+  }
+
+  // Step 2: inline auto-tagging (по customer_type) для каждой записи.
+  // applyAutoTag сам уважает tagConfirmed (не перезаписывает manual теги).
+  let tagged = 0;
+  for (const r of records) {
+    if (r.customer_type) {
+      try {
+        await applyAutoTag(r.session_id, r.remote_jid, r.customer_type);
+        tagged++;
+      } catch (e) {
+        // Tag failure не валит save — логируем silently.
       }
     }
   }
-  return { saved, updated, ids };
+
+  // Step 3: bulk mark-as-read только для analyzed JIDs (если попросили).
+  // Single SQL UPDATE на messages с фильтром по списку (session_id, remote_jid)
+  // парам — гораздо быстрее loop'а через per-chat /read-all endpoint.
+  let markedRead = 0;
+  if (markAsRead) {
+    // Группируем по session_id чтобы одним запросом на каждую сессию.
+    const bySession = new Map();
+    for (const r of records) {
+      if (!bySession.has(r.session_id)) bySession.set(r.session_id, new Set());
+      bySession.get(r.session_id).add(r.remote_jid);
+    }
+    for (const [sid, jidSet] of bySession.entries()) {
+      const jids = Array.from(jidSet);
+      const { count, error: mErr } = await supabase
+        .from('messages')
+        .update({ read_at: nowIso })
+        .eq('session_id', sid)
+        .eq('from_me', false)
+        .is('read_at', null)
+        .in('remote_jid', jids)
+        .select('*', { count: 'exact', head: true });
+      if (!mErr) markedRead += (count || 0);
+    }
+  }
+
+  return { saved: savedCount, updated: updatedCount, tagged, marked_read: markedRead, ids };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -238,11 +313,29 @@ export async function getStuckDeals({ days = 7 } = {}) {
     .lt('analyzed_at', cutoff)
     .is('problem_dismissed_at', null)
     .order('analyzed_at', { ascending: true })
-    .limit(50);
+    .limit(100);
   if (error) throw new Error(`getStuckDeals: ${error.message}`);
 
+  // Фильтр: только personal jids. Группы (`@g.us`) и LID-jids (15+ цифр без
+  // `@s.whatsapp.net` или с `@lid`) — мусор от старых записей, не реальные сделки.
+  const isPersonalJid = (jid) => {
+    if (!jid) return false;
+    if (jid.includes('@g.us')) return false;
+    if (jid.includes('@lid')) return false;
+    // Personal: 11 цифр + @s.whatsapp.net (KZ format)
+    if (jid.includes('@s.whatsapp.net')) {
+      const phone = jid.split('@')[0];
+      return phone.length >= 10 && phone.length <= 13 && /^\d+$/.test(phone);
+    }
+    // Без `@` — старый формат, проверим длину
+    const phone = jid.split('@')[0];
+    return phone.length >= 10 && phone.length <= 13 && /^\d+$/.test(phone);
+  };
+
+  const filtered = (data || []).filter((c) => isPersonalJid(c.remote_jid));
+
   const stuck = [];
-  for (const c of data || []) {
+  for (const c of filtered) {
     const { data: lastMsg } = await supabase
       .from('messages')
       .select('id, timestamp, from_me')

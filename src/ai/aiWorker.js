@@ -415,7 +415,7 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
   }
 }
 
-async function applyAutoTag(sessionId, remoteJid, customerType) {
+export async function applyAutoTag(sessionId, remoteJid, customerType) {
   // resolveTag handles canonical + legacy customer_type values (see tagConstants.js).
   const newTag = resolveTag(customerType);
   if (!newTag) {

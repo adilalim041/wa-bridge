@@ -1652,13 +1652,15 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /admin/daily-run/pending-dialogs?limit=100&sessionId=...
-  // dialog_sessions БЕЗ записи в chat_ai. По умолчанию все активные сессии.
+  // GET /admin/daily-run/pending-dialogs?limit=100&sessionId=...&since_hours=24
+  // ТОЛЬКО диалоги с активностью в окне (default 24h, max 720h=30d).
+  // Включает 2 кейса: новые (нет в chat_ai) + re-analyze (новые сообщения после chat_ai.analyzed_at).
   router.get('/admin/daily-run/pending-dialogs', adminOnly, async (req, res) => {
     try {
       const r = await dailyRun.getPendingDialogs({
         limit: req.query.limit,
         sessionId: req.query.sessionId,
+        sinceHours: req.query.since_hours,
       });
       res.json(r);
     } catch (e) {
@@ -1667,15 +1669,18 @@ export function setupRoutes(app) {
     }
   });
 
-  // POST /admin/daily-run/save-analysis   body: { records: [...] }
-  // Batch upsert проанализированных диалогов в chat_ai.
+  // POST /admin/daily-run/save-analysis   body: { records: [...], mark_as_read?: bool }
+  // Batch insert+update проанализированных диалогов в chat_ai.
+  // Inline auto-tagging (по customer_type) — больше не нужен отдельный backfill-tags.
+  // mark_as_read=true → bulk-mark-read только для тех (session_id, remote_jid),
+  // которые попали в этот save (stealth, без WA read-receipts).
   router.post('/admin/daily-run/save-analysis', adminOnly, async (req, res) => {
     try {
-      const { records } = req.body || {};
+      const { records, mark_as_read } = req.body || {};
       if (!Array.isArray(records)) {
         return res.status(400).json({ error: 'records must be an array' });
       }
-      const r = await dailyRun.saveAnalysis(records);
+      const r = await dailyRun.saveAnalysis(records, { markAsRead: mark_as_read === true });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'daily_run_save_failed');
