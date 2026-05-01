@@ -154,8 +154,11 @@ export async function getPendingDialogs({ limit = 100, sessionId } = {}) {
 // 4. saveAnalysis
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Batch upsert проанализированных диалогов в chat_ai.
-// onConflict: dialog_session_id — один диалог = одна запись.
+// Batch insert проанализированных диалогов в chat_ai.
+// `dialog_session_id` имеет UNIQUE constraint, но без явного name —
+// PostgREST не сматчит onConflict. Используем insert + per-record
+// fallback на update если попался дубль (idempotent re-run).
+// getPendingDialogs возвращает только непроанализированные → дубли редки.
 const REQUIRED_FIELDS = ['session_id', 'remote_jid', 'dialog_session_id', 'intent', 'lead_temperature'];
 
 export async function saveAnalysis(records) {
@@ -171,13 +174,49 @@ export async function saveAnalysis(records) {
     if (!r.analyzed_at) r.analyzed_at = nowIso;
   }
 
+  // Try bulk insert first.
   const { data, error } = await supabase
     .from('chat_ai')
-    .upsert(records, { onConflict: 'dialog_session_id' })
+    .insert(records)
     .select('id, dialog_session_id');
-  if (error) throw new Error(`saveAnalysis: ${error.message}`);
 
-  return { saved: data?.length || 0, ids: (data || []).map((d) => d.id) };
+  if (!error) {
+    return { saved: data?.length || 0, ids: (data || []).map((d) => d.id), updated: 0 };
+  }
+
+  // 23505 = unique_violation — есть дубли, делаем per-record с fallback на update
+  if (error.code !== '23505') {
+    throw new Error(`saveAnalysis: ${error.message}`);
+  }
+
+  let saved = 0, updated = 0;
+  const ids = [];
+  for (const r of records) {
+    const { data: ins, error: insErr } = await supabase
+      .from('chat_ai')
+      .insert(r)
+      .select('id, dialog_session_id')
+      .maybeSingle();
+    if (!insErr && ins) {
+      saved++;
+      ids.push(ins.id);
+      continue;
+    }
+    if (insErr?.code === '23505') {
+      // Уже есть запись — апдейтим по dialog_session_id
+      const { data: upd, error: updErr } = await supabase
+        .from('chat_ai')
+        .update(r)
+        .eq('dialog_session_id', r.dialog_session_id)
+        .select('id, dialog_session_id')
+        .maybeSingle();
+      if (!updErr && upd) {
+        updated++;
+        ids.push(upd.id);
+      }
+    }
+  }
+  return { saved, updated, ids };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
