@@ -21,6 +21,7 @@ import { resolveSender } from '../reports/routing.js';
 import { isSentryEnabled } from '../observability/sentry.js';
 import { runCloudinaryCleanup, getCleanupConfig } from '../cleanup/cloudinaryCleanup.js';
 import * as salesCrm from '../lib/salesCrm.js';
+import * as dailyRun from '../lib/dailyRun.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -1608,6 +1609,102 @@ export function setupRoutes(app) {
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_mark_done_failed');
       res.status(400).json({ error: e.message });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Daily-run admin endpoints — sandbox-safe оркестратор для Claude Code SKILL.md
+  // ───────────────────────────────────────────────────────────────────────────
+  // Раньше SKILL.md `daily-wa-analysis` ходил curl'ом напрямую в Supabase
+  // REST API с service_role JWT — sandbox blocks (правильно: креды в транскрипте).
+  // Теперь весь pipeline идёт через Bridge x-api-key, service_role живёт только
+  // на Railway. Все эндпоинты admin-only (req.user → 403).
+
+  function adminOnly(req, res, next) {
+    if (req.user) {
+      return res.status(403).json({ error: 'admin-only endpoint (x-api-key required)' });
+    }
+    next();
+  }
+
+  // POST /admin/daily-run/auto-dismiss
+  // Закрывает «висящие» проблемные переписки если менеджер уже отвечал клиенту
+  // после analyzed_at. Возвращает счётчики и список тех что реально висят.
+  router.post('/admin/daily-run/auto-dismiss', adminOnly, async (req, res) => {
+    try {
+      const r = await dailyRun.autoDismissResolved();
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'daily_run_auto_dismiss_failed');
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /admin/daily-run/feedback-recent?limit=50
+  // Последние N chat_ai_feedback для guidelines в SKILL.md.
+  router.get('/admin/daily-run/feedback-recent', adminOnly, async (req, res) => {
+    try {
+      const r = await dailyRun.getRecentFeedback(req.query.limit);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'daily_run_feedback_failed');
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /admin/daily-run/pending-dialogs?limit=100&sessionId=...
+  // dialog_sessions БЕЗ записи в chat_ai. По умолчанию все активные сессии.
+  router.get('/admin/daily-run/pending-dialogs', adminOnly, async (req, res) => {
+    try {
+      const r = await dailyRun.getPendingDialogs({
+        limit: req.query.limit,
+        sessionId: req.query.sessionId,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'daily_run_pending_failed');
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /admin/daily-run/save-analysis   body: { records: [...] }
+  // Batch upsert проанализированных диалогов в chat_ai.
+  router.post('/admin/daily-run/save-analysis', adminOnly, async (req, res) => {
+    try {
+      const { records } = req.body || {};
+      if (!Array.isArray(records)) {
+        return res.status(400).json({ error: 'records must be an array' });
+      }
+      const r = await dailyRun.saveAnalysis(records);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'daily_run_save_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /admin/daily-run/stuck-deals?days=7
+  // Горячие/тёплые сделки без movement >= N дней (max 60).
+  router.get('/admin/daily-run/stuck-deals', adminOnly, async (req, res) => {
+    try {
+      const r = await dailyRun.getStuckDeals({ days: req.query.days });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'daily_run_stuck_failed');
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /admin/daily-run/digest?send_telegram=true
+  // Текстовая сводка за 24h (critical/hot/issues/stuck) + опционально в Telegram.
+  router.post('/admin/daily-run/digest', adminOnly, async (req, res) => {
+    try {
+      const sendTelegram = req.query.send_telegram === 'true';
+      const r = await dailyRun.composeDigest({ sendTelegram });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'daily_run_digest_failed');
+      res.status(500).json({ error: e.message });
     }
   });
 
