@@ -753,8 +753,28 @@ export async function getSalesAnalytics(req, params = {}) {
     agency_id: cMap.get(p.contact_id)?.agency_id || null,
   }));
 
-  // 4. Categories — берём все sale_items параллельно
-  const items = await loadAllParallel(sb, 'sale_items', 'category, sale_id, amount');
+  // 4. Categories — city-aware: если city задан, берём только items продаж этого города.
+  // sale_items не имеют поля city, поэтому сначала получаем sale_ids нужного города,
+  // потом items батчами по 500 (PostgREST .in() limit).
+  let items;
+  if (args.city && args.city !== 'all') {
+    // Используем уже загруженные sales — они уже city-filtered (addCityFilter выше)
+    const cityFilteredSaleIds = sales.map(s => s.id).filter(Boolean);
+    if (cityFilteredSaleIds.length === 0) {
+      items = [];
+    } else {
+      const batches = [];
+      for (let i = 0; i < cityFilteredSaleIds.length; i += 500) {
+        batches.push(cityFilteredSaleIds.slice(i, i + 500));
+      }
+      const batchResults = await Promise.all(
+        batches.map(batch => sb.from('sale_items').select('category, sale_id, amount').in('sale_id', batch))
+      );
+      items = batchResults.flatMap(r => r.data || []);
+    }
+  } else {
+    items = await loadAllParallel(sb, 'sale_items', 'category, sale_id, amount');
+  }
   const cats = {};
   for (const it of items || []) {
     const c = it.category || 'other';
