@@ -1554,6 +1554,31 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/partners/distribution?city=Алматы|Астана|all[&cities=Алматы,Астана]
+  // Pie-chart distribution партнёров по revenue (TOP-15 named + Прочие + Одноразовые + Неизвестные).
+  // При ?cities=Алматы,Астана возвращает { byCity: { Алматы: {...}, Астана: {...} } }.
+  // ВАЖНО: зарегистрирован ДО /:id — иначе Express поглотит 'distribution' как id-параметр.
+  router.get('/sales-crm/partners/distribution', async (req, res) => {
+    try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getPartnersDistribution(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getPartnersDistribution(req, { city: cp.city });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_partners_distribution_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners/:id/journey — Customer journey timeline
   router.get('/sales-crm/partners/:id/journey', async (req, res) => {
     try {
@@ -1586,6 +1611,31 @@ export function setupRoutes(app) {
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_list_agencies_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/agencies/distribution?city=Алматы|Астана|all[&cities=Алматы,Астана]
+  // Pie-chart distribution студий по revenue (TOP-15 named + Прочие + 1-заказ + Без студии).
+  // При ?cities=Алматы,Астана возвращает { byCity: { Алматы: {...}, Астана: {...} } }.
+  // ВАЖНО: зарегистрирован ДО /:id — иначе Express поглотит 'distribution' как id-параметр.
+  router.get('/sales-crm/agencies/distribution', async (req, res) => {
+    try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getAgenciesDistribution(req, { city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getAgenciesDistribution(req, { city: cp.city });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_agencies_distribution_failed');
       res.status(400).json({ error: e.message });
     }
   });

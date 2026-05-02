@@ -3108,3 +3108,246 @@ export async function getMultiYearBreakdown(req, opts = {}) {
   cacheSet(ck, result);
   return result;
 }
+
+// ── Distribution helpers ─────────────────────────────────────────────────────
+//
+// Общая логика для pie-chart distribution endpoints:
+//   1. Загружаем данные с city-фильтром
+//   2. Aggregating by entity id in JS
+//   3. Категоризируем: named TOP-N | other | single | unknown/no_entity
+//
+// TOP_N — количество named слайсов (остальные → "Прочие")
+const DISTRIBUTION_TOP_N = 15;
+
+/**
+ * Вспомогательная функция: строим distribution-данные для pie chart.
+ * @param {Array} slices - Массив { name, id, revenue, count, category }
+ * @param {number} totalRevenue
+ * @param {number} totalEntities - количество уникальных named entities
+ */
+function buildDistributionResult(slices, totalRevenue, totalEntities) {
+  // Сортируем named первыми (по revenue), потом специальные категории
+  const named = slices.filter(s => s.category === 'named').sort((a, b) => b.revenue - a.revenue);
+  const special = slices.filter(s => s.category !== 'named');
+  return {
+    data: [...named, ...special],
+    total_revenue: totalRevenue,
+    total_entities: totalEntities,
+  };
+}
+
+// ── getPartnersDistribution ──────────────────────────────────────────────────
+//
+// Pie-chart distribution партнёров по revenue.
+//
+// Категории:
+//   named   — TOP-15 партнёров с более чем 1 заказом (отдельные slices)
+//   other   — именованные партнёры за пределами TOP-15 (1 slice «Прочие партнёры»)
+//   single  — партнёры ровно с 1 заказом (1 slice «Одноразовые»)
+//   unknown — canonical_name LIKE 'Неизвестный%' (1 slice «Неизвестные»)
+//
+// city-фильтр через addCityFilter (source_file prefix, как везде).
+// multi-city: при isMulti — withCityBreakdown, возвращает { byCity }.
+//
+export async function getPartnersDistribution(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('partners-distribution', req, { city });
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  const sb = pickClient(req);
+
+  // 1. Все sales где есть partner_id (B2B продажи), с city-фильтром
+  const salesFilters = addCityFilter({ notNull: ['partner_id'] }, city);
+  const sales = await loadAllParallel(sb, 'sales',
+    'partner_id, total_amount',
+    salesFilters
+  );
+
+  // 2. Aggregate по partner_id
+  const byPartner = {};
+  let totalRevenue = 0;
+  for (const s of sales) {
+    const pid = s.partner_id;
+    if (!pid) continue;
+    if (!byPartner[pid]) byPartner[pid] = { revenue: 0, count: 0 };
+    byPartner[pid].revenue += s.total_amount || 0;
+    byPartner[pid].count++;
+    totalRevenue += s.total_amount || 0;
+  }
+
+  const partnerIds = Object.keys(byPartner);
+  if (partnerIds.length === 0) {
+    const empty = { data: [], total_revenue: 0, total_entities: 0 };
+    cacheSet(ck, empty);
+    return empty;
+  }
+
+  // 3. Обогащаем именами (батч по 500)
+  const nameMap = {};
+  for (let i = 0; i < partnerIds.length; i += 500) {
+    const batch = partnerIds.slice(i, i + 500);
+    const { data: contacts } = await sb.from('partner_contacts')
+      .select('id, canonical_name')
+      .in('id', batch);
+    for (const c of contacts || []) nameMap[c.id] = c.canonical_name;
+  }
+
+  // 4. Классификация
+  // unknown: canonical_name начинается с 'Неизвестный' или контакт не найден в nameMap
+  // single:  ровно 1 заказ (НЕ unknown)
+  // named:   > 1 заказа (НЕ unknown)
+
+  const unknown = { name: 'Неизвестные', revenue: 0, count: 0, category: 'unknown', ids: [] };
+  const singleBucket = { name: 'Одноразовые (1 заказ)', revenue: 0, count: 0, category: 'single', ids: [] };
+  const namedList = [];
+
+  for (const [pid, agg] of Object.entries(byPartner)) {
+    const cname = nameMap[pid];
+    const isUnknown = !cname || /^Неизвестн/i.test(cname);
+
+    if (isUnknown) {
+      unknown.revenue += agg.revenue;
+      unknown.count += agg.count;
+      unknown.ids.push(pid);
+      continue;
+    }
+    if (agg.count === 1) {
+      singleBucket.revenue += agg.revenue;
+      singleBucket.count += agg.count;
+      singleBucket.ids.push(pid);
+      continue;
+    }
+    namedList.push({ name: cname, id: pid, revenue: agg.revenue, count: agg.count, category: 'named' });
+  }
+
+  // 5. Сортируем named по revenue, отрезаем TOP-N
+  namedList.sort((a, b) => b.revenue - a.revenue);
+  const topNamed = namedList.slice(0, DISTRIBUTION_TOP_N);
+  const restNamed = namedList.slice(DISTRIBUTION_TOP_N);
+
+  const slices = [...topNamed];
+
+  if (restNamed.length > 0) {
+    slices.push({
+      name: `Прочие партнёры (${restNamed.length})`,
+      revenue: restNamed.reduce((s, x) => s + x.revenue, 0),
+      count: restNamed.reduce((s, x) => s + x.count, 0),
+      category: 'other',
+      ids: restNamed.map(x => x.id),
+    });
+  }
+  if (singleBucket.ids.length > 0) slices.push(singleBucket);
+  if (unknown.ids.length > 0) slices.push(unknown);
+
+  const result = buildDistributionResult(slices, totalRevenue, partnerIds.length);
+  cacheSet(ck, result);
+  return result;
+}
+
+// ── getAgenciesDistribution ──────────────────────────────────────────────────
+//
+// Pie-chart distribution студий по revenue.
+//
+// Категории:
+//   named     — TOP-15 студий с > 1 заказом
+//   other     — студии за пределами TOP-15 (slice «Прочие студии»)
+//   single    — студии с 1 заказом (slice «Прочие студии (1 заказ)»)
+//   no_agency — заказы без студии (agency_id IS NULL) → slice «Без студии»
+//
+// ВАЖНО: agency_id в sales — ссылка на студию дизайнера, не клиента.
+// Все sales (не только B2B) учитываются, если agency_id заполнен.
+//
+export async function getAgenciesDistribution(req, opts = {}) {
+  const city = opts.city || 'all';
+  const ck = cacheKey('agencies-distribution', req, { city });
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  const sb = pickClient(req);
+
+  // 1. Все sales с city-фильтром (включаем ALL — и с agency_id, и без).
+  // Используем loadAllParallel чтобы обойти лимит PostgREST 1000 строк.
+  const salesFilters = addCityFilter({}, city);
+  const sales = await loadAllParallel(sb, 'sales',
+    'agency_id, total_amount',
+    salesFilters
+  );
+
+  // 2. Aggregate по agency_id (null = «Без студии»)
+  const byAgency = {};
+  let totalRevenue = 0;
+  let noAgencyRevenue = 0;
+  let noAgencyCount = 0;
+
+  for (const s of sales) {
+    totalRevenue += s.total_amount || 0;
+    if (!s.agency_id) {
+      noAgencyRevenue += s.total_amount || 0;
+      noAgencyCount++;
+      continue;
+    }
+    if (!byAgency[s.agency_id]) byAgency[s.agency_id] = { revenue: 0, count: 0 };
+    byAgency[s.agency_id].revenue += s.total_amount || 0;
+    byAgency[s.agency_id].count++;
+  }
+
+  const agencyIds = Object.keys(byAgency);
+
+  // 3. Обогащаем именами студий
+  const nameMap = {};
+  if (agencyIds.length > 0) {
+    for (let i = 0; i < agencyIds.length; i += 500) {
+      const batch = agencyIds.slice(i, i + 500);
+      const { data: agencies } = await sb.from('agencies')
+        .select('id, canonical_name')
+        .in('id', batch);
+      for (const a of agencies || []) nameMap[a.id] = a.canonical_name;
+    }
+  }
+
+  // 4. Классификация
+  const singleBucket = { name: 'Прочие студии (1 заказ)', revenue: 0, count: 0, category: 'single', ids: [] };
+  const namedList = [];
+
+  for (const [aid, agg] of Object.entries(byAgency)) {
+    const cname = nameMap[aid] || `Студия ${aid.slice(0, 8)}`;
+    if (agg.count === 1) {
+      singleBucket.revenue += agg.revenue;
+      singleBucket.count += agg.count;
+      singleBucket.ids.push(aid);
+      continue;
+    }
+    namedList.push({ name: cname, id: aid, revenue: agg.revenue, count: agg.count, category: 'named' });
+  }
+
+  // 5. TOP-N + остаток
+  namedList.sort((a, b) => b.revenue - a.revenue);
+  const topNamed = namedList.slice(0, DISTRIBUTION_TOP_N);
+  const restNamed = namedList.slice(DISTRIBUTION_TOP_N);
+
+  const slices = [...topNamed];
+
+  if (restNamed.length > 0) {
+    slices.push({
+      name: `Прочие студии (${restNamed.length})`,
+      revenue: restNamed.reduce((s, x) => s + x.revenue, 0),
+      count: restNamed.reduce((s, x) => s + x.count, 0),
+      category: 'other',
+      ids: restNamed.map(x => x.id),
+    });
+  }
+  if (singleBucket.ids.length > 0) slices.push(singleBucket);
+  if (noAgencyCount > 0) {
+    slices.push({
+      name: 'Без студии',
+      revenue: noAgencyRevenue,
+      count: noAgencyCount,
+      category: 'no_agency',
+    });
+  }
+
+  const result = buildDistributionResult(slices, totalRevenue, agencyIds.length);
+  cacheSet(ck, result);
+  return result;
+}
