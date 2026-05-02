@@ -260,16 +260,66 @@ export function tagItemsWithCity(items, city) {
 //   'no_phone'      — без телефона (рискованные для re-engage)
 //   'recent'        — последняя продажа за 30 дней
 //
+// ─── Tier / Activity helpers ─────────────────────────────────────────────────
+// Tier: Gold / Silver / Bronze — по total_purchases_amount из view v_partner_full.
+// Activity: HOT / WARM / COLD — по last_purchase_date.
+//
+// Thresholds (₸):
+//   Gold   >= 5 000 000
+//   Silver  1 000 000 — 4 999 999
+//   Bronze  > 0 (но < 1 000 000)
+//
+// Activity (дней с последней покупки):
+//   HOT   < 30
+//   WARM  30 — 90
+//   COLD  > 90
+//
+const TIER_GOLD_THRESHOLD   = 5_000_000;
+const TIER_SILVER_THRESHOLD = 1_000_000;
+
+function computeTier(totalRevenue) {
+  const rev = totalRevenue || 0;
+  if (rev >= TIER_GOLD_THRESHOLD)   return 'Gold';
+  if (rev >= TIER_SILVER_THRESHOLD) return 'Silver';
+  return 'Bronze';
+}
+
+function computeActivity(lastPurchaseDate) {
+  if (!lastPurchaseDate) return 'COLD';
+  const daysSince = Math.floor((Date.now() - new Date(lastPurchaseDate).getTime()) / 86_400_000);
+  if (daysSince < 30)  return 'HOT';
+  if (daysSince <= 90) return 'WARM';
+  return 'COLD';
+}
+
+// Парсим CSV tier / activity из query param.
+// Принимает строку '«Gold,Silver»' → ['Gold','Silver']. Unknown значения отфильтровываются.
+const VALID_TIERS      = new Set(['Gold', 'Silver', 'Bronze']);
+const VALID_ACTIVITIES = new Set(['HOT', 'WARM', 'COLD']);
+
+function parseCsvParam(raw, validSet) {
+  if (!raw) return [];
+  return String(raw).split(',').map(s => s.trim()).filter(s => validSet.has(s));
+}
+
 const listPartnersInput = z.object({
   filter: z.enum(['all', 'with_chat', 'top_revenue', 'no_phone', 'recent']).default('all'),
   q: z.string().max(200).optional().default(''),
   limit: z.number().int().min(1).max(500).default(100),
   offset: z.number().int().min(0).default(0),
   city: citySchema,
+  // Tier и activity — CSV, валидация в коде (parseCsvParam)
+  tier:     z.string().optional(),
+  activity: z.string().optional(),
 });
 
 export async function listPartners(req, params = {}) {
   const args = listPartnersInput.parse(params);
+
+  // Tier/activity фильтры — парсим заранее (для cache key + фильтрации)
+  const tierFilter     = parseCsvParam(args.tier,     VALID_TIERS);
+  const activityFilter = parseCsvParam(args.activity, VALID_ACTIVITIES);
+
   // Кэшируем по полному набору параметров — limit/offset включены, чтобы pagination работал
   const ck = cacheKey('list-partners', req, args);
   const cached = cacheGet(ck);
@@ -302,15 +352,45 @@ export async function listPartners(req, params = {}) {
     if (s) q = q.or(`canonical_name.ilike.%${s}%,primary_phone.ilike.%${s}%`);
   }
 
-  // Sort
+  // Sort — всегда по revenue desc, tier/activity — post-filter (в JS, не SQL)
   q = q.order('total_revenue', { ascending: false });
 
-  // Paginate
-  q = q.range(args.offset, args.offset + args.limit - 1);
+  // Если есть tier/activity фильтр — нужно загрузить больше строк для in-memory фильтрации,
+  // потому что PostgREST не знает про computed tier/activity.
+  // Стратегия: если фильтр задан → грузим весь набор (до 1000 = max page PostgREST), фильтруем, пагинируем в JS.
+  // Если фильтра нет → standard DB-side pagination (быстро для 100-200 партнёров).
+  const hasTierActivityFilter = tierFilter.length > 0 || activityFilter.length > 0;
+
+  if (!hasTierActivityFilter) {
+    q = q.range(args.offset, args.offset + args.limit - 1);
+  }
+  // Иначе — не добавляем .range(), грузим всё (у нас < 500 уникальных партнёров)
 
   const { data, error } = await q;
   if (error) throw new Error(`listPartners: ${error.message}`);
-  const result = { items: data || [], limit: args.limit, offset: args.offset };
+
+  // Enrich each partner with tier + activity computed fields
+  let enriched = (data || []).map(p => ({
+    ...p,
+    tier:     computeTier(p.total_revenue),
+    activity: computeActivity(p.last_purchase_date),
+  }));
+
+  // Post-query фильтрация по tier / activity
+  if (tierFilter.length > 0) {
+    enriched = enriched.filter(p => tierFilter.includes(p.tier));
+  }
+  if (activityFilter.length > 0) {
+    enriched = enriched.filter(p => activityFilter.includes(p.activity));
+  }
+
+  // JS-side pagination при наличии tier/activity фильтра
+  const totalFiltered = enriched.length;
+  if (hasTierActivityFilter) {
+    enriched = enriched.slice(args.offset, args.offset + args.limit);
+  }
+
+  const result = { items: enriched, limit: args.limit, offset: args.offset, total: totalFiltered };
   cacheSet(ck, result);
   return result;
 }
@@ -612,14 +692,19 @@ export async function updatePartnerAgency(req, contactId, payload) {
 //
 export async function listAgencies(req, opts = {}) {
   const city = opts.city || 'all';
-  const ck = cacheKey('list-agencies', req, { city });
+  // Tier/activity фильтры для агентств (аналог listPartners)
+  const tierFilter     = parseCsvParam(opts.tier,     VALID_TIERS);
+  const activityFilter = parseCsvParam(opts.activity, VALID_ACTIVITIES);
+
+  const ck = cacheKey('list-agencies', req, { city, tier: opts.tier, activity: opts.activity });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
   // Все agencies + sales-aggregates через 2 запроса
   // City-фильтр применяется к sales (агрегаты по выручке/заказам из нужного города)
-  let salesQ = sb.from('sales').select('agency_id, total_amount').not('agency_id', 'is', null);
+  // Добавляем sale_date для вычисления last_purchase_date → activity
+  let salesQ = sb.from('sales').select('agency_id, total_amount, sale_date').not('agency_id', 'is', null);
   salesQ = applyCity(salesQ, city);
   const [{ data: agencies }, { data: salesAgg }, { data: contactsAgg }] = await Promise.all([
     sb.from('agencies').select('id, canonical_name, city, notes'),
@@ -629,22 +714,45 @@ export async function listAgencies(req, opts = {}) {
 
   const byAgency = {};
   for (const s of salesAgg || []) {
-    if (!byAgency[s.agency_id]) byAgency[s.agency_id] = { orders: 0, revenue: 0 };
+    if (!byAgency[s.agency_id]) byAgency[s.agency_id] = { orders: 0, revenue: 0, last_purchase_date: null };
     byAgency[s.agency_id].orders++;
     byAgency[s.agency_id].revenue += s.total_amount || 0;
+    // Tracking last_purchase_date для activity
+    if (s.sale_date) {
+      if (!byAgency[s.agency_id].last_purchase_date || s.sale_date > byAgency[s.agency_id].last_purchase_date) {
+        byAgency[s.agency_id].last_purchase_date = s.sale_date;
+      }
+    }
   }
   const contactsByAgency = {};
   for (const c of contactsAgg || []) {
     contactsByAgency[c.agency_id] = (contactsByAgency[c.agency_id] || 0) + 1;
   }
 
-  const items = (agencies || []).map(a => ({
-    ...a,
-    orders: byAgency[a.id]?.orders || 0,
-    revenue: byAgency[a.id]?.revenue || 0,
-    contacts: contactsByAgency[a.id] || 0,
-  })).filter(a => a.orders > 0 || a.contacts > 0)
+  let items = (agencies || []).map(a => {
+    const agg = byAgency[a.id];
+    const revenue = agg?.revenue || 0;
+    const lastPurchaseDate = agg?.last_purchase_date || null;
+    return {
+      ...a,
+      orders:             agg?.orders || 0,
+      revenue,
+      contacts:           contactsByAgency[a.id] || 0,
+      last_purchase_date: lastPurchaseDate,
+      // Computed tier + activity
+      tier:               computeTier(revenue),
+      activity:           computeActivity(lastPurchaseDate),
+    };
+  }).filter(a => a.orders > 0 || a.contacts > 0)
     .sort((a, b) => b.revenue - a.revenue);
+
+  // Post-query фильтрация по tier / activity
+  if (tierFilter.length > 0) {
+    items = items.filter(a => tierFilter.includes(a.tier));
+  }
+  if (activityFilter.length > 0) {
+    items = items.filter(a => activityFilter.includes(a.activity));
+  }
 
   const result = { items };
   cacheSet(ck, result);
@@ -1796,37 +1904,69 @@ export async function getForecast(req, opts = {}) {
     return { error: 'Недостаточно данных для прогноза (нужно минимум 6 мес)' };
   }
 
-  // 2. Линейная регрессия last 12 (или все если меньше)
-  const last12 = months.slice(-12);
-  const xs = last12.map((_, i) => i);
-  const ys = last12.map(m => monthlyRev[m]);
-  const n = xs.length;
-  const sumX = xs.reduce((s, x) => s + x, 0);
-  const sumY = ys.reduce((s, y) => s + y, 0);
-  const sumXY = xs.reduce((s, x, i) => s + x * ys[i], 0);
-  const sumX2 = xs.reduce((s, x) => s + x * x, 0);
-  const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-  const intercept = (sumY - slope * sumX) / n;
-
-  // 3. Сезонный коэффициент (multiplier по месяцам года)
-  const seasonal = Array.from({ length: 12 }, () => ({ sum: 0, count: 0 }));
-  for (const m of months) {
-    const monthIdx = parseInt(m.slice(5, 7)) - 1; // 0..11
-    seasonal[monthIdx].sum += monthlyRev[m];
-    seasonal[monthIdx].count++;
-  }
-  const avgRev = sumY / n;
-  const seasonalMult = seasonal.map(s =>
-    s.count > 0 && avgRev > 0 ? (s.sum / s.count) / avgRev : 1
-  );
-
-  // 4. Forecast следующих 6 мес
-  const lastMonth = months[months.length - 1];
+  // Helper: addMonths
   function addMonths(ym, k) {
     const [y, mo] = ym.split('-').map(Number);
     const d = new Date(y, mo - 1 + k, 1);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
   }
+
+  // 2. Weighted Moving Average baseline
+  // Weights: last 3 months × 0.5, last 6 × 0.3, last 12 (or all) × 0.2
+  // Если данных < 6 мес — already guarded above. Если < 12 — используем то что есть.
+  const last3  = months.slice(-3);
+  const last6  = months.slice(-6);
+  const last12 = months.slice(-12);
+
+  const avg3  = last3.reduce((s, m) => s + monthlyRev[m], 0) / last3.length;
+  const avg6  = last6.reduce((s, m) => s + monthlyRev[m], 0) / last6.length;
+  const avg12 = last12.reduce((s, m) => s + monthlyRev[m], 0) / last12.length;
+
+  // При < 6 мес данных fallback на simple average; выше guard уже отсеял эти кейсы.
+  // При < 12 мес: avg12 = avg по всем имеющимся (last12 = все months если < 12).
+  const wmaBaseline = avg3 * 0.5 + avg6 * 0.3 + avg12 * 0.2;
+
+  // 3. Сезонный коэффициент + year-over-year growth
+  // seasonal[i] = среднее за этот месяц / общее среднее по году
+  const seasonal = Array.from({ length: 12 }, () => ({ sum: 0, count: 0 }));
+  // Группируем по году для YoY
+  const revenueByYear = {};
+  for (const m of months) {
+    const monthIdx = parseInt(m.slice(5, 7)) - 1; // 0..11
+    const year = m.slice(0, 4);
+    seasonal[monthIdx].sum += monthlyRev[m];
+    seasonal[monthIdx].count++;
+    revenueByYear[year] = (revenueByYear[year] || 0) + monthlyRev[m];
+  }
+
+  // avgRev для seasonalMult — используем WMA baseline (стабильнее чем simple mean)
+  const avgRev = wmaBaseline > 0 ? wmaBaseline : (avg12 || 1);
+  const seasonalMult = seasonal.map(s =>
+    s.count > 0 && avgRev > 0 ? (s.sum / s.count) / avgRev : 1
+  );
+
+  // YoY growth: сравниваем последний полный год с предыдущим
+  const years = Object.keys(revenueByYear).sort();
+  let yearOverYearGrowth = 0;
+  if (years.length >= 2) {
+    const prevYear = revenueByYear[years[years.length - 2]];
+    const lastYear = revenueByYear[years[years.length - 1]];
+    if (prevYear > 0) yearOverYearGrowth = (lastYear - prevYear) / prevYear;
+  }
+
+  // Для trend insights (аналог slope из WMA: recent vs older)
+  const recentAvgForInsight = avg3;
+  const olderAvg = last12.slice(0, 3).reduce((s, m) => s + monthlyRev[m], 0) / Math.min(3, last12.length);
+  // Приближение slope для insights (₸/мес тренд из WMA: recent vs older)
+  const slope = olderAvg > 0 ? (avg3 - olderAvg) / last12.length : 0;
+
+  // 4. Forecast следующих 6 мес — Weighted MA × seasonal × (1 + YoY×0.5)
+  // Защита от излишнего pessimism/overshoot:
+  //   min(forecast) = baseline × 0.7
+  //   max(forecast) = baseline × 2.0
+  const lastMonth = months[months.length - 1];
+  const forecastMin = wmaBaseline * 0.70;
+  const forecastMax = wmaBaseline * 2.00;
 
   const forecastTimeline = [];
   // historical (last 12)
@@ -1839,10 +1979,10 @@ export async function getForecast(req, opts = {}) {
   for (let k = 1; k <= 6; k++) {
     const fm = addMonths(lastMonth, k);
     const monthIdx = parseInt(fm.slice(5, 7)) - 1;
-    const linear = intercept + slope * (n + k - 1);
-    const adjusted = Math.max(0, linear * seasonalMult[monthIdx]);
+    const raw = wmaBaseline * seasonalMult[monthIdx] * (1 + yearOverYearGrowth * 0.5);
+    const clamped = Math.min(forecastMax, Math.max(forecastMin, raw));
     forecastTimeline.push({
-      month: fm, actual: null, forecast: Math.round(adjusted),
+      month: fm, actual: null, forecast: Math.round(clamped),
     });
   }
 
@@ -1898,22 +2038,31 @@ export async function getForecast(req, opts = {}) {
   }
 
   // 6. Авто-инсайты по тренду (без AI на бэке — простые правила)
+  // recentAvgForInsight и olderAvg уже вычислены в шаге 2 (WMA baseline).
   const insights = [];
-  const recentAvg = ys.slice(-3).reduce((s, y) => s + y, 0) / 3; // last 3 months
-  const olderAvg = ys.slice(0, 3).reduce((s, y) => s + y, 0) / 3; // first 3 months
 
-  if (slope > 0) {
-    const monthlyGrowthPct = avgRev > 0 ? Math.round(slope / avgRev * 100 * 10) / 10 : 0;
+  // YoY growth insight
+  if (yearOverYearGrowth > 0.05) {
+    const yoyPct = Math.round(yearOverYearGrowth * 100);
     insights.push({
       kind: 'positive',
-      title: `Тренд +${monthlyGrowthPct}% в месяц`,
-      text: `Линейная регрессия показывает рост ${Math.abs(slope).toLocaleString('ru-RU')} ₸/мес. На 6 мес вперёд ожидается ~${Math.round(forecastTimeline.filter(t => t.forecast).reduce((s, t) => s + t.forecast, 0) / 1_000_000)}M ₸ выручки.`,
+      title: `Рост год к году: +${yoyPct}%`,
+      text: `Последний год в сравнении с предыдущим вырос на ${yoyPct}%. На 6 мес вперёд ожидается ~${Math.round(forecastTimeline.filter(t => t.forecast).reduce((s, t) => s + t.forecast, 0) / 1_000_000)}M ₸ выручки.`,
     });
-  } else if (slope < 0) {
+  } else if (yearOverYearGrowth < -0.05) {
+    const yoyDropPct = Math.round(Math.abs(yearOverYearGrowth) * 100);
     insights.push({
       kind: 'warning',
-      title: `Тренд −${Math.round(Math.abs(slope) / avgRev * 100 * 10) / 10}% в месяц`,
-      text: `Выручка падает на ${Math.abs(slope).toLocaleString('ru-RU')} ₸/мес. Стоит разобрать: cold-партнёров, упавшие категории, изменение в каналах продаж.`,
+      title: `Снижение год к году: −${yoyDropPct}%`,
+      text: `Последний год показал снижение на ${yoyDropPct}% относительно предыдущего. Стоит разобрать: cold-партнёров, упавшие категории, изменение в каналах продаж.`,
+    });
+  } else if (recentAvgForInsight > olderAvg * 1.1) {
+    // Нет YoY данных или рост нейтральный, но последние 3 мес растут
+    const growthPct = Math.round((recentAvgForInsight / olderAvg - 1) * 100);
+    insights.push({
+      kind: 'positive',
+      title: `Ускорение: +${growthPct}% за квартал`,
+      text: `Последние 3 месяца в среднем на ${growthPct}% выше первых 3 в окне анализа. На 6 мес вперёд ожидается ~${Math.round(forecastTimeline.filter(t => t.forecast).reduce((s, t) => s + t.forecast, 0) / 1_000_000)}M ₸ выручки.`,
     });
   }
 
@@ -1952,9 +2101,9 @@ export async function getForecast(req, opts = {}) {
     });
   }
 
-  // Сравнение recent vs older
-  if (olderAvg > 0 && recentAvg > 0) {
-    const ratio = recentAvg / olderAvg;
+  // Сравнение recent vs older (дополнительный insight, если ещё не добавлен выше)
+  if (olderAvg > 0 && recentAvgForInsight > 0 && yearOverYearGrowth === 0) {
+    const ratio = recentAvgForInsight / olderAvg;
     if (ratio > 1.3) {
       insights.push({
         kind: 'positive',
@@ -1964,7 +2113,7 @@ export async function getForecast(req, opts = {}) {
     } else if (ratio < 0.8) {
       insights.push({
         kind: 'warning',
-        title: 'Торможение: −',
+        title: 'Торможение',
         text: `Последние 3 месяца на ${Math.round((1 - ratio) * 100)}% ниже первых 3. Проверь cold-партнёров и динамику менеджеров.`,
       });
     }
@@ -1973,13 +2122,17 @@ export async function getForecast(req, opts = {}) {
   const result = {
     timeline: forecastTimeline,
     next_6_months_revenue: forecastTimeline.filter(t => t.forecast !== null).reduce((s, t) => s + t.forecast, 0),
-    trend_slope: Math.round(slope), // ₸/мес тренд
+    trend_slope: Math.round(slope), // ₸/мес — приближение тренда (recent vs older WMA)
     seasonality: seasonalMult.map((m, i) => ({
       month_idx: i + 1,
       multiplier: Math.round(m * 100) / 100,
     })),
     cartridge_pipeline: cartridgePipeline,
     total_pipeline_units: cartridgePipeline.reduce((s, p) => s + p.expected_cartridges, 0),
+    // Debug fields — помогают понять почему прогноз такой
+    wma_baseline: Math.round(wmaBaseline),
+    yoy_growth_pct: Math.round(yearOverYearGrowth * 100),
+    forecast_bounds: { min: Math.round(forecastMin), max: Math.round(forecastMax) },
     insights,
   };
   cacheSet(ck, result);

@@ -1535,17 +1535,19 @@ export function setupRoutes(app) {
     return { ...parsed, city };
   }
 
-  // GET /sales-crm/partners?filter=&q=&limit=&offset=&city=Алматы|Астана|all
+  // GET /sales-crm/partners?filter=&q=&limit=&offset=&city=&tier=Gold,Silver&activity=HOT,WARM
   router.get('/sales-crm/partners', async (req, res) => {
     try {
       const cp = parseCityQuery(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
       const r = await salesCrm.listPartners(req, {
-        filter: req.query.filter,
-        q: req.query.q || '',
-        limit: req.query.limit ? Number(req.query.limit) : undefined,
-        offset: req.query.offset ? Number(req.query.offset) : undefined,
-        city: cp.city,
+        filter:   req.query.filter,
+        q:        req.query.q || '',
+        limit:    req.query.limit    ? Number(req.query.limit)  : undefined,
+        offset:   req.query.offset   ? Number(req.query.offset) : undefined,
+        city:     cp.city,
+        tier:     req.query.tier     || undefined,
+        activity: req.query.activity || undefined,
       });
       res.json(r);
     } catch (e) {
@@ -1602,12 +1604,16 @@ export function setupRoutes(app) {
     }
   });
 
-  // GET /sales-crm/agencies?city=Алматы|Астана|all  — list of all studios with aggregates
+  // GET /sales-crm/agencies?city=&tier=Gold,Silver&activity=HOT,WARM  — list of all studios with aggregates
   router.get('/sales-crm/agencies', async (req, res) => {
     try {
       const cp = parseCityQuery(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
-      const r = await salesCrm.listAgencies(req, { city: cp.city });
+      const r = await salesCrm.listAgencies(req, {
+        city:     cp.city,
+        tier:     req.query.tier     || undefined,
+        activity: req.query.activity || undefined,
+      });
       res.json(r);
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_list_agencies_failed');
