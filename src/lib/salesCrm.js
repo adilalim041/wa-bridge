@@ -78,6 +78,8 @@ async function loadAllParallel(sb, table, selectFields, filters = {}) {
   if (filters.isNull) for (const k of filters.isNull) cntQ = cntQ.is(k, null);
   if (filters.gte) for (const [k, v] of Object.entries(filters.gte)) cntQ = cntQ.gte(k, v);
   if (filters.lte) for (const [k, v] of Object.entries(filters.lte)) cntQ = cntQ.lte(k, v);
+  if (filters.like) for (const [k, v] of Object.entries(filters.like)) cntQ = cntQ.like(k, v);
+  if (filters.notLike) for (const [k, v] of Object.entries(filters.notLike)) cntQ = cntQ.not(k, 'like', v);
   const { count } = await cntQ;
   const total = count || 0;
   if (total === 0) return [];
@@ -92,6 +94,8 @@ async function loadAllParallel(sb, table, selectFields, filters = {}) {
     if (filters.isNull) for (const k of filters.isNull) q = q.is(k, null);
     if (filters.gte) for (const [k, v] of Object.entries(filters.gte)) q = q.gte(k, v);
     if (filters.lte) for (const [k, v] of Object.entries(filters.lte)) q = q.lte(k, v);
+    if (filters.like) for (const [k, v] of Object.entries(filters.like)) q = q.like(k, v);
+    if (filters.notLike) for (const [k, v] of Object.entries(filters.notLike)) q = q.not(k, 'like', v);
     promises.push(q);
   }
   const results = await Promise.all(promises);
@@ -125,16 +129,28 @@ function safeFilterValue(s) {
 export const CITY_ENUM = ['Алматы', 'Астана', 'all'];
 export const citySchema = z.enum(['Алматы', 'Астана', 'all']).default('all');
 
-/** Применяет .eq('city', city) к PostgREST query, если city != 'all'. */
+// IMPORTANT (2026-05-02): "city" в аналитике = SHOP city (Астана/Алматы),
+// а не delivery city (sales.city колонка может быть Шымкент/Атырау/др).
+// Фильтр по shop city определяется через source_file префикс:
+//   "Алматы — Январь 2024.xlsx"     → shop = Алматы
+//   "Январь 2024.xlsx" / любое другое → shop = Астана
+// Это исправляет 340 sales (Astana shop с доставкой в другой город),
+// которые раньше выпадали из city='Астана' filter и потеря revenue 9.4M ₸/мес.
+
+/** Применяет фильтр по SHOP city (Астана/Алматы) через source_file. */
 function applyCity(query, city) {
-  if (city && city !== 'all') return query.eq('city', city);
+  if (!city || city === 'all') return query;
+  if (city === 'Алматы') return query.like('source_file', 'Алматы%');
+  if (city === 'Астана') return query.not('source_file', 'like', 'Алматы%');
   return query;
 }
 
-/** Добавляет city в loadAllParallel-совместимый filters.eq объект. */
+/** Добавляет shop city в loadAllParallel filters (через source_file). */
 function addCityFilter(filters, city) {
   if (!city || city === 'all') return filters;
-  return { ...filters, eq: { ...(filters.eq || {}), city } };
+  if (city === 'Алматы') return { ...filters, like: { ...(filters.like || {}), source_file: 'Алматы%' } };
+  if (city === 'Астана') return { ...filters, notLike: { ...(filters.notLike || {}), source_file: 'Алматы%' } };
+  return filters;
 }
 
 // ── Multi-city query parsing ──────────────────────────────────────────────────
