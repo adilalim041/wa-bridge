@@ -1328,9 +1328,41 @@ export async function getProductInsights(req, opts = {}) {
     .slice(0, 50);
 
   // 2. Cross-sell pairs (SKU A + SKU B в одном заказе → counter)
+  //
+  // FIX 2026-05-02 (Adil feedback): исключаем «обвес» из cross-sell пар.
+  // Adil видел «NA-01 + Измельчитель» 240 раз — NA-01 это отводная арматура для измельчителя,
+  // очевидный обвес. Также картриджи и сменные модули — расходники, не интересные пары.
+  //
+  // CROSS_SELL_EXCLUDE_CATEGORIES: категории которые полностью исключаются из cross-sell.
+  // CROSS_SELL_EXCLUDE_SKU_PREFIXES: SKU-префиксы которые исключаются (NA-01 = отв. арматура).
+  // CROSS_SELL_EXCLUDE_NAME_PATTERNS: части raw_name которые сигнализируют о сменном элементе.
+  //
+  // ОСТАВЛЯЕМ только «основные» категории: sink, faucet, disposer, water_filter, dispenser.
+  //
+  const CROSS_SELL_EXCLUDE_CATEGORIES = new Set(['cartridge', 'accessory']);
+  const CROSS_SELL_EXCLUDE_SKU_PREFIXES = ['NA-01', 'NA01'];
+  const CROSS_SELL_EXCLUDE_NAME_PATTERNS = [
+    'сменн', 'замен', 'replacement', 'картридж', 'картриджи',
+    'модуль замены', 'v-complex', 'm-complex', 'pure drop замен',
+  ];
+  const CROSS_SELL_MAIN_CATEGORIES = new Set(['sink', 'faucet', 'disposer', 'water_filter', 'dispenser']);
+
+  function isCrossSellExcluded(it) {
+    if (!it.sku && !it.raw_name) return true; // no identity
+    if (CROSS_SELL_EXCLUDE_CATEGORIES.has(it.category)) return true;
+    const sku = (it.sku || '').toUpperCase();
+    if (CROSS_SELL_EXCLUDE_SKU_PREFIXES.some(p => sku.startsWith(p.toUpperCase()))) return true;
+    const name = (it.raw_name || '').toLowerCase();
+    if (CROSS_SELL_EXCLUDE_NAME_PATTERNS.some(p => name.includes(p))) return true;
+    // Если категория задана и не входит в основные — тоже exclude
+    if (it.category && !CROSS_SELL_MAIN_CATEGORIES.has(it.category)) return true;
+    return false;
+  }
+
   const itemsBySale = {};
   for (const it of items) {
     if (!it.sku) continue;
+    if (isCrossSellExcluded(it)) continue; // skip accessories/cartridges/replacements
     if (!itemsBySale[it.sale_id]) itemsBySale[it.sale_id] = new Set();
     itemsBySale[it.sale_id].add(it.sku);
   }
@@ -1351,7 +1383,7 @@ export async function getProductInsights(req, opts = {}) {
   for (const it of items) if (it.sku && !skuNames.has(it.sku)) skuNames.set(it.sku, it.raw_name || it.sku);
 
   const crossSell = Object.entries(pairCount)
-    .filter(([_, c]) => c >= 5)
+    .filter(([_, c]) => c >= 3) // FIX 2026-05-02: снизили порог с 5 до 3 — после exclusion пар стало меньше
     .sort((a, b) => b[1] - a[1])
     .slice(0, 30)
     .map(([key, count]) => {
@@ -1738,6 +1770,14 @@ export async function getForecast(req, opts = {}) {
 
   // 1. Sales по месяцам — для линейного прогноза.
   // Загружаем id тоже — нужен для city-фильтра картриджного pipeline (section 5).
+  //
+  // FIX 2026-05-02 (Adil feedback): исключаем текущий НЕПОЛНЫЙ месяц из training data.
+  // Например, 2 мая 2026: продаж мая ≈0 → регрессия думает «май = 0» → прогноз = 0.
+  // Решение: фильтруем данные WHERE sale_date < current month start.
+  // Прогноз НАЧИНАЕТСЯ с текущего месяца (future). Ретроспектива — только завершённые.
+  const currentMonth = new Date().toISOString().slice(0, 7); // 'YYYY-MM'
+  // Load all sales including current month data (for cartridge pipeline), then
+  // filter in JS — current month is excluded only from regression training data.
   const salesFilters = addCityFilter({}, city);
   const sales = await loadAllParallel(sb, 'sales',
     'id, sale_date, total_amount',
@@ -1747,6 +1787,8 @@ export async function getForecast(req, opts = {}) {
   for (const s of sales) {
     if (!s.sale_date) continue;
     const m = s.sale_date.slice(0, 7);
+    // Skip current month — it's incomplete, would skew regression to 0
+    if (m >= currentMonth) continue;
     monthlyRev[m] = (monthlyRev[m] || 0) + (s.total_amount || 0);
   }
   const months = Object.keys(monthlyRev).sort();
@@ -2346,12 +2388,24 @@ export async function getAutoInsights(req, opts = {}) {
 // (читать как покупка прошла). Базовая фильтрация — только sales где
 // у contact (customer or partner) есть linked_chat_jids.
 //
+// FIX 2026-05-02 (Adil feedback): убрали N+1 loop на messages/chat_ai.
+// Старый код делал отдельный запрос к messages + chat_ai для каждой sale —
+// при 50 sales = 100+ sequential DB roundtrips (~10-15 сек).
+// Новый: batch fetch всех JIDs страницы одним запросом, группируем в памяти.
+// Также убрали `.slice(0, 500)` на linkedIds — теперь батчим через loadAllParallel-style batches.
+// Добавлен 1h cache (данные меняются редко, достаточно свежести для воронки).
+//
 export async function getSalesWithChats(req, params = {}) {
   const sb = pickClient(req);
   const limit = Math.min(parseInt(params.limit) || 100, 500);
   const offset = Math.max(parseInt(params.offset) || 0, 0);
 
-  // Все contacts с jids
+  // Cache: 1h TTL (linked_chat_jids меняются только при новом WA-диалоге)
+  const ck = cacheKey('sales-with-chats', req, { limit, offset });
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  // 1. Все contacts с jids (loadAllParallel — нет row limit)
   const linked = await loadAllParallel(sb, 'partner_contacts',
     'id, canonical_name, primary_phone, linked_chat_jids',
     { notNull: ['linked_chat_jids'] }
@@ -2368,58 +2422,120 @@ export async function getSalesWithChats(req, params = {}) {
     return { items: [], total: 0 };
   }
 
-  // Sales где customer_id или partner_id ∈ linkedIds, sorted by date desc
-  // (через 2 запроса customer + partner с пагинацией)
-  const [byCust, byPart] = await Promise.all([
-    sb.from('sales')
-      .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
-      .in('customer_id', linkedIds.slice(0, 500))
-      .order('sale_date', { ascending: false })
-      .limit(limit + offset),
-    sb.from('sales')
-      .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
-      .in('partner_id', linkedIds.slice(0, 500))
-      .order('sale_date', { ascending: false })
-      .limit(limit + offset),
+  // 2. Sales где customer_id или partner_id ∈ linkedIds — батчами по 500 UUID
+  // (PostgREST IN() имеет практический лимит URL длины; 500 UUID ~= 18KB URL — safe)
+  const batchSize = 500;
+  const salesByIdMap = new Map();
+
+  async function fetchSalesForIds(col, ids) {
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batch = ids.slice(i, i + batchSize);
+      const { data } = await sb.from('sales')
+        .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
+        .in(col, batch)
+        .order('sale_date', { ascending: false })
+        .limit(limit + offset + 200); // slight over-fetch for merge dedup
+      for (const s of data || []) if (!salesByIdMap.has(s.id)) salesByIdMap.set(s.id, s);
+    }
+  }
+
+  await Promise.all([
+    fetchSalesForIds('customer_id', linkedIds),
+    fetchSalesForIds('partner_id', linkedIds),
   ]);
-  const merged = new Map();
-  for (const s of (byCust.data || [])) merged.set(s.id, s);
-  for (const s of (byPart.data || [])) if (!merged.has(s.id)) merged.set(s.id, s);
-  const sortedSales = [...merged.values()]
+
+  const sortedSales = [...salesByIdMap.values()]
     .sort((a, b) => (b.sale_date || '').localeCompare(a.sale_date || ''))
     .slice(offset, offset + limit);
 
-  // Для каждой sale — quickly fetch top-3 messages around sale_date
-  const result = [];
+  // 3. Collect all JIDs for the current page — single batch query for messages + chat_ai
+  //    instead of N+1 per-sale queries.
+  const allJids = new Set();
+  const saleJidsMap = new Map(); // sale_id → { jids, contact }
   for (const s of sortedSales) {
     const linkedContact = (s.customer_id && contactsMap.get(s.customer_id))
       || (s.partner_id && contactsMap.get(s.partner_id));
     const jids = linkedContact?.linked_chat_jids || [];
+    saleJidsMap.set(s.id, { jids, linkedContact });
+    for (const j of jids) allJids.add(j);
+  }
 
+  const jidsArr = [...allJids];
+
+  // Batch fetch messages + chat_ai for all JIDs on this page (2 queries total, not N*2)
+  let msgsByJid = {}; // jid → [msg, ...]
+  let aiByJid = {};   // jid → chat_ai record (most recent)
+
+  if (jidsArr.length > 0) {
+    // Split into batches of 100 JIDs (PostgREST IN safety)
+    const JID_BATCH = 100;
+    const msgBatches = [];
+    const aiBatches = [];
+    for (let i = 0; i < jidsArr.length; i += JID_BATCH) {
+      const jBatch = jidsArr.slice(i, i + JID_BATCH);
+      msgBatches.push(
+        sb.from('messages')
+          .select('id, remote_jid, body, from_me, timestamp, session_id')
+          .in('remote_jid', jBatch)
+          .order('timestamp', { ascending: false })
+          .limit(200) // top-200 messages across all JIDs in batch
+      );
+      aiBatches.push(
+        sb.from('chat_ai')
+          .select('id, remote_jid, intent, lead_temperature, deal_stage, summary_ru, manager_issues, risk_flags, analyzed_at')
+          .in('remote_jid', jBatch)
+          .order('analyzed_at', { ascending: false })
+          .limit(JID_BATCH) // latest one per JID is enough
+      );
+    }
+
+    const [msgResults, aiResults] = await Promise.all([
+      Promise.all(msgBatches),
+      Promise.all(aiBatches),
+    ]);
+
+    for (const { data } of msgResults) {
+      for (const m of data || []) {
+        if (!msgsByJid[m.remote_jid]) msgsByJid[m.remote_jid] = [];
+        msgsByJid[m.remote_jid].push(m);
+      }
+    }
+    for (const { data } of aiResults) {
+      for (const a of data || []) {
+        // keep only most recent per JID (already ordered by analyzed_at DESC)
+        if (!aiByJid[a.remote_jid]) aiByJid[a.remote_jid] = a;
+      }
+    }
+  }
+
+  // 4. Assemble result — pure in-memory join, no more DB calls per sale
+  const result = [];
+  for (const s of sortedSales) {
+    const { jids, linkedContact } = saleJidsMap.get(s.id) || { jids: [], linkedContact: null };
+
+    // Collect messages from all jids for this sale, filter to ±14/+7 day window
     let recentMessages = [];
     let chatAi = null;
+
     if (jids.length > 0 && s.sale_date) {
-      // ±14 дней окно вокруг sale_date
-      const fromDate = new Date(new Date(s.sale_date).getTime() - 14 * 24 * 3600 * 1000).toISOString();
-      const toDate = new Date(new Date(s.sale_date).getTime() + 7 * 24 * 3600 * 1000).toISOString();
-      const [msgs, ai] = await Promise.all([
-        sb.from('messages')
-          .select('id, body, from_me, timestamp, session_id')
-          .in('remote_jid', jids)
-          .gte('timestamp', fromDate)
-          .lte('timestamp', toDate)
-          .order('timestamp', { ascending: false })
-          .limit(20),
-        sb.from('chat_ai')
-          .select('id, intent, lead_temperature, deal_stage, summary_ru, manager_issues, risk_flags, analyzed_at')
-          .in('remote_jid', jids)
-          .gte('analyzed_at', fromDate)
-          .lte('analyzed_at', toDate)
-          .order('analyzed_at', { ascending: false })
-          .limit(1),
-      ]);
-      recentMessages = (msgs.data || []).reverse(); // chronological
-      chatAi = ai.data?.[0] || null;
+      const saleTs = new Date(s.sale_date).getTime();
+      const fromTs = saleTs - 14 * 24 * 3600 * 1000;
+      const toTs   = saleTs +  7 * 24 * 3600 * 1000;
+
+      for (const jid of jids) {
+        for (const m of (msgsByJid[jid] || [])) {
+          const mts = new Date(m.timestamp).getTime();
+          if (mts >= fromTs && mts <= toTs) recentMessages.push(m);
+        }
+        // Pick most recent chat_ai within window
+        const a = aiByJid[jid];
+        if (a && !chatAi) {
+          const ats = new Date(a.analyzed_at).getTime();
+          if (ats >= fromTs && ats <= toTs) chatAi = a;
+        }
+      }
+
+      recentMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     }
 
     result.push({
@@ -2446,7 +2562,12 @@ export async function getSalesWithChats(req, params = {}) {
     });
   }
 
-  return { items: result, total: merged.size };
+  const out = { items: result, total: salesByIdMap.size };
+  // Cache 1h — воронка не требует real-time свежести (24h стандартный TTL избыточен)
+  if (ck) {
+    _cache.set(ck, { data: out, expiresAt: Date.now() + 60 * 60 * 1000 });
+  }
+  return out;
 }
 
 // ── 7e. getLeadFunnel — lead→sale conversion (Group E) ──────────────────────
