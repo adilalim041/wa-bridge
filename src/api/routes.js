@@ -20,6 +20,7 @@ import { uploadReportPdf } from '../reports/uploadPdfToCloudinary.js';
 import { resolveSender } from '../reports/routing.js';
 import { isSentryEnabled } from '../observability/sentry.js';
 import { runCloudinaryCleanup, getCleanupConfig } from '../cleanup/cloudinaryCleanup.js';
+import { runMvRefresh } from '../cleanup/mvRefresh.js';
 import * as salesCrm from '../lib/salesCrm.js';
 import * as dailyRun from '../lib/dailyRun.js';
 import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
@@ -1969,6 +1970,23 @@ export function setupRoutes(app) {
       salesCrm.invalidateSalesCache();
       res.json({ ok: true });
     } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /admin/sales-crm/refresh-mvs — вручную запустить REFRESH MATERIALIZED VIEW CONCURRENTLY.
+  // Вызывает Postgres RPC refresh_sales_mvs() (из миграции 0018).
+  // Обычно не нужен (cron mvRefresh.js делает это каждый день в 04:30 Almaty).
+  // Используй после крупного импорта данных когда надо обновить MV сразу.
+  //
+  // SECURITY: admin-only (x-api-key). JWT-пользователи получают 403.
+  // Время выполнения ~1-3 сек (CONCURRENTLY не блокирует читателей).
+  router.post('/admin/sales-crm/refresh-mvs', adminOnly, async (req, res) => {
+    try {
+      const result = await runMvRefresh();
+      res.json(result);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'mv_refresh_endpoint_failed');
       res.status(500).json({ error: e.message });
     }
   });

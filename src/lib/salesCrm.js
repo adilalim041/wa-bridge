@@ -800,6 +800,42 @@ function pctDelta(curr, prev) {
   return Math.round(((curr - prev) / prev) * 1000) / 10;
 }
 
+// ── MV migration plan ───────────────────────────────────────────────────────
+//
+// Migration 0018 created mv_sales_monthly and mv_partner_aggregates.
+// These MVs are refreshed daily at 04:30 Almaty by mvRefresh.js cron.
+// The functions below (getSalesAnalytics, getMultiYearBreakdown,
+// getInsightsSummary, getAnomalies, getManagerPerformance) currently load
+// full tables and aggregate in JS. This is intentional for now — the MVs
+// were added as an infrastructure foundation without touching existing logic.
+//
+// FUTURE MIGRATION (separate feature, do NOT do it here):
+//
+// 1. getSalesAnalytics timeline section:
+//    REPLACE:
+//      loadAllParallel(sb, 'sales', ...) + JS bucketing
+//    WITH:
+//      sb.from('mv_sales_monthly')
+//        .select('month, shop_city, channel, orders_count, total_revenue, avg_check')
+//        .gte('month', args.date_from || '2000-01-01')
+//        .lte('month', args.date_to || '2099-12-31')
+//        (+ applyCity equivalent on shop_city column)
+//    Benefit: ~10x less data transferred, pure SQL aggregation.
+//
+// 2. getMultiYearBreakdown (_computeMultiYearBreakdown inner):
+//    Same pattern — query mv_sales_monthly GROUP BY year/month instead of
+//    loading all sales and pivoting in JS.
+//
+// 3. listPartners top_revenue sort + tier computation:
+//    REPLACE: v_partner_full (view with live JOIN)
+//    WITH: mv_partner_aggregates (pre-aggregated, indexed by total_revenue DESC)
+//    Benefit: avoids live JOIN across 4500 partner_contacts × 4300 sales on every request.
+//
+// Each migration is ~30-60 min of work. The key pre-condition is that
+// mv_sales_monthly UNIQUE index uses COALESCE on nullable columns — queries
+// must match that exact grouping or results will differ.
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getSalesAnalytics(req, params = {}) {
   const args = analyticsInput.parse(params);
 
