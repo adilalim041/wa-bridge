@@ -22,6 +22,7 @@ import { isSentryEnabled } from '../observability/sentry.js';
 import { runCloudinaryCleanup, getCleanupConfig } from '../cleanup/cloudinaryCleanup.js';
 import * as salesCrm from '../lib/salesCrm.js';
 import * as dailyRun from '../lib/dailyRun.js';
+import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -1273,6 +1274,84 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error, id }, 'feedback unexpected error');
       return res.status(500).json({ error: 'Save failed' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // GET /ai/issues?category=slow|no_followup|critical|football|lost&page=N&limit=20
+  //
+  // Paginated list of problem conversations for the Analytics carousel.
+  // 5 categories (spec: backlog.md 2026-04-29):
+  //   slow        — manager_issues contains 'slow_first_response'
+  //   no_followup — manager_issues contains 'no_followup'
+  //   critical    — sentiment=aggressive OR intent=complaint OR risk_flags non-empty
+  //   football    — same remote_jid handled by ≥2 different sessions in 7 days
+  //   lost        — previously dismissed as 'lost' (page 5 of carousel)
+  //
+  // All categories except 'lost' exclude already-dismissed rows.
+  // Cache: 1h per (userId, category, page, limit). Invalidated on dismiss.
+  // Auth: req.userClient (RLS-aware).
+  // ---------------------------------------------------------------------------
+  router.get('/ai/issues', async (req, res) => {
+    const { category } = req.query;
+    const page = Math.max(0, parseInt(req.query.page, 10) || 0);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 20), 50);
+
+    const VALID = new Set(['slow', 'no_followup', 'critical', 'football', 'lost']);
+    if (!category || !VALID.has(category)) {
+      return res.status(400).json({
+        error: `category is required and must be one of: ${[...VALID].join(', ')}`,
+      });
+    }
+
+    try {
+      const db = req.userClient ?? supabase;
+      const userId = req.user?.userId || req.user?.id || null;
+
+      const result = await getIssues({ category, page, limit, db, userId });
+      return res.json(result);
+    } catch (err) {
+      if (err.statusCode === 400) return res.status(400).json({ error: err.message });
+      logger.error({ err, category, page, limit }, 'GET /ai/issues failed');
+      return res.status(500).json({ error: 'Failed to fetch issues' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // POST /ai/issues/:dialog_session_id/dismiss
+  //
+  // Dismiss a problem conversation from the carousel. Server determines won/lost
+  // from the current deal_stage in chat_ai at dismiss time:
+  //   IN (completed, delivery, payment, closed_won, post_sale) → won
+  //   otherwise → lost (falls into category 'lost' on page 5)
+  //
+  // Idempotent: second call returns { ok: true, alreadyDismissed: true }.
+  // Auth: req.userClient — RLS-scoped, cross-tenant write blocked.
+  // ---------------------------------------------------------------------------
+  router.post('/ai/issues/:dialog_session_id/dismiss', async (req, res) => {
+    const { dialog_session_id } = req.params;
+
+    if (!dialog_session_id || typeof dialog_session_id !== 'string') {
+      return res.status(400).json({ error: 'dialog_session_id is required' });
+    }
+
+    // Coerce to integer string — dialog_session_id is a bigserial
+    const dsId = dialog_session_id.replace(/\D/g, '');
+    if (!dsId) {
+      return res.status(400).json({ error: 'dialog_session_id must be numeric' });
+    }
+
+    try {
+      const db = req.userClient ?? supabase;
+      const userId = req.user?.userId || req.user?.id || null;
+
+      const result = await dismissIssue(dsId, db, userId);
+      return res.json(result);
+    } catch (err) {
+      if (err.statusCode === 400) return res.status(400).json({ error: err.message });
+      if (err.statusCode === 404) return res.status(404).json({ error: err.message });
+      logger.error({ err, dialog_session_id }, 'POST /ai/issues/:dsid/dismiss failed');
+      return res.status(500).json({ error: 'Dismiss failed' });
     }
   });
 
