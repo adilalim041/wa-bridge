@@ -2156,6 +2156,54 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/insights-summary?date_from=&date_to=&cities=&channel=
+  // Statistical AI Summary card — 8 insights без LLM.
+  // При mode='multi': возвращает byCity breakdown.
+  router.get('/sales-crm/insights-summary', async (req, res) => {
+    try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      const channelRaw = req.query.channel;
+      const channelParsed = z.enum(['all', 'b2b', 'b2c']).default('all').safeParse(channelRaw);
+      if (!channelParsed.success) {
+        return res.status(400).json({ error: 'channel must be one of: all, b2b, b2c' });
+      }
+      const channel = channelParsed.data;
+
+      const dateFromRaw = req.query.date_from;
+      const dateToRaw   = req.query.date_to;
+      const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+      if (dateFromRaw && !DATE_RE.test(dateFromRaw)) {
+        return res.status(400).json({ error: 'date_from must be YYYY-MM-DD' });
+      }
+      if (dateToRaw && !DATE_RE.test(dateToRaw)) {
+        return res.status(400).json({ error: 'date_to must be YYYY-MM-DD' });
+      }
+
+      const opts = {
+        city:      cp.city,
+        channel,
+        date_from: dateFromRaw || undefined,
+        date_to:   dateToRaw   || undefined,
+      };
+
+      if (cp.mode === 'multi') {
+        const { byCity } = await salesCrm.withCityBreakdown(
+          cp.cities,
+          (c) => salesCrm.getInsightsSummary(req, { ...opts, city: c })
+        );
+        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+      }
+
+      const r = await salesCrm.getInsightsSummary(req, opts);
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_insights_summary_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/search?q=...   — quick lookup by name/phone
   router.get('/sales-crm/search', async (req, res) => {
     try {

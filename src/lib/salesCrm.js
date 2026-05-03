@@ -3625,3 +3625,381 @@ export async function getAgenciesDistribution(req, opts = {}) {
   cacheSet(ck, result);
   return result;
 }
+
+// ── 10. getInsightsSummary — statistical AI Summary card (8+ insights) ────────
+//
+// Возвращает список insights для карточки "AI Summary" в верхней части страницы
+// Аналитика. Чисто статистическая агрегация — без LLM.
+//
+// Insights (8 шт.):
+//   1. best_month     — месяц с max revenue, diff = % от среднего
+//   2. worst_month    — месяц с min revenue (без текущего неполного)
+//   3. top_category   — top sale_items.category по revenue, diff = % от total
+//   4. champions      — top-3 agencies по revenue
+//   5. cold_partners  — count partner_contacts где last_purchase > 90 дней
+//   6. rising_partners— count партнёров чей revenue этого периода > 1.5x предыдущего
+//   7. biggest_deal   — sale с max total_amount
+//   8. b2b_share      — % B2B выручки (partner_id != null) от total
+//
+// Query params: date_from, date_to, city ('all'|'Алматы'|'Астана'), channel ('all'|'b2b'|'b2c')
+//
+const insightsSummaryInput = z.object({
+  date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  channel:   z.enum(['all', 'b2b', 'b2c']).default('all'),
+  city:      citySchema,
+});
+
+// Форматируем число как M ₸ / K ₸
+function formatRevenue(v) {
+  if (!v) return '0 ₸';
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M ₸`;
+  if (v >= 1_000)    return `${Math.round(v / 1_000)}K ₸`;
+  return `${Math.round(v)} ₸`;
+}
+
+// Русские названия месяцев (полные)
+const RU_MONTHS_FULL = ['Январь','Февраль','Март','Апрель','Май','Июнь',
+                        'Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+function formatYM(ym) {
+  if (!ym) return ym;
+  const [y, m] = ym.split('-').map(Number);
+  return `${RU_MONTHS_FULL[(m - 1) % 12]} ${y}`;
+}
+
+export async function getInsightsSummary(req, opts = {}) {
+  const args = insightsSummaryInput.parse(opts);
+  const ck = cacheKey('insights-summary', req, args);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  const sb = pickClient(req);
+  const today = new Date();
+  const currentMonth = today.toISOString().slice(0, 7); // YYYY-MM
+
+  // ── Загружаем sales (city + date + channel фильтры) ──────────────────────
+  let filters = {};
+  if (args.date_from) filters.gte = { sale_date: args.date_from };
+  if (args.date_to)   filters.lte = { sale_date: args.date_to };
+  if (args.channel === 'b2b') filters.notNull = ['partner_id'];
+  if (args.channel === 'b2c') filters.isNull  = ['partner_id'];
+  filters = addCityFilter(filters, args.city);
+
+  const sales = await loadAllParallel(sb, 'sales',
+    'id, sale_date, total_amount, partner_id, customer_id, agency_id, order_num, source_file',
+    filters
+  );
+
+  if (sales.length === 0) {
+    const empty = { insights: [], generated_at: new Date().toISOString(), period: null };
+    cacheSet(ck, empty);
+    return empty;
+  }
+
+  // ── 1+2. Best/worst month ─────────────────────────────────────────────────
+  const monthlyRev = {};
+  let totalRevenue = 0;
+  let b2bRevenue = 0;
+  let b2bOrders = 0;
+
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const m = s.sale_date.slice(0, 7);
+    if (!monthlyRev[m]) monthlyRev[m] = 0;
+    monthlyRev[m] += s.total_amount || 0;
+    totalRevenue  += s.total_amount || 0;
+    if (s.partner_id) {
+      b2bRevenue += s.total_amount || 0;
+      b2bOrders++;
+    }
+  }
+
+  // Исключаем текущий неполный месяц из worst/best (он всегда будет занижен)
+  const completeMonths = Object.entries(monthlyRev)
+    .filter(([m]) => m < currentMonth)
+    .map(([month, revenue]) => ({ month, revenue }))
+    .sort((a, b) => a.month.localeCompare(b.month));
+
+  const avgMonthRev = completeMonths.length > 0
+    ? completeMonths.reduce((s, m) => s + m.revenue, 0) / completeMonths.length
+    : 0;
+
+  const bestMonth  = completeMonths.reduce((best, m) => !best || m.revenue > best.revenue ? m : best, null);
+  const worstMonth = completeMonths.reduce((worst, m) => !worst || m.revenue < worst.revenue ? m : worst, null);
+
+  // ── 3. Top category (sale_items) ─────────────────────────────────────────
+  // city-aware: берём items только для продаж из нашего sales-набора
+  let catItems;
+  if (args.city !== 'all' || args.date_from || args.date_to || args.channel !== 'all') {
+    const saleIds = sales.map(s => s.id).filter(Boolean);
+    if (saleIds.length === 0) {
+      catItems = [];
+    } else {
+      const batches = [];
+      for (let i = 0; i < saleIds.length; i += 500) batches.push(saleIds.slice(i, i + 500));
+      const batchResults = await Promise.all(
+        batches.map(batch => sb.from('sale_items').select('category, amount').in('sale_id', batch))
+      );
+      catItems = batchResults.flatMap(r => r.data || []);
+    }
+  } else {
+    catItems = await loadAllParallel(sb, 'sale_items', 'category, amount');
+  }
+
+  const catAgg = {};
+  let totalItemRevenue = 0;
+  for (const it of catItems) {
+    const c = it.category || 'other';
+    catAgg[c] = (catAgg[c] || 0) + (it.amount || 0);
+    totalItemRevenue += it.amount || 0;
+  }
+  const topCat = Object.entries(catAgg).sort((a, b) => b[1] - a[1])[0] || null;
+
+  // ── 4. Champions — top-3 agencies ────────────────────────────────────────
+  const agencyRev = {};
+  for (const s of sales) {
+    if (!s.agency_id) continue;
+    agencyRev[s.agency_id] = (agencyRev[s.agency_id] || 0) + (s.total_amount || 0);
+  }
+  const top3AgencyIds = Object.entries(agencyRev)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([id]) => id);
+
+  let championsNames = [];
+  let championsRevenue = 0;
+  if (top3AgencyIds.length > 0) {
+    const { data: agencyRows } = await sb.from('agencies')
+      .select('id, canonical_name')
+      .in('id', top3AgencyIds);
+    const aMap = new Map((agencyRows || []).map(a => [a.id, a.canonical_name]));
+    // Сохраняем порядок (по revenue)
+    championsNames = top3AgencyIds.map(id => aMap.get(id) || '?');
+    championsRevenue = top3AgencyIds.reduce((s, id) => s + (agencyRev[id] || 0), 0);
+  }
+
+  // ── 5. Cold partners — partner_contacts где last_purchase > 90 дней ───────
+  // Используем данные из sales-набора: partner_id → last sale_date
+  const partnerLastSale = {};
+  const partnerTotalRev = {};
+  for (const s of sales) {
+    if (!s.partner_id || !s.sale_date) continue;
+    if (!partnerLastSale[s.partner_id] || s.sale_date > partnerLastSale[s.partner_id]) {
+      partnerLastSale[s.partner_id] = s.sale_date;
+    }
+    partnerTotalRev[s.partner_id] = (partnerTotalRev[s.partner_id] || 0) + (s.total_amount || 0);
+  }
+  const cutoff90 = new Date(today.getTime() - 90 * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10);
+  // Считаем только тех кто принёс хоть что-то (фильтруем мусорные записи)
+  const coldPartnerIds = Object.keys(partnerLastSale).filter(id =>
+    partnerLastSale[id] < cutoff90 && (partnerTotalRev[id] || 0) > 0
+  );
+  const coldCount = coldPartnerIds.length;
+
+  // ── 6. Rising partners — revenue этого периода > 1.5x предыдущего ────────
+  // «Этот период» = date_from..date_to (или по умолчанию всё время).
+  // Для сравнения берём предыдущий период той же длины.
+  let risingCount = 0;
+  if (args.date_from && args.date_to) {
+    const msFrom = new Date(args.date_from).getTime();
+    const msTo   = new Date(args.date_to).getTime();
+    const periodMs = msTo - msFrom;
+    const prevFrom = new Date(msFrom - periodMs).toISOString().slice(0, 10);
+    const prevTo   = args.date_from; // exclusive
+
+    // Загружаем prev period с теми же city/channel фильтрами
+    let prevFilters = { gte: { sale_date: prevFrom }, lte: { sale_date: prevTo } };
+    if (args.channel === 'b2b') prevFilters.notNull = ['partner_id'];
+    if (args.channel === 'b2c') prevFilters.isNull  = ['partner_id'];
+    prevFilters = addCityFilter(prevFilters, args.city);
+
+    const prevSales = await loadAllParallel(sb, 'sales',
+      'partner_id, customer_id, total_amount',
+      prevFilters
+    );
+
+    // Агрегируем по contact_id для current и prev
+    const currRev = {};
+    const prevRev = {};
+    for (const s of sales) {
+      const id = s.partner_id || s.customer_id;
+      if (!id) continue;
+      currRev[id] = (currRev[id] || 0) + (s.total_amount || 0);
+    }
+    for (const s of prevSales) {
+      const id = s.partner_id || s.customer_id;
+      if (!id) continue;
+      prevRev[id] = (prevRev[id] || 0) + (s.total_amount || 0);
+    }
+    // Растущий: curr > 0 AND prev > 0 AND curr >= 1.5 * prev
+    risingCount = Object.keys(currRev).filter(id =>
+      (prevRev[id] || 0) > 0 && currRev[id] >= 1.5 * prevRev[id]
+    ).length;
+  } else {
+    // Без явного периода: сравниваем последние 3 мес vs предыдущие 3 мес (скользящее окно)
+    const now = today.toISOString().slice(0, 10);
+    const m3ago = new Date(today.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const m6ago = new Date(today.getTime() - 180 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const currRev = {}, prevRev = {};
+    for (const s of sales) {
+      if (!s.sale_date) continue;
+      const id = s.partner_id || s.customer_id;
+      if (!id) continue;
+      if (s.sale_date >= m3ago && s.sale_date <= now) {
+        currRev[id] = (currRev[id] || 0) + (s.total_amount || 0);
+      } else if (s.sale_date >= m6ago && s.sale_date < m3ago) {
+        prevRev[id] = (prevRev[id] || 0) + (s.total_amount || 0);
+      }
+    }
+    risingCount = Object.keys(currRev).filter(id =>
+      (prevRev[id] || 0) > 0 && currRev[id] >= 1.5 * prevRev[id]
+    ).length;
+  }
+
+  // ── 7. Biggest deal ───────────────────────────────────────────────────────
+  let biggestDeal = null;
+  for (const s of sales) {
+    if (!biggestDeal || (s.total_amount || 0) > (biggestDeal.total_amount || 0)) {
+      biggestDeal = s;
+    }
+  }
+  let biggestDealLabel = null;
+  if (biggestDeal) {
+    // city определяем через source_file (как везде)
+    const shopCity = biggestDeal.source_file && biggestDeal.source_file.startsWith('Алматы')
+      ? 'Алматы' : 'Астана';
+    biggestDealLabel = `${shopCity} #${biggestDeal.order_num || '?'}`;
+  }
+
+  // ── 8. B2B share ─────────────────────────────────────────────────────────
+  const b2bPct = totalRevenue > 0 ? Math.round((b2bRevenue / totalRevenue) * 100) : 0;
+
+  // ── Период покрытия (для поля period в ответе) ────────────────────────────
+  const sortedMonths = Object.keys(monthlyRev).sort();
+  const periodStr = sortedMonths.length > 0
+    ? `${sortedMonths[0]}..${sortedMonths[sortedMonths.length - 1]}`
+    : null;
+
+  // ── Собираем insights[] ──────────────────────────────────────────────────
+  const insights = [];
+
+  // 1. best_month
+  if (bestMonth) {
+    const diffPct = avgMonthRev > 0
+      ? Math.round(((bestMonth.revenue - avgMonthRev) / avgMonthRev) * 100)
+      : 0;
+    insights.push({
+      icon: '🏆',
+      type: 'best_month',
+      title: 'Лучший месяц',
+      value: formatYM(bestMonth.month),
+      metric: formatRevenue(bestMonth.revenue),
+      diff: diffPct > 0 ? `+${diffPct}% от среднего` : `${diffPct}% от среднего`,
+    });
+  }
+
+  // 2. worst_month
+  if (worstMonth && worstMonth.month !== bestMonth?.month) {
+    const diffPct = avgMonthRev > 0
+      ? Math.round(((worstMonth.revenue - avgMonthRev) / avgMonthRev) * 100)
+      : 0;
+    insights.push({
+      icon: '📉',
+      type: 'worst_month',
+      title: 'Худший месяц',
+      value: formatYM(worstMonth.month),
+      metric: formatRevenue(worstMonth.revenue),
+      diff: diffPct > 0 ? `+${diffPct}% от среднего` : `${diffPct}% от среднего`,
+    });
+  }
+
+  // 3. top_category
+  if (topCat) {
+    const [catName, catRev] = topCat;
+    const catPct = totalItemRevenue > 0 ? Math.round((catRev / totalItemRevenue) * 100) : 0;
+    // Человекочитаемые названия категорий
+    const CAT_NAMES = {
+      sink: 'Мойки', faucet: 'Смесители', disposer: 'Измельчители',
+      water_filter: 'Фильтры', dispenser: 'Диспенсеры',
+      cartridge: 'Картриджи', accessory: 'Аксессуары', other: 'Прочее',
+    };
+    insights.push({
+      icon: '🥇',
+      type: 'top_category',
+      title: 'Топ категория',
+      value: CAT_NAMES[catName] || catName,
+      metric: formatRevenue(catRev),
+      diff: `${catPct}% выручки`,
+    });
+  }
+
+  // 4. champions
+  if (championsNames.length > 0) {
+    const champPct = totalRevenue > 0 ? Math.round((championsRevenue / totalRevenue) * 100) : 0;
+    insights.push({
+      icon: '👑',
+      type: 'champions',
+      title: `${championsNames.length} студии-чемпиона`,
+      value: championsNames.join(', '),
+      metric: formatRevenue(championsRevenue),
+      diff: `${champPct}% от общей`,
+    });
+  }
+
+  // 5. cold_partners
+  insights.push({
+    icon: '🥶',
+    type: 'cold_partners',
+    title: 'Cold партнёры',
+    value: `${coldCount} партнёр${coldCount === 1 ? '' : coldCount >= 2 && coldCount <= 4 ? 'а' : 'ов'}`,
+    metric: 'не покупали >90 дней',
+    diff: coldCount > 0 ? 'стоит позвонить' : 'всё в норме',
+  });
+
+  // 6. rising_partners
+  if (risingCount > 0) {
+    insights.push({
+      icon: '🔥',
+      type: 'rising_partners',
+      title: 'Растущие партнёры',
+      value: `${risingCount} партнёр${risingCount === 1 ? '' : risingCount >= 2 && risingCount <= 4 ? 'а' : 'ов'}`,
+      metric: '+50% выручки vs прошлого периода',
+      diff: '',
+    });
+  }
+
+  // 7. biggest_deal
+  if (biggestDeal && biggestDealLabel) {
+    const dealDate = biggestDeal.sale_date
+      ? new Date(biggestDeal.sale_date).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })
+      : '?';
+    insights.push({
+      icon: '💰',
+      type: 'biggest_deal',
+      title: 'Самый большой заказ',
+      value: biggestDealLabel,
+      metric: formatRevenue(biggestDeal.total_amount),
+      diff: dealDate,
+    });
+  }
+
+  // 8. b2b_share
+  insights.push({
+    icon: '📊',
+    type: 'b2b_share',
+    title: 'B2B доля',
+    value: `${b2bPct}%`,
+    metric: `${formatRevenue(b2bRevenue)} из ${formatRevenue(totalRevenue)}`,
+    diff: `${b2bOrders} заказов`,
+  });
+
+  const result = {
+    insights,
+    generated_at: new Date().toISOString(),
+    period: periodStr,
+  };
+  cacheSet(ck, result);
+  return result;
+}
