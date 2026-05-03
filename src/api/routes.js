@@ -1635,6 +1635,25 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/partners/:id/similar?limit=5 — top-N похожих партнёров
+  // Similarity: Jaccard(categories) + tier/agency/activity бонусы. Cache 24h.
+  // ВАЖНО: зарегистрирован ДО /sales-crm/partners/:id (literal sub-path)
+  router.get('/sales-crm/partners/:id/similar', async (req, res) => {
+    try {
+      const limit = req.query.limit !== undefined
+        ? Number(req.query.limit)
+        : 5;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 20) {
+        return res.status(400).json({ error: 'limit must be integer 1-20' });
+      }
+      const r = await salesCrm.getSimilarPartners(req, req.params.id, { limit });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_similar_partners_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners/:id  — full card
   router.get('/sales-crm/partners/:id', async (req, res) => {
     try {

@@ -4154,3 +4154,212 @@ export async function bulkMergePartners(req, payload) {
   if (merged > 0) invalidateSalesCache();
   return { merged, failed };
 }
+
+// ── getSimilarPartners — top-N похожих партнёров по tier + категориям ──────
+//
+// Алгоритм:
+//   1. Загружаем sales базового партнёра (partner_id = contactId) → distinct categories
+//      через двухэтапный join (sales → sale_items).
+//   2. Загружаем всех партнёров из v_partner_full с orders_count > 0.
+//   3. Для каждого кандидата (≠ base) вычисляем similarity_score:
+//        jaccard = |catBase ∩ catCand| / |catBase ∪ catCand|
+//        +0.10 если same tier
+//        +0.05 если same agency_id (оба не null)
+//        +0.05 если same activity
+//   4. Сортировка по score DESC, top-N.
+//
+// Cache 24h (стандартный CACHE_TTL_MS). RLS-aware через pickClient(req).
+//
+const similarPartnersInput = z.object({
+  limit: z.coerce.number().int().min(1).max(20).default(5),
+});
+
+export async function getSimilarPartners(req, contactId, opts = {}) {
+  if (!isUuid(contactId)) throw new Error('invalid contact id');
+  const args = similarPartnersInput.parse(opts);
+
+  const ck = cacheKey('similar-partners', req, { contactId, limit: args.limit });
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  const sb = pickClient(req);
+
+  // ── Step 1: категории базового партнёра (двухэтапный join) ────────────────
+  // Шаг 1a: все sale_id где partner_id = contactId
+  const { data: baseSales, error: bse } = await sb
+    .from('sales')
+    .select('id')
+    .eq('partner_id', contactId);
+  if (bse) throw new Error(`getSimilarPartners baseSales: ${bse.message}`);
+
+  let baseCategorySet = new Set();
+
+  if (baseSales && baseSales.length > 0) {
+    const saleIds = baseSales.map(s => s.id);
+
+    // Шаг 1b: батчами по 500 (PostgREST URL limit для .in())
+    const BATCH = 500;
+    const batches = [];
+    for (let i = 0; i < saleIds.length; i += BATCH) {
+      batches.push(saleIds.slice(i, i + BATCH));
+    }
+    const itemResults = await Promise.all(
+      batches.map(ids =>
+        sb.from('sale_items').select('category').in('sale_id', ids)
+      )
+    );
+    for (const { data: items } of itemResults) {
+      for (const it of items || []) {
+        if (it.category) baseCategorySet.add(it.category);
+      }
+    }
+  }
+
+  const baseCats = [...baseCategorySet];
+
+  // ── Step 2: базовая карточка партнёра (tier, activity, agency_id) ─────────
+  const { data: baseCard, error: bce } = await sb
+    .from('v_partner_full')
+    .select('id, total_revenue, last_purchase_date, agency_id, total_purchases_amount, total_purchases_count, orders_count')
+    .eq('id', contactId)
+    .maybeSingle();
+  if (bce) throw new Error(`getSimilarPartners baseCard: ${bce.message}`);
+  if (!baseCard) return { similar: [], base_partner_categories: baseCats };
+
+  const baseTier     = computeTier(baseCard.total_revenue);
+  const baseActivity = computeActivity(baseCard.last_purchase_date);
+  const baseAgency   = baseCard.agency_id || null;
+
+  // ── Step 3: все партнёры с заказами ───────────────────────────────────────
+  // У Omoikiri < 500 уникальных партнёров — safe для in-memory.
+  const { data: allPartners, error: ape } = await sb
+    .from('v_partner_full')
+    .select('id, canonical_name, total_revenue, last_purchase_date, agency_id, total_purchases_amount, total_purchases_count, orders_count')
+    .gt('orders_count', 0)
+    .neq('id', contactId);
+  if (ape) throw new Error(`getSimilarPartners allPartners: ${ape.message}`);
+
+  const candidates = allPartners || [];
+
+  // Batch-загрузка categories для всех кандидатов ───────────────────────────
+  // Шаг 3a: все их sale_id
+  const candidateIds = candidates.map(p => p.id);
+
+  // Загружаем sale_id → partner_id для всех кандидатов батчами
+  const BATCH = 500;
+  const salesBatches = [];
+  for (let i = 0; i < candidateIds.length; i += BATCH) {
+    salesBatches.push(candidateIds.slice(i, i + BATCH));
+  }
+  const salesResults = await Promise.all(
+    salesBatches.map(ids =>
+      sb.from('sales').select('id, partner_id').in('partner_id', ids)
+    )
+  );
+
+  // Map: partner_id → Set<sale_id>
+  const partnerSaleIds = new Map(); // partner_id → sale_id[]
+  for (const { data: rows } of salesResults) {
+    for (const row of rows || []) {
+      if (!partnerSaleIds.has(row.partner_id)) partnerSaleIds.set(row.partner_id, []);
+      partnerSaleIds.get(row.partner_id).push(row.id);
+    }
+  }
+
+  // Шаг 3b: загружаем категории для всех sale_ids кандидатов
+  const allCandSaleIds = [...partnerSaleIds.values()].flat();
+
+  // Map: sale_id → category[]
+  const saleCategories = new Map();
+  if (allCandSaleIds.length > 0) {
+    const itemBatches = [];
+    for (let i = 0; i < allCandSaleIds.length; i += BATCH) {
+      itemBatches.push(allCandSaleIds.slice(i, i + BATCH));
+    }
+    const itemResults2 = await Promise.all(
+      itemBatches.map(ids =>
+        sb.from('sale_items').select('sale_id, category').in('sale_id', ids)
+      )
+    );
+    for (const { data: items } of itemResults2) {
+      for (const it of items || []) {
+        if (!saleCategories.has(it.sale_id)) saleCategories.set(it.sale_id, []);
+        if (it.category) saleCategories.get(it.sale_id).push(it.category);
+      }
+    }
+  }
+
+  // ── Step 4: вычисляем similarity_score для каждого кандидата ──────────────
+  const scored = candidates.map(p => {
+    const tier     = computeTier(p.total_revenue);
+    const activity = computeActivity(p.last_purchase_date);
+    const agency   = p.agency_id || null;
+
+    // Собираем distinct categories кандидата
+    const saleIds = partnerSaleIds.get(p.id) || [];
+    const candCatSet = new Set();
+    for (const sid of saleIds) {
+      for (const cat of saleCategories.get(sid) || []) {
+        candCatSet.add(cat);
+      }
+    }
+    const candCats = [...candCatSet];
+
+    // Жаккар: |A ∩ B| / |A ∪ B|
+    let jaccard = 0;
+    if (baseCats.length > 0 || candCats.length > 0) {
+      const intersection = baseCats.filter(c => candCatSet.has(c)).length;
+      const unionSize = new Set([...baseCats, ...candCats]).size;
+      jaccard = unionSize > 0 ? intersection / unionSize : 0;
+    }
+
+    let score = jaccard;
+    if (tier === baseTier)                         score += 0.10;
+    if (agency && baseAgency && agency === baseAgency) score += 0.05;
+    if (activity === baseActivity)                 score += 0.05;
+
+    // Агрегированные покупки: берём из v_partner_full напрямую
+    // (v_partner_full содержит total_purchases_amount / total_purchases_count
+    //  либо total_revenue / orders_count — зависит от версии view)
+    const totalAmount = p.total_purchases_amount ?? p.total_revenue ?? 0;
+    const totalCount  = p.total_purchases_count  ?? p.orders_count  ?? 0;
+
+    return {
+      id:                     p.id,
+      canonical_name:         p.canonical_name,
+      tier,
+      activity,
+      agency_id:              agency,
+      agency_name:            null, // enrich ниже если нужна
+      total_purchases_amount: totalAmount,
+      total_purchases_count:  totalCount,
+      shared_categories:      baseCats.filter(c => candCatSet.has(c)),
+      similarity_score:       Math.round(score * 1000) / 1000,
+    };
+  });
+
+  // ── Step 5: sort + top-N ──────────────────────────────────────────────────
+  scored.sort((a, b) => b.similarity_score - a.similarity_score);
+  const topN = scored.slice(0, args.limit);
+
+  // ── Step 6: enrich agency_name (batch) ───────────────────────────────────
+  const agencyIds = [...new Set(topN.map(p => p.agency_id).filter(Boolean))];
+  if (agencyIds.length > 0) {
+    const { data: agencies } = await sb
+      .from('agencies')
+      .select('id, name')
+      .in('id', agencyIds);
+    const agencyMap = new Map((agencies || []).map(a => [a.id, a.name]));
+    for (const p of topN) {
+      if (p.agency_id) p.agency_name = agencyMap.get(p.agency_id) || null;
+    }
+  }
+
+  const result = {
+    similar: topN,
+    base_partner_categories: baseCats,
+  };
+
+  cacheSet(ck, result);
+  return result;
+}
