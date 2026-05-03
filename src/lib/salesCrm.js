@@ -4003,3 +4003,154 @@ export async function getInsightsSummary(req, opts = {}) {
   cacheSet(ck, result);
   return result;
 }
+
+// ── Bulk helpers ─────────────────────────────────────────────────────────────
+//
+// Массовые операции над partner_contacts. Используются из /sales-crm/partners/bulk-*.
+// Каждая функция принимает req (чтобы соблюдать RLS через req.userClient),
+// валидирует входные данные через Zod и инвалидирует кэш после записи.
+//
+// Лимит 100 ids на запрос — защита от случайной блокировки БД длинным .in().
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BULK_MAX_IDS = 100;
+
+const bulkTagInput = z.object({
+  partner_ids: z.array(z.string().uuid()).min(1).max(BULK_MAX_IDS),
+  tags: z.array(z.string().min(1)).min(1),
+  action: z.enum(['add', 'replace', 'remove']),
+});
+
+/**
+ * Массовое обновление тегов partner_contacts.
+ *
+ * action="add"     — объединить с существующими тегами (union)
+ * action="replace" — перезаписать теги
+ * action="remove"  — убрать перечисленные теги из существующих
+ *
+ * Возвращает { updated: N, errors: [{ id, error }] }
+ */
+export async function bulkUpdatePartnerTags(req, payload) {
+  const args = bulkTagInput.parse(payload);
+  const sb = pickClient(req);
+
+  const errors = [];
+  let updated = 0;
+
+  if (args.action === 'replace') {
+    // Одна операция UPDATE для всего списка — самый дешёвый путь
+    const { error, count } = await sb
+      .from('partner_contacts')
+      .update({ tags: args.tags })
+      .in('id', args.partner_ids)
+      .select('id', { count: 'exact', head: true });
+
+    if (error) throw new Error(`bulkUpdatePartnerTags replace: ${error.message}`);
+    updated = count ?? args.partner_ids.length;
+  } else {
+    // add / remove требуют read-merge-write per row (Supabase не поддерживает
+    // array_append / array_remove в PostgREST patch без RPC).
+    // Читаем текущие теги одним батчем, затем пишем каждый UPDATE.
+    const { data: rows, error: readErr } = await sb
+      .from('partner_contacts')
+      .select('id, tags')
+      .in('id', args.partner_ids);
+
+    if (readErr) throw new Error(`bulkUpdatePartnerTags read: ${readErr.message}`);
+
+    const newTagsSet = new Set(args.tags);
+
+    await Promise.all((rows || []).map(async (row) => {
+      const existing = Array.isArray(row.tags) ? row.tags : [];
+      let merged;
+      if (args.action === 'add') {
+        merged = [...new Set([...existing, ...args.tags])];
+      } else {
+        // remove
+        merged = existing.filter(t => !newTagsSet.has(t));
+      }
+
+      const { error: writeErr } = await sb
+        .from('partner_contacts')
+        .update({ tags: merged })
+        .eq('id', row.id);
+
+      if (writeErr) {
+        errors.push({ id: row.id, error: writeErr.message });
+      } else {
+        updated++;
+      }
+    }));
+  }
+
+  invalidateSalesCache();
+  return { updated, errors };
+}
+
+const bulkAgencyInput = z.object({
+  partner_ids: z.array(z.string().uuid()).min(1).max(BULK_MAX_IDS),
+  agency_id: z.string().uuid().nullable(),
+});
+
+/**
+ * Массовое изменение agency_id у partner_contacts.
+ * agency_id=null — открепить от студии.
+ *
+ * Возвращает { updated: N }
+ */
+export async function bulkUpdatePartnerAgency(req, payload) {
+  const args = bulkAgencyInput.parse(payload);
+  const sb = pickClient(req);
+
+  const { error, count } = await sb
+    .from('partner_contacts')
+    .update({ agency_id: args.agency_id })
+    .in('id', args.partner_ids)
+    .select('id', { count: 'exact', head: true });
+
+  if (error) throw new Error(`bulkUpdatePartnerAgency: ${error.message}`);
+
+  invalidateSalesCache();
+  return { updated: count ?? args.partner_ids.length };
+}
+
+const bulkMergeInput = z.object({
+  source_ids: z.array(z.string().uuid()).min(1).max(BULK_MAX_IDS),
+  target_id: z.string().uuid(),
+});
+
+/**
+ * Массовый merge: каждый source_id → target_id через RPC merge_partners.
+ *
+ * Atomicity per-source: если упадёт на 3-м — первые 2 уже смержены.
+ * Это намеренно (документировано) — частичный merge лучше чем откат всего.
+ *
+ * Возвращает { merged: N, failed: [{ source_id, error }] }
+ */
+export async function bulkMergePartners(req, payload) {
+  const args = bulkMergeInput.parse(payload);
+  if (args.source_ids.includes(args.target_id)) {
+    throw new Error('target_id не должен присутствовать в source_ids');
+  }
+
+  const sb = pickClient(req);
+  let merged = 0;
+  const failed = [];
+
+  // Последовательно — merge не идемпотентен, параллельность может вызвать
+  // конфликт если source_ids содержат дубликаты или транзакции пересекаются.
+  for (const sourceId of args.source_ids) {
+    const { error } = await sb.rpc('merge_partners', {
+      source_id: sourceId,
+      target_id: args.target_id,
+    });
+    if (error) {
+      failed.push({ source_id: sourceId, error: error.message });
+    } else {
+      merged++;
+    }
+  }
+
+  if (merged > 0) invalidateSalesCache();
+  return { merged, failed };
+}

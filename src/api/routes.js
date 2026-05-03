@@ -1556,6 +1556,49 @@ export function setupRoutes(app) {
     }
   });
 
+  // ── Bulk endpoints ─────────────────────────────────────────────────────────
+  // ВАЖНО: все /bulk-* зарегистрированы ДО /:id — иначе Express поглотит
+  // 'bulk-tag' / 'bulk-agency' / 'bulk-merge' как значение параметра :id.
+
+  // POST /sales-crm/partners/bulk-tag
+  // Body: { partner_ids, tags, action: "add"|"replace"|"remove" }
+  router.post('/sales-crm/partners/bulk-tag', async (req, res) => {
+    try {
+      const r = await salesCrm.bulkUpdatePartnerTags(req, req.body || {});
+      req.log?.info({ updated: r.updated, errors: r.errors.length }, 'bulk_tag_done');
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'bulk_tag_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // POST /sales-crm/partners/bulk-agency
+  // Body: { partner_ids, agency_id: uuid|null }
+  router.post('/sales-crm/partners/bulk-agency', async (req, res) => {
+    try {
+      const r = await salesCrm.bulkUpdatePartnerAgency(req, req.body || {});
+      req.log?.info({ updated: r.updated }, 'bulk_agency_done');
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'bulk_agency_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // POST /sales-crm/partners/bulk-merge
+  // Body: { source_ids: [uuid, ...], target_id: uuid }
+  router.post('/sales-crm/partners/bulk-merge', async (req, res) => {
+    try {
+      const r = await salesCrm.bulkMergePartners(req, req.body || {});
+      req.log?.info({ merged: r.merged, failed: r.failed.length }, 'bulk_merge_done');
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'bulk_merge_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/partners/distribution?city=Алматы|Астана|all[&cities=Алматы,Астана]
   // Pie-chart distribution партнёров по revenue (TOP-15 named + Прочие + Одноразовые + Неизвестные).
   // При ?cities=Алматы,Астана возвращает { byCity: { Алматы: {...}, Астана: {...} } }.
