@@ -4363,3 +4363,347 @@ export async function getSimilarPartners(req, contactId, opts = {}) {
   cacheSet(ck, result);
   return result;
 }
+
+// ─── Anomaly Detection ────────────────────────────────────────────────────────
+//
+// getAnomalies — статистический детектор аномалий без LLM.
+// Один loadAllParallel за последние 365 дней, потом JS-агрегация.
+//
+// Алгоритмы:
+//   1. partner_decline  — top-15 agency по total revenue. last30d vs prev30d.
+//                         Если diff < -40% AND prev_revenue > 1_000_000 → high.
+//   2. category_decline — все категории. YTD vs same period last year.
+//                         Если diff < -25% → medium.
+//   3. partner_silence  — top-15 agency. last_sale > 45 дней назад
+//                         AND historically > 5 sales → high. Sort by silence DESC.
+//   4. spike            — agency revenue last 7d > 2× avg daily revenue of last 30d → low.
+//   5. avg_check_drop   — overall avg_check last30d vs prev30d.
+//                         Если drop > 15% → medium.
+//
+// Cache TTL: 12h (свежее чем insights, чтобы alerts были актуальны).
+//
+const ANOMALY_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12h
+const _anomalyCache = new Map();
+
+function anomalyCacheKey(name, req, paramsObj) {
+  if (!req?.user?.userId) return null;
+  return `${name}|${req.user.userId}|${JSON.stringify(paramsObj || {})}`;
+}
+function anomalyCacheGet(key) {
+  if (!key) return null;
+  const e = _anomalyCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { _anomalyCache.delete(key); return null; }
+  return e.data;
+}
+function anomalyCacheSet(key, data) {
+  if (!key) return;
+  _anomalyCache.set(key, { data, expiresAt: Date.now() + ANOMALY_CACHE_TTL_MS });
+  if (_anomalyCache.size > 100) {
+    const cutoff = Date.now();
+    for (const [k, v] of _anomalyCache) if (v.expiresAt < cutoff) _anomalyCache.delete(k);
+  }
+}
+
+/** Форматирует число как "5.2M ₸" / "320K ₸" / "15 000 ₸" */
+function fmtRev(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M ₸`;
+  if (n >= 1_000)     return `${Math.round(n / 1_000)}K ₸`;
+  return `${Math.round(n).toLocaleString('ru')} ₸`;
+}
+
+const anomalyInput = z.object({
+  cities:    z.string().optional(),
+  date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+export async function getAnomalies(req, opts = {}) {
+  const args = anomalyInput.parse(opts);
+
+  const ck = anomalyCacheKey('anomalies', req, args);
+  const cached = anomalyCacheGet(ck);
+  if (cached) return cached;
+
+  const sb = pickClient(req);
+
+  // Определяем окно: дата_to = сегодня, дата_from = 365 дней назад.
+  // Если caller передал date_from/date_to — используем их как «сегодня»
+  // (для тестов / исторических отчётов).
+  const today = args.date_to ? new Date(args.date_to) : new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const dayMs = 86_400_000;
+
+  // Опорные точки для окон
+  const ts = {
+    today:     today.getTime(),
+    d7ago:     today.getTime() - 7  * dayMs,
+    d30ago:    today.getTime() - 30 * dayMs,
+    d60ago:    today.getTime() - 60 * dayMs,
+    d365ago:   today.getTime() - 365 * dayMs,
+  };
+
+  // Год назад (для YoY): тот же календарный период год назад
+  const yearAgoToday = new Date(today);
+  yearAgoToday.setFullYear(yearAgoToday.getFullYear() - 1);
+  const yearAgoStart = new Date(yearAgoToday);
+  // YTD start этого года и прошлого
+  const ytdStart = new Date(today.getFullYear(), 0, 1).getTime();
+  const ytdStartLastYear = new Date(today.getFullYear() - 1, 0, 1).getTime();
+  const todayLastYear = yearAgoToday.getTime();
+
+  // ── Загрузка данных ────────────────────────────────────────────────────────
+  const windowStart = new Date(ts.d365ago).toISOString().slice(0, 10);
+
+  let filters = { gte: { sale_date: windowStart } };
+
+  // city-фильтр из ?cities= (берём первый если несколько, либо 'all')
+  let city = 'all';
+  if (args.cities) {
+    const parts = args.cities.split(',').map(s => s.trim()).filter(s => VALID_CITIES.has(s));
+    if (parts.length === 1) city = parts[0];
+    // multi → 'all' (anomalies не разбиваем по городам — один общий список)
+  }
+  filters = addCityFilter(filters, city);
+
+  const sales = await loadAllParallel(
+    sb, 'sales',
+    'id, sale_date, total_amount, agency_id',
+    filters
+  );
+
+  // ── Pre-build agency revenue maps ─────────────────────────────────────────
+  // Агрегируем по agency_id для разных временных окон
+
+  // Map<agency_id, { rev30: number, revPrev30: number, rev7: number, rev365: number, count: number, lastSaleTs: number }>
+  const agMap = new Map();
+
+  for (const s of sales) {
+    if (!s.agency_id || !s.sale_date) continue;
+    const rev = s.total_amount || 0;
+    const ts_sale = new Date(s.sale_date).getTime();
+
+    let entry = agMap.get(s.agency_id);
+    if (!entry) {
+      entry = { rev30: 0, revPrev30: 0, rev7: 0, rev365: 0, count: 0, lastSaleTs: 0 };
+      agMap.set(s.agency_id, entry);
+    }
+
+    entry.rev365 += rev;
+    entry.count++;
+    if (ts_sale > entry.lastSaleTs) entry.lastSaleTs = ts_sale;
+
+    if (ts_sale >= ts.d30ago && ts_sale < ts.today) {
+      entry.rev30 += rev;
+      if (ts_sale >= ts.d7ago) entry.rev7 += rev;
+    } else if (ts_sale >= ts.d60ago && ts_sale < ts.d30ago) {
+      entry.revPrev30 += rev;
+    }
+  }
+
+  // ── Top-15 agencies по общей выручке за 365d ──────────────────────────────
+  const top15 = [...agMap.entries()]
+    .sort((a, b) => b[1].rev365 - a[1].rev365)
+    .slice(0, 15);
+
+  // ── Обогащаем agency names одним batch-запросом ───────────────────────────
+  const top15Ids = top15.map(([id]) => id);
+  const { data: agenciesData } = await sb
+    .from('agencies')
+    .select('id, canonical_name')
+    .in('id', top15Ids);
+  const agencyNameMap = new Map((agenciesData || []).map(a => [a.id, a.canonical_name || a.id]));
+
+  // ── Category aggregation for YoY ──────────────────────────────────────────
+  // sale_items не загружаем — используем поле category если оно есть.
+  // Для category_decline нужны sale_items. Загружаем их батчами по sale_id.
+  const saleIds = sales.map(s => s.id);
+  const BATCH = 500;
+  const itemBatches = [];
+  for (let i = 0; i < saleIds.length; i += BATCH) {
+    itemBatches.push(saleIds.slice(i, i + BATCH));
+  }
+  const itemResults = await Promise.all(
+    itemBatches.map(ids => sb.from('sale_items').select('sale_id, category').in('sale_id', ids))
+  );
+  // sale_id → { sale_date, total_amount } lookup
+  const saleLookup = new Map(sales.map(s => [s.id, s]));
+
+  // Map<category, { ytd: number, ytdLastYear: number }>
+  const catYoY = new Map();
+
+  for (const { data: items } of itemResults) {
+    for (const it of items || []) {
+      if (!it.category) continue;
+      const sale = saleLookup.get(it.sale_id);
+      if (!sale || !sale.sale_date) continue;
+      const tsSale = new Date(sale.sale_date).getTime();
+
+      let entry = catYoY.get(it.category);
+      if (!entry) {
+        entry = { ytd: 0, ytdLastYear: 0 };
+        catYoY.set(it.category, entry);
+      }
+
+      // YTD текущего года: ytdStart … today
+      if (tsSale >= ytdStart && tsSale < ts.today) {
+        entry.ytd += sale.total_amount || 0;
+      }
+      // YTD прошлого года: ytdStartLastYear … todayLastYear
+      if (tsSale >= ytdStartLastYear && tsSale < todayLastYear) {
+        entry.ytdLastYear += sale.total_amount || 0;
+      }
+    }
+  }
+
+  // ── Overall avg_check (last30d vs prev30d) ────────────────────────────────
+  let sumRev30 = 0, cnt30 = 0;
+  let sumRevPrev30 = 0, cntPrev30 = 0;
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const tsSale = new Date(s.sale_date).getTime();
+    if (tsSale >= ts.d30ago && tsSale < ts.today) { sumRev30 += s.total_amount || 0; cnt30++; }
+    else if (tsSale >= ts.d60ago && tsSale < ts.d30ago) { sumRevPrev30 += s.total_amount || 0; cntPrev30++; }
+  }
+  const avgCheck30   = cnt30     > 0 ? sumRev30     / cnt30     : 0;
+  const avgCheckPrev = cntPrev30 > 0 ? sumRevPrev30 / cntPrev30 : 0;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Собираем alerts
+  // ─────────────────────────────────────────────────────────────────────────
+  const alerts = [];
+
+  // ── 1. partner_decline ─────────────────────────────────────────────────────
+  for (const [agId, agg] of top15) {
+    const { rev30, revPrev30 } = agg;
+    if (revPrev30 <= 1_000_000) continue; // исключаем мелочь
+    if (revPrev30 === 0) continue;
+    const diffPct = Math.round(((rev30 - revPrev30) / revPrev30) * 100);
+    if (diffPct >= -40) continue; // порог
+
+    const name = agencyNameMap.get(agId) || agId;
+    alerts.push({
+      type:        'partner_decline',
+      severity:    'high',
+      icon:        '🔴',
+      title:       `${name} выручка ↓`,
+      description: `За последние 30 дней ${fmtRev(rev30)} vs ${fmtRev(revPrev30)} за предыдущие 30 дней (${diffPct}%)`,
+      entity_type: 'agency',
+      entity_id:   agId,
+      entity_name: name,
+      diff_pct:    diffPct,
+    });
+  }
+
+  // ── 2. category_decline ────────────────────────────────────────────────────
+  const CATEGORY_LABELS = {
+    sink:         'Мойки',
+    faucet:       'Смесители',
+    dispenser:    'Дозаторы',
+    disposer:     'Диспоузеры',
+    water_filter: 'Фильтры воды',
+    cartridge:    'Картриджи',
+  };
+
+  for (const [cat, { ytd, ytdLastYear }] of catYoY) {
+    if (ytdLastYear === 0) continue; // нет прошлогодних данных — пропускаем
+    const diffPct = Math.round(((ytd - ytdLastYear) / ytdLastYear) * 100);
+    if (diffPct >= -25) continue;
+
+    const label = CATEGORY_LABELS[cat] || cat;
+    alerts.push({
+      type:        'category_decline',
+      severity:    'medium',
+      icon:        '📉',
+      title:       `${label} ${diffPct}% YoY`,
+      description: `Эту категорию покупают на ${Math.abs(diffPct)}% меньше год к году (${fmtRev(ytd)} vs ${fmtRev(ytdLastYear)})`,
+      entity_type: 'category',
+      entity_id:   cat,
+      entity_name: label,
+      diff_pct:    diffPct,
+    });
+  }
+
+  // ── 3. partner_silence ─────────────────────────────────────────────────────
+  const silenceAlerts = [];
+  for (const [agId, agg] of top15) {
+    if (agg.count <= 5) continue; // исторически мало покупок — не показываем
+    const daysSilent = Math.floor((ts.today - agg.lastSaleTs) / dayMs);
+    if (daysSilent < 45) continue;
+
+    const name = agencyNameMap.get(agId) || agId;
+    const lastSaleDate = new Date(agg.lastSaleTs).toISOString().slice(0, 10);
+    silenceAlerts.push({
+      type:        'partner_silence',
+      severity:    'high',
+      icon:        '🥶',
+      title:       `${name} молчит ${daysSilent} дн.`,
+      description: `Был в top-15, не покупал с ${lastSaleDate}`,
+      entity_type: 'agency',
+      entity_id:   agId,
+      entity_name: name,
+      days_silent: daysSilent,
+      diff_pct:    null,
+    });
+  }
+  // Sort by silence days DESC (самые долго молчащие — первые)
+  silenceAlerts.sort((a, b) => b.days_silent - a.days_silent);
+  alerts.push(...silenceAlerts);
+
+  // ── 4. spike ───────────────────────────────────────────────────────────────
+  for (const [agId, agg] of top15) {
+    // avg daily revenue за last30d (без last7d)
+    const rev30without7 = agg.rev30 - agg.rev7;
+    const avgDailyLast30 = rev30without7 / 23; // 30 - 7 = 23 дня
+    if (avgDailyLast30 <= 0) continue;
+
+    const avgLast7 = agg.rev7 / 7;
+    if (avgLast7 < avgDailyLast30 * 2) continue; // нет двукратного роста
+
+    const multiplier = (avgLast7 / avgDailyLast30).toFixed(1);
+    const name = agencyNameMap.get(agId) || agId;
+    alerts.push({
+      type:        'spike',
+      severity:    'low',
+      icon:        '🚀',
+      title:       `${name} +${Math.round((avgLast7 / avgDailyLast30 - 1) * 100)}% за неделю`,
+      description: `Внезапный рост (${multiplier}× от среднего) — изучить причину. Неделя: ${fmtRev(agg.rev7)}, ср. день: ${fmtRev(avgDailyLast30)}`,
+      entity_type: 'agency',
+      entity_id:   agId,
+      entity_name: name,
+      diff_pct:    Math.round((avgLast7 / avgDailyLast30 - 1) * 100),
+    });
+  }
+
+  // ── 5. avg_check_drop ──────────────────────────────────────────────────────
+  if (avgCheckPrev > 0 && cnt30 > 0 && cntPrev30 > 0) {
+    const diffPct = Math.round(((avgCheck30 - avgCheckPrev) / avgCheckPrev) * 100);
+    if (diffPct < -15) {
+      alerts.push({
+        type:        'avg_check_drop',
+        severity:    'medium',
+        icon:        '📊',
+        title:       `Средний чек ↓ ${Math.abs(diffPct)}%`,
+        description: `Средний чек за 30 дней: ${fmtRev(avgCheck30)} vs ${fmtRev(avgCheckPrev)} в предыдущем периоде`,
+        entity_type: 'overall',
+        entity_id:   null,
+        entity_name: 'Средний чек',
+        diff_pct:    diffPct,
+      });
+    }
+  }
+
+  // ── Сортировка и ограничение до top-10 ────────────────────────────────────
+  const SEVERITY_ORDER = { high: 0, medium: 1, low: 2 };
+  alerts.sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 3) - (SEVERITY_ORDER[b.severity] ?? 3));
+  const top10 = alerts.slice(0, 10);
+
+  const result = {
+    alerts:       top10,
+    generated_at: new Date().toISOString(),
+  };
+
+  anomalyCacheSet(ck, result);
+  return result;
+}

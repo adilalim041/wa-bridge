@@ -2266,6 +2266,24 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/anomalies?cities=&date_from=&date_to=
+  // Статистический детектор аномалий для HomeScreen alerts widget.
+  // Без LLM — чистая JS-агрегация поверх 365d sales.
+  // Cache 12h (свежее чем insights — alerts должны быть актуальны).
+  router.get('/sales-crm/anomalies', async (req, res) => {
+    try {
+      const r = await salesCrm.getAnomalies(req, {
+        cities:    req.query.cities    || undefined,
+        date_from: req.query.date_from || undefined,
+        date_to:   req.query.date_to   || undefined,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_anomalies_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/search?q=...   — quick lookup by name/phone
   router.get('/sales-crm/search', async (req, res) => {
     try {
