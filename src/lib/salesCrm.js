@@ -249,6 +249,81 @@ export function tagItemsWithCity(items, city) {
   return (items || []).map(item => ({ ...item, city }));
 }
 
+// ── Year-list parsing (multi-year filter) ─────────────────────────────────────
+//
+// `?years=2024,2025` (CSV) → ['2024', '2025']
+// `?year=2024` (legacy single)         → ['2024']
+// `?year=all` / nothing                → ['all']
+//
+// Возвращает массив строк-годов (отсортированный, dedup), или ['all'].
+// Whitelist: только 4-значные годы 2020..2030.
+//
+const VALID_YEAR_RE = /^20[2-3][0-9]$/;
+export function parseYearsQuery(query) {
+  const rawYears = query.years;
+  const rawYear = query.year;
+
+  if (rawYears !== undefined && rawYears !== null && rawYears !== '') {
+    const parts = String(rawYears)
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const valid = parts.filter(p => VALID_YEAR_RE.test(p) || p === 'all');
+    if (valid.includes('all')) return ['all'];
+    if (valid.length === 0) return ['all'];
+    return [...new Set(valid)].sort();
+  }
+  if (rawYear !== undefined && rawYear !== null && rawYear !== '') {
+    if (rawYear === 'all') return ['all'];
+    if (VALID_YEAR_RE.test(String(rawYear))) return [String(rawYear)];
+  }
+  return ['all'];
+}
+
+/**
+ * Применяет year-фильтр к loadAllParallel filters.
+ *
+ * years === ['all']  → no filter
+ * years === ['2024'] → gte 2024-01-01, lte 2024-12-31 (single year, legacy)
+ * years === ['2024','2025'] → gte 2024-01-01, lte 2025-12-31 (range; contiguous)
+ * years === ['2023','2025'] → gte 2023-01-01, lte 2025-12-31 (диапазон + JS post-filter
+ *                            нужен для удаления промежуточных годов; но в практике
+ *                            non-contiguous selections rare — допустим гонять чуть больше
+ *                            строк через сеть, главное чтобы JS aggregator выкидывал
+ *                            ненужные года).
+ *
+ * Возвращает { filters, postFilter } где postFilter — функция (sale)=>boolean
+ * для дополнительной фильтрации в JS (true = keep).
+ */
+function addYearFilter(filters, years) {
+  if (!years || !years.length || years.includes('all')) {
+    return { filters, postFilter: () => true };
+  }
+  const sorted = [...years].sort();
+  const minY = sorted[0];
+  const maxY = sorted[sorted.length - 1];
+  const next = {
+    ...filters,
+    gte: { ...(filters.gte || {}), sale_date: `${minY}-01-01` },
+    lte: { ...(filters.lte || {}), sale_date: `${maxY}-12-31` },
+  };
+  // Если выбраны не все года в диапазоне → JS post-filter
+  const yearSet = new Set(sorted);
+  const intMin = parseInt(minY, 10);
+  const intMax = parseInt(maxY, 10);
+  let needPostFilter = false;
+  for (let y = intMin; y <= intMax; y++) {
+    if (!yearSet.has(String(y))) { needPostFilter = true; break; }
+  }
+  const postFilter = needPostFilter
+    ? (sale) => {
+        if (!sale.sale_date) return false;
+        return yearSet.has(sale.sale_date.slice(0, 4));
+      }
+    : () => true;
+  return { filters: next, postFilter };
+}
+
 // ── 1. listPartners ─────────────────────────────────────────────────────────
 //
 // Возвращает список партнёров с агрегатами. Поддерживает фильтры и поиск.
@@ -1421,9 +1496,15 @@ function monthDiff(fromYM, toYM) {
 //
 export async function getProductInsights(req, opts = {}) {
   const city = opts.city || 'all';
-  // year — '2023'..'2026' | 'all' (default 'all'). Фильтрует и sales, и cross-sell pairs.
-  const year = opts.year && /^\d{4}$/.test(String(opts.year)) ? String(opts.year) : 'all';
-  const ck = cacheKey('products', req, { city, year });
+  // years — массив ['2024','2025'] | ['all']. Backward-compat: opts.year (single string).
+  let years = Array.isArray(opts.years) && opts.years.length ? opts.years : null;
+  if (!years && opts.year) {
+    const y = String(opts.year);
+    years = (/^\d{4}$/.test(y) || y === 'all') ? [y] : ['all'];
+  }
+  if (!years) years = ['all'];
+  const yearsKey = years.includes('all') ? 'all' : years.slice().sort().join(',');
+  const ck = cacheKey('products', req, { city, years: yearsKey });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
@@ -1431,22 +1512,20 @@ export async function getProductInsights(req, opts = {}) {
   // Все sale_items + sales — параллельно (значительно быстрее последовательной pagination)
   // При city-фильтре: загружаем только sales нужного города, потом берём только их items.
   let salesFilters = addCityFilter({}, city);
-  if (year !== 'all') {
-    salesFilters = {
-      ...salesFilters,
-      gte: { ...(salesFilters.gte || {}), sale_date: `${year}-01-01` },
-      lte: { ...(salesFilters.lte || {}), sale_date: `${year}-12-31` },
-    };
-  }
+  const { filters: yearFiltered, postFilter: yearPostFilter } = addYearFilter(salesFilters, years);
+  salesFilters = yearFiltered;
   // FIX 2026-05-04: Когда year задан с city='all', тоже фильтруем items через sale_ids.
   // Иначе top_skus / cross-sell брали бы items за все годы, игнорируя year filter.
-  const needSaleIdFilter = (city !== 'all') || (year !== 'all');
+  const isAllYears = years.includes('all');
+  const needSaleIdFilter = (city !== 'all') || !isAllYears;
   const [items, sales] = await Promise.all([
     !needSaleIdFilter
       ? loadAllParallel(sb, 'sale_items', 'sale_id, sku, raw_name, qty, amount, category')
       : (async () => {
-          // Сначала получаем sale_ids нужного города/года, потом items по ним
-          const citySales = await loadAllParallel(sb, 'sales', 'id', salesFilters);
+          // Сначала получаем sale_ids нужного города/года, потом items по ним.
+          // Применяем yearPostFilter в JS для non-contiguous year-сетов.
+          const citySalesAll = await loadAllParallel(sb, 'sales', 'id, sale_date', salesFilters);
+          const citySales = citySalesAll.filter(yearPostFilter);
           const ids = citySales.map(s => s.id);
           if (ids.length === 0) return [];
           const batches = [];
@@ -1458,7 +1537,10 @@ export async function getProductInsights(req, opts = {}) {
           );
           return results.flatMap(r => r.data || []);
         })(),
-    loadAllParallel(sb, 'sales', 'id, sale_date, customer_id', salesFilters),
+    (async () => {
+      const all = await loadAllParallel(sb, 'sales', 'id, sale_date, customer_id', salesFilters);
+      return all.filter(yearPostFilter);
+    })(),
   ]);
   const salesById = new Map(sales.map(s => [s.id, s]));
 
@@ -1941,7 +2023,17 @@ export async function getCategoryDrilldown(req, params) {
 //
 export async function getForecast(req, opts = {}) {
   const city = opts.city || 'all';
-  const ck = cacheKey('forecast', req, { city });
+  // years — массив ['2024','2025'] | ['all']. Влияет ТОЛЬКО на исторический отрезок
+  // в timeline графике; baseline регрессии, картриджный pipeline и insights считаются
+  // по всем данным (full history). Adil 2026-05-04: «forecast баллистика всё равно один».
+  let years = Array.isArray(opts.years) && opts.years.length ? opts.years : null;
+  if (!years && opts.year) {
+    const y = String(opts.year);
+    years = (/^\d{4}$/.test(y) || y === 'all') ? [y] : ['all'];
+  }
+  if (!years) years = ['all'];
+  const yearsKey = years.includes('all') ? 'all' : years.slice().sort().join(',');
+  const ck = cacheKey('forecast', req, { city, years: yearsKey });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
@@ -2057,13 +2149,22 @@ export async function getForecast(req, opts = {}) {
   const forecastMax = wmaBaseline * 2.50;
 
   const forecastTimeline = [];
-  // historical (last 12)
-  for (const m of last12) {
+  // historical: либо last 12 (default), либо все месяцы выбранных годов (multi-year)
+  const histMonths = years.includes('all')
+    ? last12
+    : (() => {
+        const sorted = [...years].sort();
+        return sorted.flatMap(y =>
+          Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`)
+        ).filter(m => m < currentMonth); // не отображаем будущие пустые месяцы из выбранных годов
+      })();
+  for (const m of histMonths) {
     forecastTimeline.push({
-      month: m, actual: monthlyRev[m], forecast: null,
+      month: m, actual: monthlyRev[m] || 0, forecast: null,
     });
   }
-  // future (next 6)
+  // future (next 6) — пристыковываем всегда после последнего исторического (даже если
+  // выбран старый год вроде 2023, прогноз всё равно с текущего месяца, а не после 2023-12).
   for (let k = 1; k <= 6; k++) {
     const fm = addMonths(lastMonth, k);
     const monthIdx = parseInt(fm.slice(5, 7)) - 1;
@@ -2962,26 +3063,27 @@ export async function getLeadFunnel(req, opts = {}) {
 //
 export async function getManagerPerformance(req, opts = {}) {
   const city = opts.city || 'all';
-  // year — '2023' | '2024' | '2025' | '2026' | 'all' (default 'all').
-  // Если задан — фильтруем sale_date по году. Также сужает timeline до 12 мес этого года.
-  const year = opts.year && /^\d{4}$/.test(String(opts.year)) ? String(opts.year) : 'all';
-  const ck = cacheKey('manager-perf', req, { city, year });
+  // years — массив ['2024','2025'] | ['all']. Backward-compat: opts.year (single string).
+  let years = Array.isArray(opts.years) && opts.years.length ? opts.years : null;
+  if (!years && opts.year) {
+    const y = String(opts.year);
+    years = (/^\d{4}$/.test(y) || y === 'all') ? [y] : ['all'];
+  }
+  if (!years) years = ['all'];
+  const yearsKey = years.includes('all') ? 'all' : years.slice().sort().join(',');
+  const ck = cacheKey('manager-perf', req, { city, years: yearsKey });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
   let perfFilters = addCityFilter({}, city);
-  if (year !== 'all') {
-    perfFilters = {
-      ...perfFilters,
-      gte: { ...(perfFilters.gte || {}), sale_date: `${year}-01-01` },
-      lte: { ...(perfFilters.lte || {}), sale_date: `${year}-12-31` },
-    };
-  }
-  const sales = await loadAllParallel(sb, 'sales',
+  const { filters: yearFiltered, postFilter: yearPostFilter } = addYearFilter(perfFilters, years);
+  perfFilters = yearFiltered;
+  const salesAll = await loadAllParallel(sb, 'sales',
     'id, sale_date, total_amount, manager, partner_id, customer_id',
     perfFilters
   );
+  const sales = salesAll.filter(yearPostFilter);
 
   // ТОЛЬКО 4 активных менеджера. Все остальные имена (Сания, Алим, Асель, Саги, ...)
   // НЕ попадают в leaderboard. Их заказы остаются в БД, но не учитываются здесь.
@@ -3039,14 +3141,18 @@ export async function getManagerPerformance(req, opts = {}) {
   }
 
   // Сборка timeline для multi-line chart.
-  // - year !== 'all': 12 месяцев выбранного года (даже если в нём пустые)
-  // - year === 'all': последние 12 месяцев с продажами
+  // - years === ['all']: последние 12 месяцев с продажами
+  // - 1 год выбран: 12 месяцев этого года (даже пустые)
+  // - 2+ года: все месяцы этих годов в порядке возрастания (24, 36, ...)
   let last12;
-  if (year !== 'all') {
-    last12 = Array.from({ length: 12 }, (_, i) => `${year}-${String(i + 1).padStart(2, '0')}`);
-  } else {
+  if (years.includes('all')) {
     const allMonths = [...new Set(sales.map(s => s.sale_date?.slice(0, 7)).filter(Boolean))].sort();
     last12 = allMonths.slice(-12);
+  } else {
+    const sorted = [...years].sort();
+    last12 = sorted.flatMap(y =>
+      Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`)
+    );
   }
   const timeline = last12.map(m => {
     const row = { month: m };
