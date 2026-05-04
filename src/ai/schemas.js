@@ -123,6 +123,19 @@ export const DailyAnalysisSchema = z.object({
   action_required: z.boolean().catch(false),
   action_suggestion: z.string().max(500).nullable().catch(null),
   confidence: z.number().min(0).max(1).catch(0),
+
+  // 2026-05-04 customer_history pipeline (migration 0020 + dailyRun.js enrichment).
+  // Эти поля заполняются Bridge в pending-dialogs (BEFORE Claude analysis), но
+  // Claude может их обновить (например уточнить is_existing_customer на основе
+  // диалога: «постоянный клиент написал по новому продукту»).
+  // Audit fix M-1: schema валидирует чтобы NULL/malformed values не попадали в DB.
+  is_existing_customer: z.boolean().nullable().catch(null),
+  previous_orders_count: z.number().int().min(0).nullable().catch(null),
+  previous_orders_amount: z.number().min(0).nullable().catch(null),
+  last_purchase_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().catch(null),
+  // lead_source_detail — машинно-читаемый ID (lowercase_with_underscores).
+  // Схема SKILL.md: omoikiri_ad_grinder_via_instagram, referral_kirill, returning_after_8m.
+  lead_source_detail: z.string().max(80).regex(/^[a-z0-9_]+$/).nullable().catch(null),
 });
 
 // === Batch classify response schema ===
