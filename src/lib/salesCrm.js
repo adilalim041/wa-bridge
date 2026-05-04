@@ -1421,19 +1421,31 @@ function monthDiff(fromYM, toYM) {
 //
 export async function getProductInsights(req, opts = {}) {
   const city = opts.city || 'all';
-  const ck = cacheKey('products', req, { city });
+  // year — '2023'..'2026' | 'all' (default 'all'). Фильтрует и sales, и cross-sell pairs.
+  const year = opts.year && /^\d{4}$/.test(String(opts.year)) ? String(opts.year) : 'all';
+  const ck = cacheKey('products', req, { city, year });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
   // Все sale_items + sales — параллельно (значительно быстрее последовательной pagination)
   // При city-фильтре: загружаем только sales нужного города, потом берём только их items.
-  const salesFilters = addCityFilter({}, city);
+  let salesFilters = addCityFilter({}, city);
+  if (year !== 'all') {
+    salesFilters = {
+      ...salesFilters,
+      gte: { ...(salesFilters.gte || {}), sale_date: `${year}-01-01` },
+      lte: { ...(salesFilters.lte || {}), sale_date: `${year}-12-31` },
+    };
+  }
+  // FIX 2026-05-04: Когда year задан с city='all', тоже фильтруем items через sale_ids.
+  // Иначе top_skus / cross-sell брали бы items за все годы, игнорируя year filter.
+  const needSaleIdFilter = (city !== 'all') || (year !== 'all');
   const [items, sales] = await Promise.all([
-    city === 'all'
+    !needSaleIdFilter
       ? loadAllParallel(sb, 'sale_items', 'sale_id, sku, raw_name, qty, amount, category')
       : (async () => {
-          // Сначала получаем sale_ids нужного города, потом items по ним
+          // Сначала получаем sale_ids нужного города/года, потом items по ним
           const citySales = await loadAllParallel(sb, 'sales', 'id', salesFilters);
           const ids = citySales.map(s => s.id);
           if (ids.length === 0) return [];
@@ -1488,14 +1500,20 @@ export async function getProductInsights(req, opts = {}) {
   const CROSS_SELL_EXCLUDE_NAME_PATTERNS = [
     'сменн', 'замен', 'replacement', 'картридж', 'картриджи',
     'модуль замены', 'v-complex', 'm-complex', 'pure drop замен',
+    'na-01', 'na01', // FIX 2026-05-04: для 2023 sale_items sku=NULL, NA-01 в raw_name
   ];
   const CROSS_SELL_MAIN_CATEGORIES = new Set(['sink', 'faucet', 'disposer', 'water_filter', 'dispenser']);
 
+  // FIX 2026-05-04: для 2023 данных sku может быть NULL, имя содержит "NA-01"
+  // → проверяем raw_name тоже на exclude prefixes.
   function isCrossSellExcluded(it) {
     if (!it.sku && !it.raw_name) return true; // no identity
     if (CROSS_SELL_EXCLUDE_CATEGORIES.has(it.category)) return true;
     const sku = (it.sku || '').toUpperCase();
     if (CROSS_SELL_EXCLUDE_SKU_PREFIXES.some(p => sku.startsWith(p.toUpperCase()))) return true;
+    // raw_name may begin with "NA-01" too (Adil's 2023 import — sku=NULL)
+    const rawNameUpper = (it.raw_name || '').toUpperCase().trim();
+    if (CROSS_SELL_EXCLUDE_SKU_PREFIXES.some(p => rawNameUpper.startsWith(p.toUpperCase()))) return true;
     const name = (it.raw_name || '').toLowerCase();
     if (CROSS_SELL_EXCLUDE_NAME_PATTERNS.some(p => name.includes(p))) return true;
     // Если категория задана и не входит в основные — тоже exclude
@@ -1503,16 +1521,35 @@ export async function getProductInsights(req, opts = {}) {
     return false;
   }
 
+  // FIX 2026-05-04: группируем cross-sell pairs по «базовой модели без цвета».
+  // «Taki 74 LG», «Taki 74 GM», «Taki 74 IN» → одна группа «Taki 74».
+  // Список цветовых суффиксов = последнее слово в raw_name из этого whitelist.
+  const COLOR_SUFFIX_RE = /\s+(LG|GM|IN|BL|BN|GB|WH|GR|GS|PA|SA|BE|DC|SS|AS|GBL|MBL|MAS|EBL|EAS|EAN)\s*$/i;
+  function baseModelName(raw) {
+    if (!raw) return null;
+    let s = String(raw).trim();
+    // strip trailing color suffix (case-insensitive), repeat once in case of double suffix
+    s = s.replace(COLOR_SUFFIX_RE, '').trim();
+    // Также нормализуем пробелы
+    s = s.replace(/\s+/g, ' ');
+    return s || null;
+  }
+
+  // pair-key — base name (lowercased для дедупликации). pair-display — original base name.
   const itemsBySale = {};
+  const baseNameDisplay = new Map(); // lower → original base name
   for (const it of items) {
-    if (!it.sku) continue;
-    if (isCrossSellExcluded(it)) continue; // skip accessories/cartridges/replacements
+    if (isCrossSellExcluded(it)) continue;
+    const base = baseModelName(it.raw_name) || it.sku;
+    if (!base) continue;
+    const baseLower = base.toLowerCase();
+    if (!baseNameDisplay.has(baseLower)) baseNameDisplay.set(baseLower, base);
     if (!itemsBySale[it.sale_id]) itemsBySale[it.sale_id] = new Set();
-    itemsBySale[it.sale_id].add(it.sku);
+    itemsBySale[it.sale_id].add(baseLower);
   }
   const pairCount = {};
-  for (const [saleId, skuSet] of Object.entries(itemsBySale)) {
-    const arr = [...skuSet];
+  for (const [, baseSet] of Object.entries(itemsBySale)) {
+    const arr = [...baseSet];
     if (arr.length < 2) continue;
     for (let i = 0; i < arr.length; i++) {
       for (let j = i + 1; j < arr.length; j++) {
@@ -1521,21 +1558,18 @@ export async function getProductInsights(req, opts = {}) {
       }
     }
   }
-  const skuNames = new Map();
-  for (const s of topSkus) if (s.sku) skuNames.set(s.sku, s.name);
-  // Тоже — для всех skus используя last seen name
-  for (const it of items) if (it.sku && !skuNames.has(it.sku)) skuNames.set(it.sku, it.raw_name || it.sku);
 
   const crossSell = Object.entries(pairCount)
-    .filter(([_, c]) => c >= 3) // FIX 2026-05-02: снизили порог с 5 до 3 — после exclusion пар стало меньше
+    .filter(([_, c]) => c >= 3) // FIX 2026-05-02: снизили порог с 5 до 3
     .sort((a, b) => b[1] - a[1])
     .slice(0, 30)
     .map(([key, count]) => {
       const [a, b] = key.split('|');
       return {
-        sku_a: a, sku_b: b,
-        name_a: skuNames.get(a) || a,
-        name_b: skuNames.get(b) || b,
+        sku_a: baseNameDisplay.get(a) || a,
+        sku_b: baseNameDisplay.get(b) || b,
+        name_a: baseNameDisplay.get(a) || a,
+        name_b: baseNameDisplay.get(b) || b,
         count,
       };
     });
@@ -1981,13 +2015,29 @@ export async function getForecast(req, opts = {}) {
     s.count > 0 && avgRev > 0 ? (s.sum / s.count) / avgRev : 1
   );
 
-  // YoY growth: сравниваем последний полный год с предыдущим
-  const years = Object.keys(revenueByYear).sort();
+  // YoY growth: сравниваем последние 12 завершённых месяцев vs 12 месяцев перед ними.
+  // FIX 2026-05-04: раньше сравнивали full-year vs full-year по revenueByYear,
+  // но при текущем неполном годе (например, май 2026 = Jan-Apr) YoY получается ≈ -70%
+  // → forecast clamps to wmaBaseline*0.7 для всех 6 будущих месяцев → flat line.
+  // Решение: сравнивать L12M vs L12M-prev (rolling), это даёт реалистичную картину.
   let yearOverYearGrowth = 0;
-  if (years.length >= 2) {
-    const prevYear = revenueByYear[years[years.length - 2]];
-    const lastYear = revenueByYear[years[years.length - 1]];
-    if (prevYear > 0) yearOverYearGrowth = (lastYear - prevYear) / prevYear;
+  if (months.length >= 18) {
+    // Need at least 24 months ideally, но 18+ ОК для частичного prior окна.
+    const last12Months = months.slice(-12);
+    const prior12Start = Math.max(0, months.length - 24);
+    const prior12 = months.slice(prior12Start, months.length - 12);
+    const last12Sum = last12Months.reduce((s, m) => s + (monthlyRev[m] || 0), 0);
+    const prior12Sum = prior12.reduce((s, m) => s + (monthlyRev[m] || 0), 0);
+    // Нормализуем prior к 12 месяцам если их меньше (avoid penalising short history).
+    const prior12Norm = prior12.length > 0 ? (prior12Sum / prior12.length) * 12 : 0;
+    if (prior12Norm > 0) yearOverYearGrowth = (last12Sum - prior12Norm) / prior12Norm;
+    // Clamp YoY к разумному диапазону [-50%, +200%] чтобы выбросы не ломали прогноз.
+    yearOverYearGrowth = Math.max(-0.5, Math.min(2.0, yearOverYearGrowth));
+  } else if (months.length >= 6) {
+    // Слишком короткая история — сравниваем avg3 vs olderAvg (как у trend slope).
+    const a3 = months.slice(-3).reduce((s, m) => s + monthlyRev[m], 0) / 3;
+    const a3Old = months.slice(0, 3).reduce((s, m) => s + monthlyRev[m], 0) / 3;
+    if (a3Old > 0) yearOverYearGrowth = Math.max(-0.5, Math.min(2.0, (a3 - a3Old) / a3Old));
   }
 
   // Для trend insights (аналог slope из WMA: recent vs older)
@@ -1998,11 +2048,13 @@ export async function getForecast(req, opts = {}) {
 
   // 4. Forecast следующих 6 мес — Weighted MA × seasonal × (1 + YoY×0.5)
   // Защита от излишнего pessimism/overshoot:
-  //   min(forecast) = baseline × 0.7
-  //   max(forecast) = baseline × 2.0
+  //   min(forecast) = baseline × 0.5  (раньше 0.7 — приводило к clamp в low-season)
+  //   max(forecastMax) = baseline × 2.5
+  // FIX 2026-05-04: ослабили bounds, чтобы сезонность действительно влияла на прогноз
+  // и линия не была flat в low/high seasons.
   const lastMonth = months[months.length - 1];
-  const forecastMin = wmaBaseline * 0.70;
-  const forecastMax = wmaBaseline * 2.00;
+  const forecastMin = wmaBaseline * 0.50;
+  const forecastMax = wmaBaseline * 2.50;
 
   const forecastTimeline = [];
   // historical (last 12)
@@ -2910,12 +2962,22 @@ export async function getLeadFunnel(req, opts = {}) {
 //
 export async function getManagerPerformance(req, opts = {}) {
   const city = opts.city || 'all';
-  const ck = cacheKey('manager-perf', req, { city });
+  // year — '2023' | '2024' | '2025' | '2026' | 'all' (default 'all').
+  // Если задан — фильтруем sale_date по году. Также сужает timeline до 12 мес этого года.
+  const year = opts.year && /^\d{4}$/.test(String(opts.year)) ? String(opts.year) : 'all';
+  const ck = cacheKey('manager-perf', req, { city, year });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
-  const perfFilters = addCityFilter({}, city);
+  let perfFilters = addCityFilter({}, city);
+  if (year !== 'all') {
+    perfFilters = {
+      ...perfFilters,
+      gte: { ...(perfFilters.gte || {}), sale_date: `${year}-01-01` },
+      lte: { ...(perfFilters.lte || {}), sale_date: `${year}-12-31` },
+    };
+  }
   const sales = await loadAllParallel(sb, 'sales',
     'id, sale_date, total_amount, manager, partner_id, customer_id',
     perfFilters
@@ -2976,9 +3038,16 @@ export async function getManagerPerformance(req, opts = {}) {
     }
   }
 
-  // Сборка timeline для multi-line chart (последние 12 мес)
-  const allMonths = [...new Set(sales.map(s => s.sale_date?.slice(0, 7)).filter(Boolean))].sort();
-  const last12 = allMonths.slice(-12);
+  // Сборка timeline для multi-line chart.
+  // - year !== 'all': 12 месяцев выбранного года (даже если в нём пустые)
+  // - year === 'all': последние 12 месяцев с продажами
+  let last12;
+  if (year !== 'all') {
+    last12 = Array.from({ length: 12 }, (_, i) => `${year}-${String(i + 1).padStart(2, '0')}`);
+  } else {
+    const allMonths = [...new Set(sales.map(s => s.sale_date?.slice(0, 7)).filter(Boolean))].sort();
+    last12 = allMonths.slice(-12);
+  }
   const timeline = last12.map(m => {
     const row = { month: m };
     for (const mname of Object.keys(byManager)) {
