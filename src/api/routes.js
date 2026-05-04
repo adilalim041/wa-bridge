@@ -2082,25 +2082,24 @@ export function setupRoutes(app) {
 
   // GET /sales-crm/products?city=Алматы|Астана|all&cities=Алматы,Астана — top SKUs + cross-sell + cartridge funnel (Group C)
   // При mode='multi': возвращает byCity breakdown.
+  // years=2024,2025 — multi-year (CSV). Backward-compat: ?year=2024.
   router.get('/sales-crm/products', async (req, res) => {
     try {
       const cp = parseCitiesQueryRoute(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
 
-      // year — '2023'..'2026' | 'all' (default 'all').
-      const yearRaw = String(req.query.year || 'all');
-      const year = /^\d{4}$/.test(yearRaw) ? yearRaw : 'all';
+      const years = salesCrm.parseYearsQuery(req.query);
 
       if (cp.mode === 'multi') {
         const { byCity } = await salesCrm.withCityBreakdown(
           cp.cities,
-          (c) => salesCrm.getProductInsights(req, { city: c, year })
+          (c) => salesCrm.getProductInsights(req, { city: c, years })
         );
-        return res.json({ byCity, cities: cp.cities, mode: 'multi', year });
+        return res.json({ byCity, cities: cp.cities, mode: 'multi', years });
       }
 
-      const r = await salesCrm.getProductInsights(req, { city: cp.city, year });
-      res.json({ ...r, year });
+      const r = await salesCrm.getProductInsights(req, { city: cp.city, years });
+      res.json({ ...r, years });
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_products_failed');
       res.status(400).json({ error: e.message });
@@ -2162,21 +2161,25 @@ export function setupRoutes(app) {
 
   // GET /sales-crm/forecast?city=Алматы|Астана|all&cities=Алматы,Астана — линейный прогноз + картриджный pipeline
   // При mode='multi': возвращает byCity breakdown.
+  // years=2024,2025 — фильтрует ТОЛЬКО исторический отрезок в timeline графике.
+  // Forecast (6 мес вперёд), баллистика и insights считаются по полной истории.
   router.get('/sales-crm/forecast', async (req, res) => {
     try {
       const cp = parseCitiesQueryRoute(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
 
+      const years = salesCrm.parseYearsQuery(req.query);
+
       if (cp.mode === 'multi') {
         const { byCity } = await salesCrm.withCityBreakdown(
           cp.cities,
-          (c) => salesCrm.getForecast(req, { city: c })
+          (c) => salesCrm.getForecast(req, { city: c, years })
         );
-        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+        return res.json({ byCity, cities: cp.cities, mode: 'multi', years });
       }
 
-      const r = await salesCrm.getForecast(req, { city: cp.city });
-      res.json(r);
+      const r = await salesCrm.getForecast(req, { city: cp.city, years });
+      res.json({ ...r, years });
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_forecast_failed');
       res.status(400).json({ error: e.message });
@@ -2293,25 +2296,24 @@ export function setupRoutes(app) {
 
   // GET /sales-crm/manager-performance?city=Алматы|Астана|all&cities=Алматы,Астана — leaderboard + timeline + response times (Group F)
   // При mode='multi': возвращает byCity breakdown.
+  // years=2024,2025 — multi-year (CSV). Backward-compat: ?year=2024.
   router.get('/sales-crm/manager-performance', async (req, res) => {
     try {
       const cp = parseCitiesQueryRoute(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
 
-      // year — '2023'..'2026' | 'all' (default 'all'). Whitelist 4-digit year.
-      const yearRaw = String(req.query.year || 'all');
-      const year = /^\d{4}$/.test(yearRaw) ? yearRaw : 'all';
+      const years = salesCrm.parseYearsQuery(req.query);
 
       if (cp.mode === 'multi') {
         const { byCity } = await salesCrm.withCityBreakdown(
           cp.cities,
-          (c) => salesCrm.getManagerPerformance(req, { city: c, year })
+          (c) => salesCrm.getManagerPerformance(req, { city: c, years })
         );
-        return res.json({ byCity, cities: cp.cities, mode: 'multi', year });
+        return res.json({ byCity, cities: cp.cities, mode: 'multi', years });
       }
 
-      const r = await salesCrm.getManagerPerformance(req, { city: cp.city, year });
-      res.json({ ...r, year });
+      const r = await salesCrm.getManagerPerformance(req, { city: cp.city, years });
+      res.json({ ...r, years });
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_manager_perf_failed');
       res.status(400).json({ error: e.message });
