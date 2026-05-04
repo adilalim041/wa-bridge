@@ -186,19 +186,37 @@ export async function getPendingDialogs({
 
     let historyByPhone = new Map();
     if (phones.length > 0) {
-      // partner_contacts хранит phone в `whatsapp_jid` или нормализованном поле.
-      // Используем in() по phone digits-only — schema 0011 имеет колонку `phone`.
-      const { data: contacts } = await supabase
+      // schema 0011: partner_contacts.primary_phone (нормализованный TEXT) +
+      // partner_contacts.phones (TEXT[]). Сначала пробуем primary_phone,
+      // потом дополнительно сканим phones[] для multi-phone контактов.
+      //
+      // 2026-05-04 C-1 fix: было `.in('phone', phones)` — колонки phone не
+      // существует, customer_history pipeline молчал с момента c98ea4e
+      // (audit 2026-05-04 catch).
+      const { data: contactsByPrimary } = await supabase
         .from('partner_contacts')
-        .select('id, canonical_name, phone, total_purchases_count, total_purchases_amount, last_purchase_date, first_purchase_date')
-        .in('phone', phones);
-      for (const c of contacts || []) {
-        if (!c.phone) continue;
-        const existing = historyByPhone.get(c.phone);
-        // Если по одному phone несколько partner_contacts (B2B + B2C alias),
-        // схлопываем в самую богатую запись по сумме покупок.
-        if (!existing || (c.total_purchases_amount || 0) > (existing.total_purchases_amount || 0)) {
-          historyByPhone.set(c.phone, c);
+        .select('id, canonical_name, primary_phone, phones, total_purchases_count, total_purchases_amount, last_purchase_date, first_purchase_date')
+        .in('primary_phone', phones);
+      // Дополнительно: где primary_phone ≠ pending phone, но phones[] содержит его
+      const { data: contactsByArray } = await supabase
+        .from('partner_contacts')
+        .select('id, canonical_name, primary_phone, phones, total_purchases_count, total_purchases_amount, last_purchase_date, first_purchase_date')
+        .overlaps('phones', phones);
+
+      const seen = new Set();
+      for (const c of [...(contactsByPrimary || []), ...(contactsByArray || [])]) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        // Map по каждому phone которым контакт известен (primary + phones[])
+        const allPhones = new Set([c.primary_phone, ...(c.phones || [])].filter(Boolean));
+        for (const ph of allPhones) {
+          if (!phones.includes(ph)) continue; // только те что в текущем окне
+          const existing = historyByPhone.get(ph);
+          // Если по одному phone несколько partner_contacts (B2B + B2C alias),
+          // схлопываем в самую богатую запись по сумме покупок.
+          if (!existing || (c.total_purchases_amount || 0) > (existing.total_purchases_amount || 0)) {
+            historyByPhone.set(ph, c);
+          }
         }
       }
     }
