@@ -172,6 +172,56 @@ export async function getPendingDialogs({
     if (out.length >= cap) break;
   }
 
+  // Enrich: customer_history per dialog (Adil 2026-05-04: «он может видеть,
+  // заказывал ли у нас клиент ранее или нет»). Один batch-запрос в
+  // partner_contacts по нормализованному phone digits — тянет агрегаты,
+  // которые уже посчитаны бэкфилом backfill_partner_aggregates.mjs.
+  if (out.length > 0) {
+    const phoneOf = (jid) => {
+      if (!jid || jid.includes('-') || jid.includes('120363')) return null;
+      const digits = jid.replace(/[^0-9]/g, '');
+      return digits || null;
+    };
+    const phones = [...new Set(out.map((d) => phoneOf(d.remote_jid)).filter(Boolean))];
+
+    let historyByPhone = new Map();
+    if (phones.length > 0) {
+      // partner_contacts хранит phone в `whatsapp_jid` или нормализованном поле.
+      // Используем in() по phone digits-only — schema 0011 имеет колонку `phone`.
+      const { data: contacts } = await supabase
+        .from('partner_contacts')
+        .select('id, canonical_name, phone, total_purchases_count, total_purchases_amount, last_purchase_date, first_purchase_date')
+        .in('phone', phones);
+      for (const c of contacts || []) {
+        if (!c.phone) continue;
+        const existing = historyByPhone.get(c.phone);
+        // Если по одному phone несколько partner_contacts (B2B + B2C alias),
+        // схлопываем в самую богатую запись по сумме покупок.
+        if (!existing || (c.total_purchases_amount || 0) > (existing.total_purchases_amount || 0)) {
+          historyByPhone.set(c.phone, c);
+        }
+      }
+    }
+
+    for (const d of out) {
+      const ph = phoneOf(d.remote_jid);
+      const c = ph ? historyByPhone.get(ph) : null;
+      if (c && (c.total_purchases_count || 0) > 0) {
+        d.customer_history = {
+          is_existing: true,
+          partner_id: c.id,
+          canonical_name: c.canonical_name || null,
+          orders_count: c.total_purchases_count || 0,
+          total_amount: c.total_purchases_amount || 0,
+          last_purchase_date: c.last_purchase_date || null,
+          first_purchase_date: c.first_purchase_date || null,
+        };
+      } else {
+        d.customer_history = { is_existing: false };
+      }
+    }
+  }
+
   return {
     count: out.length,
     new_count: newCount,
