@@ -96,18 +96,40 @@ const CHAT_AI_SELECT = [
 
 /**
  * Format phone digits from JID (e.g. "77001234567@s.whatsapp.net" → "77001234567").
- * Returns null for group JIDs.
+ * Returns null for group JIDs and для @lid идентификаторов (это внутренние WA
+ * идентификаторы, не телефоны — для них polled push_name из messages).
  */
 function _phoneFromJid(jid) {
   if (!jid || jid.includes('-') || jid.includes('120363')) return null;
+  if (jid.includes('@lid')) return null; // LID identifier, not a phone
   return jid.replace(/[^0-9]/g, '') || null;
 }
 
 /**
- * Build display name: prefer CRM display_name, fall back to phone.
+ * Determine whether a JID is the new WhatsApp LID format (no real phone in jid).
+ * For LIDs мы НЕ показываем «номер» — там 14-15 значный internal ID, который
+ * вводит Adil-а в заблуждение (выглядит как номер, но не звонится).
  */
-function _clientName(chatRow, jid) {
-  return chatRow?.display_name || _phoneFromJid(jid) || jid;
+function _isLidJid(jid) {
+  return Boolean(jid && jid.includes('@lid'));
+}
+
+/**
+ * Build display name. Приоритет:
+ *   1. chats.display_name (CRM-edited имя)
+ *   2. push_name из последнего сообщения (имя как клиент представился в WA)
+ *   3. реальный телефон, если JID — это s.whatsapp.net (а не @lid)
+ *   4. строка "Контакт #<last4digits>" — fallback для LID без push_name
+ *      (это лучше чем 15-значный «номер»-LID который непонятен Adil-у).
+ */
+function _clientName(chatRow, jid, pushName = null) {
+  if (chatRow?.display_name) return chatRow.display_name;
+  if (pushName) return pushName;
+  const phone = _phoneFromJid(jid);
+  if (phone) return phone;
+  // LID или group fallback
+  const tail = (jid || '').replace(/[^0-9]/g, '').slice(-4) || '????';
+  return `Контакт #${tail}`;
 }
 
 // ─── Main export: getIssues ───────────────────────────────────────────────────
@@ -226,11 +248,41 @@ export async function getIssues({ category, page, limit, db, userId }) {
   const [chatsRes, sessionsRes] = await Promise.all([
     db.from('chats')
       .select('session_id, remote_jid, display_name')
-      .in('session_id', uniqueSessions),
+      .in('session_id', uniqueSessions)
+      .in('remote_jid', uniqueJids),
     db.from('session_config')
       .select('session_id, display_name')
       .in('session_id', uniqueSessions),
   ]);
+
+  // Push-name lookup из messages — нужен fallback для LID-формат JIDs
+  // (новый WhatsApp protocol: remote_jid="...@lid", display_name=null,
+  // _phoneFromJid возвращает 15-значный internal ID который выглядит как
+  // фейковый номер). Adil 2026-05-04: «что не так с номерами клиентов?
+  // Ты вообще их изменил нафиг». Решение: подтягиваем `push_name` —
+  // имя как клиент представился в WhatsApp.
+  //
+  // Берём ПОСЛЕДНЕЕ сообщение с непустым push_name на каждый (session_id,
+  // remote_jid) — это имя самое свежее. Без index hint Postgres использует
+  // существующий (session_id, remote_jid, timestamp DESC) индекс.
+  const pushNameMap = new Map(); // `${session_id}:::${remote_jid}` → push_name
+  if (uniqueJids.length > 0 && uniqueSessions.length > 0) {
+    const { data: msgRows } = await db
+      .from('messages')
+      .select('session_id, remote_jid, push_name, timestamp')
+      .in('session_id', uniqueSessions)
+      .in('remote_jid', uniqueJids)
+      .not('push_name', 'is', null)
+      .order('timestamp', { ascending: false })
+      .limit(2000);
+    for (const m of msgRows ?? []) {
+      const k = `${m.session_id}:::${m.remote_jid}`;
+      // Свежесь приоритет: первое попавшееся имя в DESC-порядке = самое свежее.
+      if (!pushNameMap.has(k) && m.push_name) {
+        pushNameMap.set(k, m.push_name);
+      }
+    }
+  }
 
   const chatsMap = new Map();
   for (const c of chatsRes.data ?? []) {
@@ -245,12 +297,18 @@ export async function getIssues({ category, page, limit, db, userId }) {
   const items = slice.map((r) => {
     const chatKey = `${r.session_id}:::${r.remote_jid}`;
     const chat = chatsMap.get(chatKey);
+    const pushName = pushNameMap.get(chatKey) || null;
     const fb = footballMeta?.get(r.remote_jid) || null;
     return {
       dialog_session_id: r.dialog_session_id,
       chat_ai_id: r.id,
       remote_jid: r.remote_jid,
-      client_name: _clientName(chat, r.remote_jid),
+      client_name: _clientName(chat, r.remote_jid, pushName),
+      // Поддержка для UI: phone — реальный телефон или null если LID;
+      // is_lid — флаг для UI чтобы не показывать «номер».
+      phone: _phoneFromJid(r.remote_jid),
+      is_lid: _isLidJid(r.remote_jid),
+      push_name: pushName,
       session_id: r.session_id,
       session_display_name: sessionsMap.get(r.session_id) || r.session_id,
       summary_ru: r.summary_ru || null,
