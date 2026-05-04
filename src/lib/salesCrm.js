@@ -1707,6 +1707,8 @@ export async function getProductInsights(req, opts = {}) {
   }
 
   // ── Build by_year ──
+  // 2026-05-04: Frontend (SalesProducts.jsx) does client-side combineByYear filter.
+  // Force-deploy marker to trigger Railway redeploy after submodule-only bump.
   const yearsPresent = [...yearsSet].sort();
   const by_year = {};
   for (const y of yearsPresent) {
