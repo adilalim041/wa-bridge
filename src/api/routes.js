@@ -22,6 +22,7 @@ import { isSentryEnabled } from '../observability/sentry.js';
 import { runCloudinaryCleanup, getCleanupConfig } from '../cleanup/cloudinaryCleanup.js';
 import { runMvRefresh } from '../cleanup/mvRefresh.js';
 import * as salesCrm from '../lib/salesCrm.js';
+import * as salesCrmExtras from '../lib/salesCrmExtras.js';
 import * as dailyRun from '../lib/dailyRun.js';
 import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
 
@@ -2086,18 +2087,52 @@ export function setupRoutes(app) {
       const cp = parseCitiesQueryRoute(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
 
+      // year — '2023'..'2026' | 'all' (default 'all').
+      const yearRaw = String(req.query.year || 'all');
+      const year = /^\d{4}$/.test(yearRaw) ? yearRaw : 'all';
+
       if (cp.mode === 'multi') {
         const { byCity } = await salesCrm.withCityBreakdown(
           cp.cities,
-          (c) => salesCrm.getProductInsights(req, { city: c })
+          (c) => salesCrm.getProductInsights(req, { city: c, year })
         );
-        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+        return res.json({ byCity, cities: cp.cities, mode: 'multi', year });
       }
 
-      const r = await salesCrm.getProductInsights(req, { city: cp.city });
-      res.json(r);
+      const r = await salesCrm.getProductInsights(req, { city: cp.city, year });
+      res.json({ ...r, year });
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_products_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // GET /sales-crm/top-by-category?city=Алматы|Астана|all&cities=...&year=2023..2026|all&top=10
+  // Top-N SKU внутри каждой категории (sink, faucet, disposer, water_filter, dispenser).
+  // Группировка по «базовой модели без цвета» (Taki 74 LG/GM/IN → Taki 74).
+  // Adil 2026-05-04: «нужно анализ по конкретным моделям моек, смесителей».
+  router.get('/sales-crm/top-by-category', async (req, res) => {
+    try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      const yearRaw = String(req.query.year || 'all');
+      const year = /^\d{4}$/.test(yearRaw) ? yearRaw : 'all';
+      const top = Math.min(50, Math.max(5, parseInt(req.query.top, 10) || 10));
+
+      if (cp.mode === 'multi') {
+        // Multi-city: вычисляем по каждому городу отдельно (паттерн как в других endpoints)
+        const byCity = {};
+        await Promise.all(cp.cities.map(async (c) => {
+          byCity[c] = await salesCrmExtras.getTopByCategory(req, { city: c, year, top });
+        }));
+        return res.json({ byCity, cities: cp.cities, mode: 'multi', year });
+      }
+
+      const r = await salesCrmExtras.getTopByCategory(req, { city: cp.city, year, top });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_top_by_category_failed');
       res.status(400).json({ error: e.message });
     }
   });
@@ -2263,16 +2298,20 @@ export function setupRoutes(app) {
       const cp = parseCitiesQueryRoute(req.query);
       if (!cp.ok) return res.status(400).json({ error: cp.error });
 
+      // year — '2023'..'2026' | 'all' (default 'all'). Whitelist 4-digit year.
+      const yearRaw = String(req.query.year || 'all');
+      const year = /^\d{4}$/.test(yearRaw) ? yearRaw : 'all';
+
       if (cp.mode === 'multi') {
         const { byCity } = await salesCrm.withCityBreakdown(
           cp.cities,
-          (c) => salesCrm.getManagerPerformance(req, { city: c })
+          (c) => salesCrm.getManagerPerformance(req, { city: c, year })
         );
-        return res.json({ byCity, cities: cp.cities, mode: 'multi' });
+        return res.json({ byCity, cities: cp.cities, mode: 'multi', year });
       }
 
-      const r = await salesCrm.getManagerPerformance(req, { city: cp.city });
-      res.json(r);
+      const r = await salesCrm.getManagerPerformance(req, { city: cp.city, year });
+      res.json({ ...r, year });
     } catch (e) {
       req.log?.warn({ err: e.message }, 'sales_crm_manager_perf_failed');
       res.status(400).json({ error: e.message });
