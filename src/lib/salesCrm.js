@@ -1496,36 +1496,20 @@ function monthDiff(fromYM, toYM) {
 //
 export async function getProductInsights(req, opts = {}) {
   const city = opts.city || 'all';
-  // years — массив ['2024','2025'] | ['all']. Backward-compat: opts.year (single string).
-  let years = Array.isArray(opts.years) && opts.years.length ? opts.years : null;
-  if (!years && opts.year) {
-    const y = String(opts.year);
-    years = (/^\d{4}$/.test(y) || y === 'all') ? [y] : ['all'];
-  }
-  if (!years) years = ['all'];
-  const yearsKey = years.includes('all') ? 'all' : years.slice().sort().join(',');
-  const ck = cacheKey('products', req, { city, years: yearsKey });
+  // ВАЖНО: years больше НЕ фильтруют на backend. Возвращаем by_year payload, frontend
+  // делает client-side фильтр через useMemo.
+  const ck = cacheKey('products', req, { city, mode: 'by_year' });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
-  // Все sale_items + sales — параллельно (значительно быстрее последовательной pagination)
-  // При city-фильтре: загружаем только sales нужного города, потом берём только их items.
-  let salesFilters = addCityFilter({}, city);
-  const { filters: yearFiltered, postFilter: yearPostFilter } = addYearFilter(salesFilters, years);
-  salesFilters = yearFiltered;
-  // FIX 2026-05-04: Когда year задан с city='all', тоже фильтруем items через sale_ids.
-  // Иначе top_skus / cross-sell брали бы items за все годы, игнорируя year filter.
-  const isAllYears = years.includes('all');
-  const needSaleIdFilter = (city !== 'all') || !isAllYears;
+  const salesFilters = addCityFilter({}, city);
+  const needSaleIdFilter = city !== 'all';
   const [items, sales] = await Promise.all([
     !needSaleIdFilter
       ? loadAllParallel(sb, 'sale_items', 'sale_id, sku, raw_name, qty, amount, category')
       : (async () => {
-          // Сначала получаем sale_ids нужного города/года, потом items по ним.
-          // Применяем yearPostFilter в JS для non-contiguous year-сетов.
-          const citySalesAll = await loadAllParallel(sb, 'sales', 'id, sale_date', salesFilters);
-          const citySales = citySalesAll.filter(yearPostFilter);
+          const citySales = await loadAllParallel(sb, 'sales', 'id, sale_date', salesFilters);
           const ids = citySales.map(s => s.id);
           if (ids.length === 0) return [];
           const batches = [];
@@ -1537,185 +1521,204 @@ export async function getProductInsights(req, opts = {}) {
           );
           return results.flatMap(r => r.data || []);
         })(),
-    (async () => {
-      const all = await loadAllParallel(sb, 'sales', 'id, sale_date, customer_id', salesFilters);
-      return all.filter(yearPostFilter);
-    })(),
+    loadAllParallel(sb, 'sales', 'id, sale_date, customer_id', salesFilters),
   ]);
   const salesById = new Map(sales.map(s => [s.id, s]));
 
-  // 1. Top SKUs (агрегируем по SKU; если SKU отсутствует — по raw_name)
-  const skuAgg = {};
-  for (const it of items) {
-    const key = it.sku || `noskus:${(it.raw_name || '').slice(0, 60)}`;
-    if (!skuAgg[key]) skuAgg[key] = {
-      sku: it.sku || null,
-      name: it.raw_name || '?',
-      category: it.category || 'other',
-      qty_sold: 0,
-      orders: new Set(),
-      revenue: 0,
-    };
-    skuAgg[key].qty_sold += it.qty || 1;
-    skuAgg[key].revenue += it.amount || 0;
-    skuAgg[key].orders.add(it.sale_id);
-  }
-  const topSkus = Object.values(skuAgg)
-    .map(s => ({ ...s, orders: s.orders.size }))
-    .sort((a, b) => b.qty_sold - a.qty_sold)
-    .slice(0, 50);
-
-  // 2. Cross-sell pairs (SKU A + SKU B в одном заказе → counter)
-  //
-  // FIX 2026-05-02 (Adil feedback): исключаем «обвес» из cross-sell пар.
-  // Adil видел «NA-01 + Измельчитель» 240 раз — NA-01 это отводная арматура для измельчителя,
-  // очевидный обвес. Также картриджи и сменные модули — расходники, не интересные пары.
-  //
-  // CROSS_SELL_EXCLUDE_CATEGORIES: категории которые полностью исключаются из cross-sell.
-  // CROSS_SELL_EXCLUDE_SKU_PREFIXES: SKU-префиксы которые исключаются (NA-01 = отв. арматура).
-  // CROSS_SELL_EXCLUDE_NAME_PATTERNS: части raw_name которые сигнализируют о сменном элементе.
-  //
-  // ОСТАВЛЯЕМ только «основные» категории: sink, faucet, disposer, water_filter, dispenser.
-  //
+  // ── Cross-sell exclusion helpers (одинаковы для всех годов) ──
   const CROSS_SELL_EXCLUDE_CATEGORIES = new Set(['cartridge', 'accessory']);
   const CROSS_SELL_EXCLUDE_SKU_PREFIXES = ['NA-01', 'NA01'];
   const CROSS_SELL_EXCLUDE_NAME_PATTERNS = [
     'сменн', 'замен', 'replacement', 'картридж', 'картриджи',
     'модуль замены', 'v-complex', 'm-complex', 'pure drop замен',
-    'na-01', 'na01', // FIX 2026-05-04: для 2023 sale_items sku=NULL, NA-01 в raw_name
+    'na-01', 'na01',
   ];
   const CROSS_SELL_MAIN_CATEGORIES = new Set(['sink', 'faucet', 'disposer', 'water_filter', 'dispenser']);
-
-  // FIX 2026-05-04: для 2023 данных sku может быть NULL, имя содержит "NA-01"
-  // → проверяем raw_name тоже на exclude prefixes.
   function isCrossSellExcluded(it) {
-    if (!it.sku && !it.raw_name) return true; // no identity
+    if (!it.sku && !it.raw_name) return true;
     if (CROSS_SELL_EXCLUDE_CATEGORIES.has(it.category)) return true;
     const sku = (it.sku || '').toUpperCase();
     if (CROSS_SELL_EXCLUDE_SKU_PREFIXES.some(p => sku.startsWith(p.toUpperCase()))) return true;
-    // raw_name may begin with "NA-01" too (Adil's 2023 import — sku=NULL)
     const rawNameUpper = (it.raw_name || '').toUpperCase().trim();
     if (CROSS_SELL_EXCLUDE_SKU_PREFIXES.some(p => rawNameUpper.startsWith(p.toUpperCase()))) return true;
     const name = (it.raw_name || '').toLowerCase();
     if (CROSS_SELL_EXCLUDE_NAME_PATTERNS.some(p => name.includes(p))) return true;
-    // Если категория задана и не входит в основные — тоже exclude
     if (it.category && !CROSS_SELL_MAIN_CATEGORIES.has(it.category)) return true;
     return false;
   }
-
-  // FIX 2026-05-04: группируем cross-sell pairs по «базовой модели без цвета».
-  // «Taki 74 LG», «Taki 74 GM», «Taki 74 IN» → одна группа «Taki 74».
-  // Список цветовых суффиксов = последнее слово в raw_name из этого whitelist.
   const COLOR_SUFFIX_RE = /\s+(LG|GM|IN|BL|BN|GB|WH|GR|GS|PA|SA|BE|DC|SS|AS|GBL|MBL|MAS|EBL|EAS|EAN)\s*$/i;
   function baseModelName(raw) {
     if (!raw) return null;
     let s = String(raw).trim();
-    // strip trailing color suffix (case-insensitive), repeat once in case of double suffix
     s = s.replace(COLOR_SUFFIX_RE, '').trim();
-    // Также нормализуем пробелы
     s = s.replace(/\s+/g, ' ');
     return s || null;
   }
-
-  // pair-key — base name (lowercased для дедупликации). pair-display — original base name.
-  const itemsBySale = {};
-  const baseNameDisplay = new Map(); // lower → original base name
-  for (const it of items) {
-    if (isCrossSellExcluded(it)) continue;
-    const base = baseModelName(it.raw_name) || it.sku;
-    if (!base) continue;
-    const baseLower = base.toLowerCase();
-    if (!baseNameDisplay.has(baseLower)) baseNameDisplay.set(baseLower, base);
-    if (!itemsBySale[it.sale_id]) itemsBySale[it.sale_id] = new Set();
-    itemsBySale[it.sale_id].add(baseLower);
-  }
-  const pairCount = {};
-  for (const [, baseSet] of Object.entries(itemsBySale)) {
-    const arr = [...baseSet];
-    if (arr.length < 2) continue;
-    for (let i = 0; i < arr.length; i++) {
-      for (let j = i + 1; j < arr.length; j++) {
-        const key = arr[i] < arr[j] ? `${arr[i]}|${arr[j]}` : `${arr[j]}|${arr[i]}`;
-        pairCount[key] = (pairCount[key] || 0) + 1;
-      }
-    }
-  }
-
-  const crossSell = Object.entries(pairCount)
-    .filter(([_, c]) => c >= 3) // FIX 2026-05-02: снизили порог с 5 до 3
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 30)
-    .map(([key, count]) => {
-      const [a, b] = key.split('|');
-      return {
-        sku_a: baseNameDisplay.get(a) || a,
-        sku_b: baseNameDisplay.get(b) || b,
-        name_a: baseNameDisplay.get(a) || a,
-        name_b: baseNameDisplay.get(b) || b,
-        count,
-      };
-    });
-
-  // 3. Cartridge funnel: for each month, count water_filter sold → expected
-  //    cartridges in (month + 6mo). Compare to actual cartridges sold that month.
-  const filterByMonth = {};
-  const cartridgeByMonth = {};
-  for (const it of items) {
-    const sale = salesById.get(it.sale_id);
-    if (!sale?.sale_date) continue;
-    const m = sale.sale_date.slice(0, 7);
-    if (it.category === 'water_filter') {
-      filterByMonth[m] = (filterByMonth[m] || 0) + (it.qty || 1);
-    }
-    if (it.category === 'cartridge') {
-      cartridgeByMonth[m] = (cartridgeByMonth[m] || 0) + (it.qty || 1);
-    }
-  }
-  const allMonths = [...new Set([...Object.keys(filterByMonth), ...Object.keys(cartridgeByMonth)])].sort();
   function addMonths(ym, n) {
     const [y, m] = ym.split('-').map(Number);
     const d = new Date(y, m - 1 + n, 1);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
   }
-  const cartridgeFunnel = allMonths.map(m => ({
-    month: m,
-    filters_sold: filterByMonth[m] || 0,
-    expected_cartridges_at_plus6: filterByMonth[addMonths(m, -6)] || 0,
-    actual_cartridges_sold: cartridgeByMonth[m] || 0,
-    gap: (filterByMonth[addMonths(m, -6)] || 0) - (cartridgeByMonth[m] || 0),
-  }));
 
-  // 4. Seasonality (категория × месяц)
-  const seasonality = {};
+  // ── Группировка items и sales по году ──
+  const itemsByYear = {};
+  const salesByYear = {};
+  const yearsSet = new Set();
   for (const it of items) {
     const sale = salesById.get(it.sale_id);
     if (!sale?.sale_date) continue;
-    const monthIdx = parseInt(sale.sale_date.slice(5, 7), 10); // 1-12
-    const cat = it.category || 'other';
-    if (!seasonality[cat]) seasonality[cat] = Array.from({ length: 12 }, () => 0);
-    seasonality[cat][monthIdx - 1] += it.qty || 1;
+    const y = sale.sale_date.slice(0, 4);
+    yearsSet.add(y);
+    if (!itemsByYear[y]) itemsByYear[y] = [];
+    itemsByYear[y].push(it);
   }
-  const seasonalityList = Object.entries(seasonality)
-    .map(([category, monthly]) => ({ category, monthly }))
-    .sort((a, b) => b.monthly.reduce((s, x) => s + x, 0) - a.monthly.reduce((s, x) => s + x, 0));
+  for (const s of sales) {
+    if (!s.sale_date) continue;
+    const y = s.sale_date.slice(0, 4);
+    yearsSet.add(y);
+    if (!salesByYear[y]) salesByYear[y] = [];
+    salesByYear[y].push(s);
+  }
 
-  // 5. Bundle stats
-  const itemsCountBySale = {};
-  for (const it of items) {
-    itemsCountBySale[it.sale_id] = (itemsCountBySale[it.sale_id] || 0) + 1;
+  // ── Helper: compute one-year insights ──
+  function computeYearInsights(yItems, ySalesById, ySalesCount) {
+    // 1. Top SKUs
+    const skuAgg = {};
+    for (const it of yItems) {
+      const key = it.sku || `noskus:${(it.raw_name || '').slice(0, 60)}`;
+      if (!skuAgg[key]) skuAgg[key] = {
+        sku: it.sku || null,
+        name: it.raw_name || '?',
+        category: it.category || 'other',
+        qty_sold: 0,
+        orders: new Set(),
+        revenue: 0,
+      };
+      skuAgg[key].qty_sold += it.qty || 1;
+      skuAgg[key].revenue += it.amount || 0;
+      skuAgg[key].orders.add(it.sale_id);
+    }
+    const topSkus = Object.values(skuAgg)
+      .map(s => ({ ...s, orders: s.orders.size }))
+      .sort((a, b) => b.qty_sold - a.qty_sold)
+      .slice(0, 50);
+
+    // 2. Cross-sell pairs
+    const itemsBySale = {};
+    const baseNameDisplay = new Map();
+    for (const it of yItems) {
+      if (isCrossSellExcluded(it)) continue;
+      const base = baseModelName(it.raw_name) || it.sku;
+      if (!base) continue;
+      const baseLower = base.toLowerCase();
+      if (!baseNameDisplay.has(baseLower)) baseNameDisplay.set(baseLower, base);
+      if (!itemsBySale[it.sale_id]) itemsBySale[it.sale_id] = new Set();
+      itemsBySale[it.sale_id].add(baseLower);
+    }
+    const pairCount = {};
+    for (const [, baseSet] of Object.entries(itemsBySale)) {
+      const arr = [...baseSet];
+      if (arr.length < 2) continue;
+      for (let i = 0; i < arr.length; i++) {
+        for (let j = i + 1; j < arr.length; j++) {
+          const key = arr[i] < arr[j] ? `${arr[i]}|${arr[j]}` : `${arr[j]}|${arr[i]}`;
+          pairCount[key] = (pairCount[key] || 0) + 1;
+        }
+      }
+    }
+    const crossSell = Object.entries(pairCount)
+      .filter(([_, c]) => c >= 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 30)
+      .map(([key, count]) => {
+        const [a, b] = key.split('|');
+        return {
+          sku_a: baseNameDisplay.get(a) || a,
+          sku_b: baseNameDisplay.get(b) || b,
+          name_a: baseNameDisplay.get(a) || a,
+          name_b: baseNameDisplay.get(b) || b,
+          count,
+        };
+      });
+
+    // 3. Cartridge funnel
+    const filterByMonth = {};
+    const cartridgeByMonth = {};
+    for (const it of yItems) {
+      const sale = ySalesById.get(it.sale_id);
+      if (!sale?.sale_date) continue;
+      const m = sale.sale_date.slice(0, 7);
+      if (it.category === 'water_filter') filterByMonth[m] = (filterByMonth[m] || 0) + (it.qty || 1);
+      if (it.category === 'cartridge') cartridgeByMonth[m] = (cartridgeByMonth[m] || 0) + (it.qty || 1);
+    }
+    const allMonths = [...new Set([...Object.keys(filterByMonth), ...Object.keys(cartridgeByMonth)])].sort();
+    const cartridgeFunnel = allMonths.map(m => ({
+      month: m,
+      filters_sold: filterByMonth[m] || 0,
+      expected_cartridges_at_plus6: filterByMonth[addMonths(m, -6)] || 0,
+      actual_cartridges_sold: cartridgeByMonth[m] || 0,
+      gap: (filterByMonth[addMonths(m, -6)] || 0) - (cartridgeByMonth[m] || 0),
+    }));
+
+    // 4. Seasonality (категория × месяц)
+    const seasonality = {};
+    for (const it of yItems) {
+      const sale = ySalesById.get(it.sale_id);
+      if (!sale?.sale_date) continue;
+      const monthIdx = parseInt(sale.sale_date.slice(5, 7), 10);
+      const cat = it.category || 'other';
+      if (!seasonality[cat]) seasonality[cat] = Array.from({ length: 12 }, () => 0);
+      seasonality[cat][monthIdx - 1] += it.qty || 1;
+    }
+    const seasonalityList = Object.entries(seasonality)
+      .map(([category, monthly]) => ({ category, monthly }))
+      .sort((a, b) => b.monthly.reduce((s, x) => s + x, 0) - a.monthly.reduce((s, x) => s + x, 0));
+
+    // 5. Bundle stats
+    const itemsCountBySale = {};
+    for (const it of yItems) {
+      itemsCountBySale[it.sale_id] = (itemsCountBySale[it.sale_id] || 0) + 1;
+    }
+    const bundleStats = {
+      avg_items_per_sale: yItems.length / Math.max(1, ySalesCount),
+      one_item_sales: Object.values(itemsCountBySale).filter(n => n === 1).length,
+      multi_item_sales: Object.values(itemsCountBySale).filter(n => n > 1).length,
+    };
+
+    // 6. Categories distribution (для pie chart) — count + revenue + qty per category
+    const catAgg = {};
+    for (const it of yItems) {
+      const cat = it.category || 'other';
+      if (!catAgg[cat]) catAgg[cat] = { category: cat, count: 0, qty: 0, revenue: 0 };
+      catAgg[cat].count++;
+      catAgg[cat].qty += it.qty || 1;
+      catAgg[cat].revenue += it.amount || 0;
+    }
+    const categories = Object.values(catAgg).sort((a, b) => b.revenue - a.revenue);
+
+    return {
+      top_skus: topSkus,
+      cross_sell: crossSell,
+      cartridge_funnel: cartridgeFunnel,
+      seasonality: seasonalityList,
+      bundle_stats: bundleStats,
+      categories,
+    };
   }
-  const bundleStats = {
-    avg_items_per_sale: items.length / Math.max(1, sales.length),
-    one_item_sales: Object.values(itemsCountBySale).filter(n => n === 1).length,
-    multi_item_sales: Object.values(itemsCountBySale).filter(n => n > 1).length,
-  };
+
+  // ── Build by_year ──
+  const yearsPresent = [...yearsSet].sort();
+  const by_year = {};
+  for (const y of yearsPresent) {
+    const yItems = itemsByYear[y] || [];
+    const ySales = salesByYear[y] || [];
+    const ySalesById = new Map(ySales.map(s => [s.id, s]));
+    by_year[y] = computeYearInsights(yItems, ySalesById, ySales.length);
+  }
 
   const result = {
-    top_skus: topSkus,
-    cross_sell: crossSell,
-    cartridge_funnel: cartridgeFunnel,
-    seasonality: seasonalityList,
-    bundle_stats: bundleStats,
+    by_year,
+    years_present: yearsPresent,
   };
   cacheSet(ck, result);
   return result;
@@ -2023,17 +2026,10 @@ export async function getCategoryDrilldown(req, params) {
 //
 export async function getForecast(req, opts = {}) {
   const city = opts.city || 'all';
-  // years — массив ['2024','2025'] | ['all']. Влияет ТОЛЬКО на исторический отрезок
-  // в timeline графике; baseline регрессии, картриджный pipeline и insights считаются
-  // по всем данным (full history). Adil 2026-05-04: «forecast баллистика всё равно один».
-  let years = Array.isArray(opts.years) && opts.years.length ? opts.years : null;
-  if (!years && opts.year) {
-    const y = String(opts.year);
-    years = (/^\d{4}$/.test(y) || y === 'all') ? [y] : ['all'];
-  }
-  if (!years) years = ['all'];
-  const yearsKey = years.includes('all') ? 'all' : years.slice().sort().join(',');
-  const ck = cacheKey('forecast', req, { city, years: yearsKey });
+  // ВАЖНО: year/years больше НЕ фильтруют backend. Возвращаем все месяцы (monthly_revenue
+  // map) + forecast последних 6 мес. Frontend через useMemo делает client-side overlay
+  // по выбранным годам.
+  const ck = cacheKey('forecast', req, { city, mode: 'all_years' });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
@@ -2148,23 +2144,15 @@ export async function getForecast(req, opts = {}) {
   const forecastMin = wmaBaseline * 0.50;
   const forecastMax = wmaBaseline * 2.50;
 
+  // Default forecast timeline (last 12 historical + 6 future). Frontend может перестроить
+  // overlay из monthly_revenue по выбранным годам через useMemo, но эту дефолтную форму
+  // оставляем для backward compat single-year отображения.
   const forecastTimeline = [];
-  // historical: либо last 12 (default), либо все месяцы выбранных годов (multi-year)
-  const histMonths = years.includes('all')
-    ? last12
-    : (() => {
-        const sorted = [...years].sort();
-        return sorted.flatMap(y =>
-          Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`)
-        ).filter(m => m < currentMonth); // не отображаем будущие пустые месяцы из выбранных годов
-      })();
-  for (const m of histMonths) {
+  for (const m of last12) {
     forecastTimeline.push({
       month: m, actual: monthlyRev[m] || 0, forecast: null,
     });
   }
-  // future (next 6) — пристыковываем всегда после последнего исторического (даже если
-  // выбран старый год вроде 2023, прогноз всё равно с текущего месяца, а не после 2023-12).
   for (let k = 1; k <= 6; k++) {
     const fm = addMonths(lastMonth, k);
     const monthIdx = parseInt(fm.slice(5, 7)) - 1;
@@ -2174,6 +2162,11 @@ export async function getForecast(req, opts = {}) {
       month: fm, actual: null, forecast: Math.round(clamped),
     });
   }
+  // Future forecast separately — frontend нужен для overlay (один dataset поверх historical)
+  const forecastFuture = forecastTimeline.filter(t => t.forecast !== null);
+
+  // Years present in monthly_revenue (для year chips на frontend)
+  const yearsPresent = [...new Set(months.map(m => m.slice(0, 4)))].sort();
 
   // 5. Картриджный пайплайн на 12 мес вперёд (фильтры -6 мес назад)
   // Использую loadAllParallel чтобы не упереться в default 1000 rows.
@@ -2310,7 +2303,12 @@ export async function getForecast(req, opts = {}) {
 
   const result = {
     timeline: forecastTimeline,
-    next_6_months_revenue: forecastTimeline.filter(t => t.forecast !== null).reduce((s, t) => s + t.forecast, 0),
+    // Full monthly revenue map (для frontend client-side year-overlay).
+    // {YYYY-MM: revenue} только для завершённых месяцев (current month исключён).
+    monthly_revenue: monthlyRev,
+    years_present: yearsPresent,
+    forecast_future: forecastFuture, // отдельно — будущие 6 мес. для overlay
+    next_6_months_revenue: forecastFuture.reduce((s, t) => s + t.forecast, 0),
     trend_slope: Math.round(slope), // ₸/мес — приближение тренда (recent vs older WMA)
     seasonality: seasonalMult.map((m, i) => ({
       month_idx: i + 1,
@@ -3063,27 +3061,20 @@ export async function getLeadFunnel(req, opts = {}) {
 //
 export async function getManagerPerformance(req, opts = {}) {
   const city = opts.city || 'all';
-  // years — массив ['2024','2025'] | ['all']. Backward-compat: opts.year (single string).
-  let years = Array.isArray(opts.years) && opts.years.length ? opts.years : null;
-  if (!years && opts.year) {
-    const y = String(opts.year);
-    years = (/^\d{4}$/.test(y) || y === 'all') ? [y] : ['all'];
-  }
-  if (!years) years = ['all'];
-  const yearsKey = years.includes('all') ? 'all' : years.slice().sort().join(',');
-  const ck = cacheKey('manager-perf', req, { city, years: yearsKey });
+  // ВАЖНО: year/years больше НЕ фильтруют backend. Frontend получает all-years payload
+  // (by_year: { '2023': {...}, '2024': {...}, ... }) и делает client-side filter через
+  // useMemo + Set<string>. Это убирает HTTP round-trip при toggle year chip.
+  // Reference pattern: getMultiYearBreakdown (см. ниже).
+  const ck = cacheKey('manager-perf', req, { city, mode: 'by_year' });
   const cached = cacheGet(ck);
   if (cached) return cached;
   const sb = pickClient(req);
 
-  let perfFilters = addCityFilter({}, city);
-  const { filters: yearFiltered, postFilter: yearPostFilter } = addYearFilter(perfFilters, years);
-  perfFilters = yearFiltered;
-  const salesAll = await loadAllParallel(sb, 'sales',
+  const perfFilters = addCityFilter({}, city);
+  const sales = await loadAllParallel(sb, 'sales',
     'id, sale_date, total_amount, manager, partner_id, customer_id',
     perfFilters
   );
-  const sales = salesAll.filter(yearPostFilter);
 
   // ТОЛЬКО 4 активных менеджера. Все остальные имена (Сания, Алим, Асель, Саги, ...)
   // НЕ попадают в leaderboard. Их заказы остаются в БД, но не учитываются здесь.
@@ -3095,11 +3086,9 @@ export async function getManagerPerformance(req, opts = {}) {
     for (const m of ACTIVE_MANAGERS) {
       if (s.toLowerCase().includes(m.toLowerCase())) return m;
     }
-    return null; // unknown — отбрасываем
+    return null;
   }
 
-  // Расщепляем "Айтжан/Нурсултан" → ["Айтжан", "Нурсултан"]
-  // Каждому достаётся 1/N доли заказа и выручки.
   function splitManagers(raw) {
     if (!raw) return [];
     return String(raw)
@@ -3110,74 +3099,92 @@ export async function getManagerPerformance(req, opts = {}) {
       .filter(Boolean);
   }
 
-  const byManager = {};
+  // ── Группируем sales по году → внутри каждого года полный aggregate manager × month ──
+  // Структура:
+  //   bucketsByYear['2024'][managerName] = { orders, revenue, b2b_orders, b2c_orders,
+  //                                          first_date, last_date, by_month: {YYYY-MM: {revenue, orders}} }
+  const bucketsByYear = {};
+  const yearsSet = new Set();
   for (const s of sales) {
     const managers = splitManagers(s.manager);
     if (managers.length === 0) continue;
     const share = 1 / managers.length;
+    const year = s.sale_date ? s.sale_date.slice(0, 4) : null;
+    if (!year) continue;
+    yearsSet.add(year);
+    if (!bucketsByYear[year]) bucketsByYear[year] = {};
 
     for (const m of managers) {
-      if (!byManager[m]) byManager[m] = {
+      const yb = bucketsByYear[year];
+      if (!yb[m]) yb[m] = {
         name: m,
         orders: 0, revenue: 0, b2b_orders: 0, b2c_orders: 0,
         first_date: null, last_date: null, by_month: {},
         shared_orders: 0,
       };
-      const x = byManager[m];
+      const x = yb[m];
       x.orders += share;
       x.revenue += (s.total_amount || 0) * share;
       if (managers.length > 1) x.shared_orders++;
       if (s.partner_id) x.b2b_orders += share;
       else x.b2c_orders += share;
-      if (s.sale_date) {
-        if (!x.first_date || s.sale_date < x.first_date) x.first_date = s.sale_date;
-        if (!x.last_date || s.sale_date > x.last_date) x.last_date = s.sale_date;
-        const ym = s.sale_date.slice(0, 7);
-        if (!x.by_month[ym]) x.by_month[ym] = { revenue: 0, orders: 0 };
-        x.by_month[ym].revenue += (s.total_amount || 0) * share;
-        x.by_month[ym].orders += share;
+      if (!x.first_date || s.sale_date < x.first_date) x.first_date = s.sale_date;
+      if (!x.last_date || s.sale_date > x.last_date) x.last_date = s.sale_date;
+      const ym = s.sale_date.slice(0, 7);
+      if (!x.by_month[ym]) x.by_month[ym] = { revenue: 0, orders: 0 };
+      x.by_month[ym].revenue += (s.total_amount || 0) * share;
+      x.by_month[ym].orders += share;
+    }
+  }
+
+  // Build by_year: { '2024': { leaderboard, timeline (12 мес), kpi } }
+  const yearsPresent = [...yearsSet].sort();
+  const by_year = {};
+  for (const y of yearsPresent) {
+    const byManager = bucketsByYear[y] || {};
+    const months12 = Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`);
+
+    const timeline = months12.map(m => {
+      const row = { month: m };
+      for (const mname of Object.keys(byManager)) {
+        row[mname] = byManager[mname].by_month[m]?.revenue || 0;
       }
-    }
+      return row;
+    });
+
+    const leaderboard = Object.values(byManager)
+      .filter(m => m.orders >= 0.5) // 0.5 = одна shared половинка минимум
+      .map(m => ({
+        name: m.name,
+        orders: Math.round(m.orders * 10) / 10,
+        revenue: Math.round(m.revenue),
+        b2b_orders: Math.round(m.b2b_orders * 10) / 10,
+        b2c_orders: Math.round(m.b2c_orders * 10) / 10,
+        avg_check: m.orders > 0 ? Math.round(m.revenue / m.orders) : 0,
+        b2b_pct: m.orders > 0 ? Math.round(m.b2b_orders / m.orders * 100) : 0,
+        sparkline: months12.map(ym => m.by_month[ym]?.revenue || 0),
+        first_date: m.first_date,
+        last_date: m.last_date,
+      }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    const totalRevenue = leaderboard.reduce((s, m) => s + m.revenue, 0);
+    const totalOrders = leaderboard.reduce((s, m) => s + m.orders, 0);
+
+    by_year[y] = {
+      leaderboard,
+      timeline,
+      kpi: {
+        managers_count: leaderboard.length,
+        total_revenue: totalRevenue,
+        total_orders: Math.round(totalOrders * 10) / 10,
+        top_manager: leaderboard[0] || null,
+      },
+    };
   }
 
-  // Сборка timeline для multi-line chart.
-  // - years === ['all']: последние 12 месяцев с продажами
-  // - 1 год выбран: 12 месяцев этого года (даже пустые)
-  // - 2+ года: все месяцы этих годов в порядке возрастания (24, 36, ...)
-  let last12;
-  if (years.includes('all')) {
-    const allMonths = [...new Set(sales.map(s => s.sale_date?.slice(0, 7)).filter(Boolean))].sort();
-    last12 = allMonths.slice(-12);
-  } else {
-    const sorted = [...years].sort();
-    last12 = sorted.flatMap(y =>
-      Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`)
-    );
-  }
-  const timeline = last12.map(m => {
-    const row = { month: m };
-    for (const mname of Object.keys(byManager)) {
-      row[mname] = byManager[mname].by_month[m]?.revenue || 0;
-    }
-    return row;
-  });
-
-  const leaderboard = Object.values(byManager)
-    .filter(m => m.orders >= 1)
-    .map(m => ({
-      ...m,
-      orders: Math.round(m.orders * 10) / 10, // округляем (могут быть half-orders из split)
-      revenue: Math.round(m.revenue),
-      b2b_orders: Math.round(m.b2b_orders * 10) / 10,
-      b2c_orders: Math.round(m.b2c_orders * 10) / 10,
-      avg_check: m.orders > 0 ? Math.round(m.revenue / m.orders) : 0,
-      b2b_pct: m.orders > 0 ? Math.round(m.b2b_orders / m.orders * 100) : 0,
-      sparkline: last12.map(ym => m.by_month[ym]?.revenue || 0),
-    }))
-    .sort((a, b) => b.revenue - a.revenue)
-    .map(m => { delete m.by_month; return m; });
-
-  // Response time (если manager_analytics существует — try-catch)
+  // ── Response time — backend не group'ает по году (manager_analytics не имеет year-context).
+  // Показывается одинаково для всех year-выборов.
   let responseTimes = [];
   try {
     const { data } = await sb.from('manager_analytics')
@@ -3203,7 +3210,11 @@ export async function getManagerPerformance(req, opts = {}) {
     // manager_analytics может не существовать — это OK
   }
 
-  const result = { leaderboard, timeline, response_times: responseTimes };
+  const result = {
+    by_year,
+    years_present: yearsPresent,
+    response_times: responseTimes,
+  };
   cacheSet(ck, result);
   return result;
 }
