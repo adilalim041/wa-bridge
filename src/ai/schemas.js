@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CUSTOMER_TYPES } from './tagConstants.js';
+import { LEAD_SOURCE_ENUM } from './leadSourceConstants.js';
 
 // === Tool input schemas for chatEndpoint.js ===
 // Validated BEFORE any DB call — defense against hallucinated limits, injection via IDs,
@@ -81,10 +82,7 @@ export const DailyAnalysisSchema = z.object({
 
   lead_temperature: z.enum(['hot', 'warm', 'cold', 'dead']).catch('cold'),
 
-  lead_source: z.enum([
-    'instagram_ad', 'google_ad', 'word_of_mouth', 'repeat_client',
-    'designer_partner', 'showroom_visit', 'incoming_call', 'unknown',
-  ]).catch('unknown'),
+  lead_source: z.enum(LEAD_SOURCE_ENUM).catch('unknown'),
 
   customer_type: z.enum(CUSTOMER_TYPES).catch('unknown'),
 

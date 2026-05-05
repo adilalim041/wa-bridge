@@ -8,6 +8,7 @@ import {
   AI_AUTO_TAGS,
   resolveTag,
 } from './tagConstants.js';
+import { LEAD_SOURCE_PROMPT_LIST } from './leadSourceConstants.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -60,7 +61,7 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании ${BRAND} ${
 {
   "intent": "одно из: price_inquiry, complaint, availability, measurement_request, delivery, consultation, collaboration, small_talk, spam, other",
   "lead_temperature": "одно из: hot, warm, cold, dead",
-  "lead_source": "одно из: instagram_ad, google_ad, word_of_mouth, repeat_client, designer_partner, showroom_visit, incoming_call, unknown",
+  "lead_source": "одно из: ${LEAD_SOURCE_PROMPT_LIST}",
   "customer_type": "одно из: ${CUSTOMER_TYPE_PROMPT_LIST}",
   "dialog_topic": "одно из: sink_sale, faucet_sale, complaint, service, consultation, partnership, other",
   "deal_stage": "одно из: needs_review, first_contact, consultation, model_selection, price_negotiation, payment, delivery, completed, refused",
