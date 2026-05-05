@@ -993,17 +993,30 @@ export async function getSalesAnalytics(req, params = {}) {
   // потом items батчами по 500 (PostgREST .in() limit).
   let items;
   if (args.city && args.city !== 'all') {
-    // Используем уже загруженные sales — они уже city-filtered (addCityFilter выше)
+    // Используем уже загруженные sales — они уже city-filtered (addCityFilter выше).
+    //
+    // FIX 2026-05-04 (Bug B — empty pies): прежний код использовал .in('sale_id', [500 UUIDs])
+    // что давало URL ~18.5KB. PostgREST URL length limit ~16KB → запросы тихо
+    // failed на Астане (2955 sales × 6 batches), возвращая 0 items → pie chart пустой.
+    // Алматы (1711 sales) частично работал: последний меньший batch проходил.
+    //
+    // Решение: батчи по 100 UUIDs (URL ~3.7KB, well under limit) + range(0, 9999)
+    // чтобы default 1000-row cap не truncate'ал items в больших партиях.
     const cityFilteredSaleIds = sales.map(s => s.id).filter(Boolean);
     if (cityFilteredSaleIds.length === 0) {
       items = [];
     } else {
       const batches = [];
-      for (let i = 0; i < cityFilteredSaleIds.length; i += 500) {
-        batches.push(cityFilteredSaleIds.slice(i, i + 500));
+      for (let i = 0; i < cityFilteredSaleIds.length; i += 100) {
+        batches.push(cityFilteredSaleIds.slice(i, i + 100));
       }
       const batchResults = await Promise.all(
-        batches.map(batch => sb.from('sale_items').select('category, sale_id, amount').in('sale_id', batch))
+        batches.map(batch =>
+          sb.from('sale_items')
+            .select('category, sale_id, amount')
+            .in('sale_id', batch)
+            .range(0, 9999)
+        )
       );
       items = batchResults.flatMap(r => r.data || []);
     }
@@ -1513,10 +1526,15 @@ export async function getProductInsights(req, opts = {}) {
           const ids = citySales.map(s => s.id);
           if (ids.length === 0) return [];
           const batches = [];
-          for (let i = 0; i < ids.length; i += 200) batches.push(ids.slice(i, i + 200));
+          // FIX 2026-05-04 (Bug B): batch 100 UUIDs/req max — иначе URL > 16KB
+          // → PostgREST silently fails. См. getSalesAnalytics для подробного коммента.
+          for (let i = 0; i < ids.length; i += 100) batches.push(ids.slice(i, i + 100));
           const results = await Promise.all(
             batches.map(batch =>
-              sb.from('sale_items').select('sale_id, sku, raw_name, qty, amount, category').in('sale_id', batch)
+              sb.from('sale_items')
+                .select('sale_id, sku, raw_name, qty, amount, category')
+                .in('sale_id', batch)
+                .range(0, 9999)
             )
           );
           return results.flatMap(r => r.data || []);
