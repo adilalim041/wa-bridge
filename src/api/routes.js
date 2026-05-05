@@ -1240,7 +1240,31 @@ export function setupRoutes(app) {
     if (!kind || !FEEDBACK_KINDS.has(kind)) {
       return res.status(400).json({ error: `kind must be one of: ${[...FEEDBACK_KINDS].join(', ')}` });
     }
-    const cleanComment = typeof comment === 'string' ? comment.trim().slice(0, 2000) : null;
+    // H-3 audit fix 2026-05-04: sanitize feedback comment.
+    // Когда SKILL.md (daily-wa-analysis) читает chat_ai_feedback и инжектит в
+    // Claude prompt — известные LLM injection patterns (<system>...</system>,
+    // [INST]...[/INST], <<SYS>>) могут заставить модель игнорировать SKILL.md
+    // правила. Adil 2026-05-04: «менеджеры injection не делают, но subagent
+    // увидит — что injector сможет?» Реальный risk = corrupt 1 day analytics
+    // + cross-tenant в будущем (UORA SaaS template).
+    //
+    // Strategy: strip well-known injection tokens AT WRITE time. SKILL.md
+    // дополнительно XML-wrap'ает comment_ru при reading (см. SKILL.md шаг 0.5).
+    function sanitizeFeedbackComment(raw) {
+      if (typeof raw !== 'string') return null;
+      let s = raw.trim().slice(0, 2000);
+      // Strip prompt-injection markers (case-insensitive)
+      s = s.replace(/<\/?(system|user|assistant|inst|sys)>/gi, ' ');
+      s = s.replace(/<<\s*(system|sys|user|assistant)\s*>>/gi, ' ');
+      s = s.replace(/\[\/?(INST|SYS|SYSTEM)\]/gi, ' ');
+      s = s.replace(/\[\|im_(start|end)\|\]/gi, ' ');
+      s = s.replace(/\bignore\s+(all\s+)?(previous|above|prior)\s+(instructions|rules|prompts)/gi, '[redacted]');
+      s = s.replace(/\bдиссрегардируй\b|\bигнорируй\s+(все\s+)?(правила|инструкции|выше|предыдущие)/gi, '[redacted]');
+      // Collapse double spaces
+      s = s.replace(/\s+/g, ' ').trim();
+      return s || null;
+    }
+    const cleanComment = sanitizeFeedbackComment(comment);
     if (!cleanComment && kind === 'other') {
       return res.status(400).json({ error: 'comment required when kind=other' });
     }
