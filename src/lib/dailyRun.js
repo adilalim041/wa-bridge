@@ -179,6 +179,14 @@ export async function getPendingDialogs({
   if (out.length > 0) {
     const phoneOf = (jid) => {
       if (!jid || jid.includes('-') || jid.includes('120363')) return null;
+      // 2026-05-05 audit fix NEW-1 (same class as C-1): @lid format JIDs
+      // не содержат phone — это 14-15 digit internal WhatsApp identifier.
+      // Без этой проверки .replace(/[^0-9]/g, '') возвращал бы pseudo-phone
+      // (e.g. 205493331062950 from "205493331062950@lid") → silent miss
+      // в .in('primary_phone', [...]) для всех LID-клиентов
+      // (доминирующий формат new contacts в Baileys v7).
+      // Mirror'нуто из issues.js _phoneFromJid.
+      if (jid.includes('@lid')) return null;
       const digits = jid.replace(/[^0-9]/g, '');
       return digits || null;
     };
