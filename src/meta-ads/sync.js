@@ -824,11 +824,35 @@ export async function syncAds(adAccountId) {
 }
 
 /**
+ * Перечисляет даты от since до until включительно.
+ * @param {string} since "YYYY-MM-DD"
+ * @param {string} until "YYYY-MM-DD"
+ * @returns {string[]}
+ */
+function enumerateDates(since, until) {
+  const result = [];
+  const start = new Date(since + 'T00:00:00Z');
+  const end = new Date(until + 'T00:00:00Z');
+  for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    result.push(d.toISOString().slice(0, 10));
+  }
+  return result;
+}
+
+/**
  * Синхронизировать insights → UPSERT meta_insights_daily.
  *
- * Стратегия: один запрос на уровне ad_account с level=campaign/adset/ad.
- * time_increments=1 = разбивка по дням (один row = один день).
- * Явные since/until для воспроизводимости (не date_preset).
+ * Стратегия: ИТЕРАЦИЯ ПО ДНЯМ — для каждого дня делаем отдельный запрос
+ * с since=until=date. Meta агрегирует за этот день и возвращает row(s)
+ * со spend/impressions/clicks. date_start гарантированно = date.
+ *
+ * ПОЧЕМУ так: time_increments=1 ИГНОРИРУЕТСЯ Meta при level=campaign/adset/ad
+ * (подтверждено _test_insights.mjs 2026-05-05). Возвращает 1 строку на объект
+ * агрегированную за весь period — мы получали date_start = first day период
+ * вместо daily breakdown.
+ *
+ * Стоимость: 30 дней × 3 levels = 90 API-вызовов на backfill (вместо 3).
+ * В пределах rate limit (200/hour для dev tier).
  *
  * ВАЖНО: spend/cpm/cpc из /insights — MAJOR units (доллары).
  * В meta_insights_daily храним MINOR units (центы): умножаем ×100.
@@ -858,48 +882,67 @@ async function _syncInsights(adAccountId, accountUuid, opts = {}) {
       return d.toISOString().slice(0, 10);
     })();
 
-  logger.info({ since, until, levels }, 'meta-ads:sync: fetching insights');
+  // Перечисляем все даты в окне — будем дёргать Meta по одной за раз.
+  const dates = enumerateDates(since, until);
+  logger.info(
+    { since, until, days: dates.length, levels },
+    'meta-ads:sync: fetching insights day-by-day (time_increments ignored by Meta)'
+  );
 
   for (const level of levels) {
-    let insightsRows;
-    try {
-      // Один запрос за весь период с daily breakdown (time_increments=1).
-      // Meta возвращает одну строку на (объект × день).
-      // clicks = all interactions, inline_link_clicks = только клики по ссылке.
-      // (CTR gotcha: Meta clicks включает engagement — запрашиваем оба поля.)
-      // MAJOR units → ×100 для MINOR: spend/cpm/cpc умножаем в normalizeInsightsRow().
-      const levelIdField =
-        level === 'campaign' ? 'campaign_id,campaign_name' :
-        level === 'adset'    ? 'adset_id,adset_name' :
-                               'ad_id,ad_name';
+    let insightsRows = [];
+    let daysSucceeded = 0;
+    let daysFailed = 0;
 
-      insightsRows = await metaAdsClient.getInsights(adAccountId, {
-        level,
-        since,
-        until,
-        fields: `date_start,impressions,clicks,inline_link_clicks,spend,reach,frequency,ctr,cpm,cpc,actions,${levelIdField}`,
-        time_increments: 1, // daily breakdown — один row на (object × day)
-      });
-    } catch (err) {
-      const errType = classifyMetaError(err);
-      if (errType === 'token_expired') {
-        throw err; // Fatal — прерываем весь sync
-      }
-      if (errType === 'rate_limit') {
-        errors.push({
-          code: err.code,
-          message: `Rate limit on insights level=${level}: ${err.message}`,
-          objectId: `${adAccountId}/${level}`,
+    const levelIdField =
+      level === 'campaign' ? 'campaign_id,campaign_name' :
+      level === 'adset'    ? 'adset_id,adset_name' :
+                             'ad_id,ad_name';
+
+    // Каждый день — отдельный запрос с since=until=date.
+    // Meta агрегирует за этот день, возвращает row на каждый объект который
+    // delivered в этот день. date_start === date.
+    for (const date of dates) {
+      try {
+        const dayRows = await metaAdsClient.getInsights(adAccountId, {
+          level,
+          since: date,
+          until: date,
+          fields: `date_start,impressions,clicks,inline_link_clicks,spend,reach,frequency,ctr,cpm,cpc,actions,${levelIdField}`,
+          // НЕ передаём time_increments — Meta его игнорирует для object-levels.
+          // single-day since=until даёт правильную агрегацию за этот день.
+          maxRecords: 50000, // иначе default cap=500 порежет большие дни
         });
-        logger.warn({ level, errCode: err.code }, 'meta-ads:sync: rate limit on insights — continuing with next level');
-        continue;
+        insightsRows.push(...(dayRows ?? []));
+        daysSucceeded++;
+      } catch (err) {
+        const errType = classifyMetaError(err);
+        if (errType === 'token_expired') {
+          throw err; // Fatal
+        }
+        // Rate limit или другая ошибка на конкретном дне — пропускаем,
+        // продолжаем со следующим днём. Финальный status = 'partial'.
+        daysFailed++;
+        errors.push({
+          code: err.code ?? 'INTERNAL',
+          message: `Insights ${level} ${date}: ${err.message}`,
+          objectId: `${adAccountId}/${level}/${date}`,
+        });
+        if (errType === 'rate_limit') {
+          logger.warn(
+            { level, date, errCode: err.code },
+            'meta-ads:sync: rate limit on day — continuing'
+          );
+        }
       }
-      // Другая ошибка — логируем как partial
-      errors.push({ code: err.code ?? 'INTERNAL', message: err.message, objectId: `${adAccountId}/${level}` });
-      continue;
     }
 
-    if (!insightsRows || insightsRows.length === 0) {
+    logger.info(
+      { level, totalRows: insightsRows.length, daysSucceeded, daysFailed },
+      'meta-ads:sync: insights collected for level'
+    );
+
+    if (insightsRows.length === 0) {
       logger.info({ level }, 'meta-ads:sync: no insights data for level');
       continue;
     }
