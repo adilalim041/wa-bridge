@@ -25,6 +25,7 @@ import * as salesCrm from '../lib/salesCrm.js';
 import * as salesCrmExtras from '../lib/salesCrmExtras.js';
 import * as dailyRun from '../lib/dailyRun.js';
 import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
+import { metaAdsRouter } from '../meta-ads/api.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -5224,6 +5225,11 @@ export function setupRoutes(app) {
       return res.status(500).json({ error: 'Failed to delete template' });
     }
   });
+
+  // Meta Ads API — all 5 endpoints under /meta-ads/*.
+  // Auth is already enforced by the global middleware in server.js (Bearer JWT
+  // or x-api-key). The router itself contains only business logic.
+  app.use('/meta-ads', metaAdsRouter);
 
   app.use('/', router);
 }
