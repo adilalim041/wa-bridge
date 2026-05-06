@@ -458,13 +458,16 @@ export const metaAdsClient = {
     const id = resolveAccountId(adAccountId);
     const fields =
       opts.fields ??
-      'id,name,objective,status,daily_budget,lifetime_budget,created_time';
+      'id,name,objective,status,effective_status,daily_budget,lifetime_budget,created_time';
     return collectAllPages(
       `/${id}/campaigns`,
       {
         fields,
         limit: opts.limit ?? 100,
         ...(opts.after ? { after: opts.after } : {}),
+        // effective_status filter — фильтрует только кампании с нужным статусом
+        // (учитывает иерархию статусов, не то же что status)
+        ...(opts.effectiveStatus ? { effective_status: opts.effectiveStatus } : {}),
       },
       { maxRecords: opts.maxRecords }
     );
@@ -483,7 +486,7 @@ export const metaAdsClient = {
     const id = resolveAccountId(adAccountId);
     const fields =
       opts.fields ??
-      'id,name,campaign_id,status,daily_budget,lifetime_budget,' +
+      'id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,' +
         'optimization_goal,billing_event,bid_strategy,targeting,promoted_object,' +
         'is_dynamic_creative,schedule_start_time,schedule_end_time';
     return collectAllPages(
@@ -492,6 +495,9 @@ export const metaAdsClient = {
         fields,
         limit: opts.limit ?? 100,
         ...(opts.after ? { after: opts.after } : {}),
+        ...(opts.effectiveStatus ? { effective_status: opts.effectiveStatus } : {}),
+        // campaign_id filter — только adsets конкретной кампании
+        ...(opts.campaignId ? { campaign_id: opts.campaignId } : {}),
       },
       { maxRecords: opts.maxRecords }
     );
@@ -509,13 +515,16 @@ export const metaAdsClient = {
     assertEnabled();
     const id = resolveAccountId(adAccountId);
     const fields =
-      opts.fields ?? 'id,name,adset_id,campaign_id,creative,status,created_time';
+      opts.fields ?? 'id,name,adset_id,campaign_id,creative,status,effective_status,created_time';
     return collectAllPages(
       `/${id}/ads`,
       {
         fields,
         limit: opts.limit ?? 100,
         ...(opts.after ? { after: opts.after } : {}),
+        ...(opts.effectiveStatus ? { effective_status: opts.effectiveStatus } : {}),
+        // campaign_id filter — только ads конкретной кампании
+        ...(opts.campaignId ? { campaign_id: opts.campaignId } : {}),
       },
       { maxRecords: opts.maxRecords }
     );
@@ -587,7 +596,38 @@ export const metaAdsClient = {
     // Без этого Meta агрегирует весь period в одну строку.
     if (opts.time_increments != null) params.time_increments = opts.time_increments;
 
-    return collectAllPages(`/${objectId}/insights`, params);
+    return collectAllPages(`/${objectId}/insights`, params, { maxRecords: opts.maxRecords });
+  },
+
+  // ------------------------------------------------------------------
+  // /<creative_id> — детали одного креатива (lazy fetch)
+  // ------------------------------------------------------------------
+  /**
+   * Получить полные данные одного креатива включая object_story_spec.
+   *
+   * ВАЖНО: object_story_spec НЕ запрашивается в bulk-fetch (/adcreatives),
+   * так как Meta возвращает error #100 "Please reduce the amount of data"
+   * даже при limit=25. Однако per-creative запрос проходит нормально.
+   * Подтверждено на Omoikiri 2026-05-05.
+   * (см. meta-marketing-api.md, раздел Risks: "Please reduce the amount of data")
+   *
+   * Использование: при клике на конкретный ad в UI для lazy-fetch WA-деталей.
+   * Не вызывать в циклах — каждый вызов = отдельный API request.
+   *
+   * @param {string} creativeId — Meta creative ID (числовая строка)
+   * @param {object} [opts]
+   * @param {string} [opts.fields] — переопределить поля запроса
+   * @returns {Promise<object>} — raw Meta creative object
+   */
+  async getCreative(creativeId, opts = {}) {
+    assertEnabled();
+    if (!creativeId) throw new Error('creativeId is required for getCreative');
+
+    const fields =
+      opts.fields ??
+      'id,name,title,body,call_to_action_type,image_url,thumbnail_url,video_id,object_story_spec';
+
+    return request(`/${creativeId}`, { fields });
   },
 
   // ------------------------------------------------------------------

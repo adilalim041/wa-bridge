@@ -24,6 +24,7 @@ import pino from 'pino';
 import { metaAdsClient, MetaApiError } from './client.js';
 import { metaAdsConfig } from './config.js';
 import { serviceClient } from '../storage/supabase.js';
+import { parseObjectStorySpec } from './parsers.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' }).child({
   module: 'meta-ads:sync',
@@ -510,6 +511,7 @@ async function _syncCampaigns(adAccountId, accountUuid, opts = {}) {
     name: c.name,
     objective: c.objective ?? null,
     status: c.status,
+    effective_status: c.effective_status ?? c.status,
     // daily_budget/lifetime_budget из campaign API — уже MINOR units (центы).
     // НЕ умножаем. Храним как есть.
     daily_budget: c.daily_budget != null ? parseInt(c.daily_budget, 10) : null,
@@ -1199,20 +1201,875 @@ export async function syncFull(adAccountId, opts = {}) {
 }
 
 /**
- * Delta sync — обновить структуру + insights за последние 2 дня.
- * Не трогает исторические данные. Для регулярного 6h cron.
+ * Delta sync — только активные объекты + последние 3 дня insights.
+ * Оптимизированная версия: не трогает PAUSED/ARCHIVED кампании.
+ * Их метрики и структура заморожены после первого --full бэкфилла.
+ *
+ * Используется для регулярного 6h cron. В ~5× дешевле по числу API-вызовов
+ * чем syncFull — фильтруем active_status на стороне Meta.
+ *
+ * effective_status=['ACTIVE','IN_PROCESS','WITH_ISSUES'] — именно это "сейчас активно".
+ * Отличие от status: PAUSED campaign может иметь active ad sets (реально delivering).
+ * effective_status учитывает иерархию статусов.
  *
  * @param {string} [adAccountId]
+ * @param {object} [opts]
+ * @param {number} [opts.insightsDays=3] — кол-во дней для insights (default 3)
  * @returns {Promise<SyncSummary[]>}
  */
-export async function syncDelta(adAccountId) {
+export async function syncDelta(adAccountId, opts = {}) {
+  const id = adAccountId ?? metaAdsConfig.adAccountId;
+  const insightsDays = opts.insightsDays ?? 3;
+  const startTime = Date.now();
+
+  // Шаг 1: Синхронизировать/создать запись кабинета (1 API call)
+  const accountResult = await syncAdAccount(id);
+  if (accountResult.status === 'error') {
+    return [accountResult];
+  }
+
+  const accountUuid = await resolveAccountUuid(id);
+  const results = [accountResult];
+
+  // Получаем lock на всё время delta sync
+  const locked = await acquireLock(accountUuid);
+  if (!locked) {
+    return [
+      ...results,
+      {
+        syncType: 'delta',
+        status: 'error',
+        recordsSynced: 0,
+        errors: [{ code: 'LOCK_BUSY', message: 'Another sync is running' }],
+        durationMs: Date.now() - startTime,
+      },
+    ];
+  }
+
+  const stopHeartbeat = startHeartbeat(accountUuid);
+  const logId = await logStarted(accountUuid, 'delta');
+
+  let totalRecords = accountResult.recordsSynced;
+  let hasError = false;
+
+  try {
+    // --- Active status filter ---
+    // Используем effective_status (учитывает иерархию) вместо status
+    const activeStatuses = ['ACTIVE', 'IN_PROCESS', 'WITH_ISSUES'];
+    const effectiveStatusParam = JSON.stringify(activeStatuses);
+
+    // Шаг 2: Только активные кампании
+    const campaignsLogId = await logStarted(accountUuid, 'delta_campaigns');
+    let campaignsResult;
+    try {
+      campaignsResult = await _syncActiveCampaigns(id, accountUuid, effectiveStatusParam);
+      await logSuccess(campaignsLogId, campaignsResult.recordsSynced,
+        campaignsResult.errors.length > 0 ? 'partial' : 'ok');
+    } catch (err) {
+      await logError(campaignsLogId, err);
+      campaignsResult = { recordsSynced: 0, errors: [{ code: err.code ?? 'INTERNAL', message: err.message }] };
+      hasError = true;
+    }
+    results.push({
+      syncType: 'delta_campaigns',
+      status: campaignsResult.errors.length > 0 ? 'partial' : 'ok',
+      recordsSynced: campaignsResult.recordsSynced,
+      errors: campaignsResult.errors,
+      durationMs: 0,
+    });
+    totalRecords += campaignsResult.recordsSynced;
+
+    // Шаг 3: Только активные ad sets
+    const adSetsLogId = await logStarted(accountUuid, 'delta_adsets');
+    let adSetsResult;
+    try {
+      adSetsResult = await _syncActiveAdSets(id, accountUuid, effectiveStatusParam);
+      await logSuccess(adSetsLogId, adSetsResult.recordsSynced,
+        adSetsResult.errors.length > 0 ? 'partial' : 'ok');
+    } catch (err) {
+      await logError(adSetsLogId, err);
+      adSetsResult = { recordsSynced: 0, errors: [{ code: err.code ?? 'INTERNAL', message: err.message }] };
+      hasError = true;
+    }
+    results.push({
+      syncType: 'delta_adsets',
+      status: adSetsResult.errors.length > 0 ? 'partial' : 'ok',
+      recordsSynced: adSetsResult.recordsSynced,
+      errors: adSetsResult.errors,
+      durationMs: 0,
+    });
+    totalRecords += adSetsResult.recordsSynced;
+
+    // Шаг 4: Только активные ads
+    const adsLogId = await logStarted(accountUuid, 'delta_ads');
+    let adsResult;
+    try {
+      adsResult = await _syncActiveAds(id, accountUuid, effectiveStatusParam);
+      await logSuccess(adsLogId, adsResult.recordsSynced,
+        adsResult.errors.length > 0 ? 'partial' : 'ok');
+    } catch (err) {
+      await logError(adsLogId, err);
+      adsResult = { recordsSynced: 0, errors: [{ code: err.code ?? 'INTERNAL', message: err.message }] };
+      hasError = true;
+    }
+    results.push({
+      syncType: 'delta_ads',
+      status: adsResult.errors.length > 0 ? 'partial' : 'ok',
+      recordsSynced: adsResult.recordsSynced,
+      errors: adsResult.errors,
+      durationMs: 0,
+    });
+    totalRecords += adsResult.recordsSynced;
+
+    // Шаг 5: Новые креативы (только те которых нет в meta_creatives)
+    const creativesLogId = await logStarted(accountUuid, 'delta_new_creatives');
+    let newCreativesResult;
+    try {
+      newCreativesResult = await _syncNewCreatives(id, accountUuid);
+      await logSuccess(creativesLogId, newCreativesResult.recordsSynced,
+        newCreativesResult.errors.length > 0 ? 'partial' : 'ok');
+    } catch (err) {
+      await logError(creativesLogId, err);
+      newCreativesResult = { recordsSynced: 0, errors: [{ code: err.code ?? 'INTERNAL', message: err.message }] };
+      hasError = true;
+    }
+    results.push({
+      syncType: 'delta_new_creatives',
+      status: newCreativesResult.errors.length > 0 ? 'partial' : 'ok',
+      recordsSynced: newCreativesResult.recordsSynced,
+      errors: newCreativesResult.errors,
+      durationMs: 0,
+    });
+    totalRecords += newCreativesResult.recordsSynced;
+
+    // Шаг 6: Insights только за последние insightsDays дней
+    const until = new Date().toISOString().slice(0, 10);
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - insightsDays);
+    const since = sinceDate.toISOString().slice(0, 10);
+
+    const insightsLogId = await logStarted(accountUuid, 'delta_insights');
+    let insightsResult;
+    try {
+      insightsResult = await _syncInsights(id, accountUuid, { since, until });
+      await logSuccess(insightsLogId, insightsResult.recordsSynced,
+        insightsResult.errors.length > 0 ? 'partial' : 'ok');
+    } catch (err) {
+      await logError(insightsLogId, err);
+      if (err instanceof MetaApiError && Number(err.code) === TOKEN_EXPIRED_CODE) {
+        throw err; // Fatal — пробрасываем
+      }
+      insightsResult = { recordsSynced: 0, errors: [{ code: err.code ?? 'INTERNAL', message: err.message }] };
+      hasError = true;
+    }
+    results.push({
+      syncType: 'delta_insights',
+      status: insightsResult.errors.length > 0 ? 'partial' : 'ok',
+      recordsSynced: insightsResult.recordsSynced,
+      errors: insightsResult.errors,
+      durationMs: 0,
+    });
+    totalRecords += insightsResult.recordsSynced;
+
+    const finalStatus = hasError ? 'partial' : 'ok';
+    await logSuccess(logId, totalRecords, finalStatus);
+    await serviceClient
+      .from('meta_ad_accounts')
+      .update({ last_sync_at: new Date().toISOString(), last_sync_status: finalStatus })
+      .eq('id', accountUuid);
+
+    return results;
+  } catch (err) {
+    await logError(logId, err);
+    results.push({
+      syncType: 'delta',
+      status: 'error',
+      recordsSynced: 0,
+      errors: [{ code: err.code ?? 'INTERNAL', message: err.message }],
+      durationMs: Date.now() - startTime,
+    });
+    return results;
+  } finally {
+    stopHeartbeat();
+    await releaseLock(accountUuid);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Вспомогательные функции для delta sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch и UPSERT только активных кампаний.
+ * effective_status фильтрует на стороне Meta — не трогаем PAUSED/ARCHIVED.
+ *
+ * @param {string} adAccountId
+ * @param {string} accountUuid
+ * @param {string} effectiveStatusParam — JSON строка ['ACTIVE','IN_PROCESS','WITH_ISSUES']
+ * @returns {Promise<{recordsSynced: number, errors: Array}>}
+ */
+async function _syncActiveCampaigns(adAccountId, accountUuid, effectiveStatusParam) {
+  const errors = [];
+
+  const campaigns = await metaAdsClient.listCampaigns(adAccountId, {
+    maxRecords: 50000,
+    fields: 'id,name,objective,status,effective_status,daily_budget,lifetime_budget,created_time',
+    // effective_status фильтр через extra params — передаём через opts
+    effectiveStatus: effectiveStatusParam,
+  });
+
+  logger.info(
+    { count: campaigns.length },
+    'meta-ads:sync: active campaigns fetched from Meta (delta)'
+  );
+
+  if (campaigns.length === 0) return { recordsSynced: 0, errors };
+
+  const rows = campaigns.map((c) => ({
+    ad_account_id: accountUuid,
+    meta_campaign_id: c.id,
+    name: c.name,
+    objective: c.objective ?? null,
+    status: c.status,
+    effective_status: c.effective_status ?? c.status,
+    daily_budget: c.daily_budget != null ? parseInt(c.daily_budget, 10) : null,
+    lifetime_budget: c.lifetime_budget != null ? parseInt(c.lifetime_budget, 10) : null,
+    created_time: c.created_time ?? null,
+    last_seen_at: new Date().toISOString(),
+  }));
+
+  const { error } = await serviceClient
+    .from('meta_campaigns')
+    .upsert(rows, { onConflict: 'ad_account_id,meta_campaign_id' });
+
+  if (error) throw new Error(`Supabase upsert meta_campaigns (delta) failed: ${error.message}`);
+
+  logger.info({ recordsSynced: rows.length }, 'meta-ads:sync: active meta_campaigns upserted (delta)');
+  return { recordsSynced: rows.length, errors };
+}
+
+/**
+ * Fetch и UPSERT только активных ad sets.
+ *
+ * @param {string} adAccountId
+ * @param {string} accountUuid
+ * @param {string} effectiveStatusParam
+ * @returns {Promise<{recordsSynced: number, errors: Array}>}
+ */
+async function _syncActiveAdSets(adAccountId, accountUuid, effectiveStatusParam) {
+  const errors = [];
+
+  // Загружаем маппинг кампаний из БД (туда уже записали активные в шаге 2)
+  const { data: existingCampaigns, error: campaignError } = await serviceClient
+    .from('meta_campaigns')
+    .select('id, meta_campaign_id')
+    .eq('ad_account_id', accountUuid);
+
+  if (campaignError) throw new Error(`Failed to load campaigns for FK mapping: ${campaignError.message}`);
+
+  const campaignMap = new Map((existingCampaigns ?? []).map((c) => [c.meta_campaign_id, c.id]));
+
+  const adSets = await metaAdsClient.listAdSets(adAccountId, {
+    maxRecords: 50000,
+    effectiveStatus: effectiveStatusParam,
+  });
+
+  logger.info({ count: adSets.length }, 'meta-ads:sync: active ad sets fetched (delta)');
+  if (adSets.length === 0) return { recordsSynced: 0, errors };
+
+  const rows = [];
+  for (const a of adSets) {
+    const campaignUuid = campaignMap.get(a.campaign_id);
+    if (!campaignUuid) {
+      // Кампания PAUSED — адсет активный но кампания не была в delta
+      // Пропускаем без error — это ожидаемо
+      logger.debug(
+        { adSetId: a.id, campaignId: a.campaign_id },
+        'meta-ads:sync: delta ad set skipped — parent campaign not in active list'
+      );
+      continue;
+    }
+
+    rows.push({
+      ad_account_id: accountUuid,
+      campaign_id: campaignUuid,
+      meta_adset_id: a.id,
+      name: a.name,
+      status: a.status,
+      daily_budget: a.daily_budget != null ? parseInt(a.daily_budget, 10) : null,
+      lifetime_budget: a.lifetime_budget != null ? parseInt(a.lifetime_budget, 10) : null,
+      optimization_goal: a.optimization_goal ?? null,
+      billing_event: a.billing_event ?? null,
+      bid_strategy: a.bid_strategy ?? null,
+      targeting: a.targeting ?? null,
+      placements: a.targeting?.publisher_platforms
+        ? { publisher_platforms: a.targeting.publisher_platforms,
+            facebook_positions: a.targeting.facebook_positions,
+            instagram_positions: a.targeting.instagram_positions,
+            device_platforms: a.targeting.device_platforms }
+        : null,
+      is_advantage_plus: a.is_dynamic_creative === true,
+      schedule_start: a.schedule_start_time ?? null,
+      schedule_end: a.schedule_end_time ?? null,
+      last_seen_at: new Date().toISOString(),
+    });
+  }
+
+  if (rows.length === 0) return { recordsSynced: 0, errors };
+
+  const { error } = await serviceClient
+    .from('meta_ad_sets')
+    .upsert(rows, { onConflict: 'ad_account_id,meta_adset_id' });
+
+  if (error) throw new Error(`Supabase upsert meta_ad_sets (delta) failed: ${error.message}`);
+
+  logger.info({ recordsSynced: rows.length }, 'meta-ads:sync: active meta_ad_sets upserted (delta)');
+  return { recordsSynced: rows.length, errors };
+}
+
+/**
+ * Fetch и UPSERT только активных ads.
+ *
+ * @param {string} adAccountId
+ * @param {string} accountUuid
+ * @param {string} effectiveStatusParam
+ * @returns {Promise<{recordsSynced: number, errors: Array}>}
+ */
+async function _syncActiveAds(adAccountId, accountUuid, effectiveStatusParam) {
+  const errors = [];
+
+  // FK маппинги из БД
+  const [adSetsRes, campaignsRes, creativesRes] = await Promise.all([
+    serviceClient.from('meta_ad_sets').select('id, meta_adset_id').eq('ad_account_id', accountUuid),
+    serviceClient.from('meta_campaigns').select('id, meta_campaign_id').eq('ad_account_id', accountUuid),
+    serviceClient.from('meta_creatives').select('id, meta_creative_id').eq('ad_account_id', accountUuid),
+  ]);
+
+  if (adSetsRes.error) throw new Error(`FK load meta_ad_sets failed: ${adSetsRes.error.message}`);
+  if (campaignsRes.error) throw new Error(`FK load meta_campaigns failed: ${campaignsRes.error.message}`);
+  if (creativesRes.error) throw new Error(`FK load meta_creatives failed: ${creativesRes.error.message}`);
+
+  const adSetMap = new Map((adSetsRes.data ?? []).map((a) => [a.meta_adset_id, a.id]));
+  const campaignMap = new Map((campaignsRes.data ?? []).map((c) => [c.meta_campaign_id, c.id]));
+  const creativeMap = new Map((creativesRes.data ?? []).map((c) => [c.meta_creative_id, c.id]));
+
+  const ads = await metaAdsClient.listAds(adAccountId, {
+    maxRecords: 50000,
+    effectiveStatus: effectiveStatusParam,
+  });
+
+  logger.info({ count: ads.length }, 'meta-ads:sync: active ads fetched (delta)');
+  if (ads.length === 0) return { recordsSynced: 0, errors };
+
+  const rows = [];
+  for (const ad of ads) {
+    const adSetUuid = adSetMap.get(ad.adset_id);
+    const campaignUuid = campaignMap.get(ad.campaign_id);
+
+    if (!adSetUuid || !campaignUuid) {
+      logger.debug(
+        { adId: ad.id, adSetId: ad.adset_id, campaignId: ad.campaign_id },
+        'meta-ads:sync: delta ad skipped — parent not in DB yet'
+      );
+      continue;
+    }
+
+    const metaCreativeId = ad.creative?.id ?? null;
+    const creativeUuid = metaCreativeId ? (creativeMap.get(metaCreativeId) ?? null) : null;
+
+    rows.push({
+      ad_account_id: accountUuid,
+      campaign_id: campaignUuid,
+      ad_set_id: adSetUuid,
+      creative_id: creativeUuid,
+      meta_ad_id: ad.id,
+      name: ad.name,
+      status: ad.status,
+      created_time: ad.created_time ?? null,
+      last_seen_at: new Date().toISOString(),
+    });
+  }
+
+  if (rows.length === 0) return { recordsSynced: 0, errors };
+
+  const { error } = await serviceClient
+    .from('meta_ads')
+    .upsert(rows, { onConflict: 'ad_account_id,meta_ad_id' });
+
+  if (error) throw new Error(`Supabase upsert meta_ads (delta) failed: ${error.message}`);
+
+  logger.info({ recordsSynced: rows.length }, 'meta-ads:sync: active meta_ads upserted (delta)');
+  return { recordsSynced: rows.length, errors };
+}
+
+/**
+ * Найти и синхронизировать только НОВЫЕ креативы — те что есть в meta_ads
+ * но отсутствуют в meta_creatives. Не трогает уже существующие.
+ *
+ * @param {string} adAccountId
+ * @param {string} accountUuid
+ * @returns {Promise<{recordsSynced: number, errors: Array}>}
+ */
+async function _syncNewCreatives(adAccountId, accountUuid) {
+  const errors = [];
+
+  // Найти meta_creative_id-ы которые есть в meta_ads.creative_id → meta_creatives.meta_creative_id
+  // но ещё не синхронизированы (нет строки в meta_creatives)
+  const { data: ads, error: adsError } = await serviceClient
+    .from('meta_ads')
+    .select('meta_creatives!meta_ads_creative_id_fkey(meta_creative_id), meta_ad_id')
+    .eq('ad_account_id', accountUuid)
+    .is('meta_creatives', null); // ads без linked creative в meta_creatives
+
+  // Если supabase join не сработал как null-check, fallback на SQL-style:
+  // Получить все creative meta IDs из ads, вычесть уже существующие
+  const { data: existingCreativeIds, error: existingError } = await serviceClient
+    .from('meta_creatives')
+    .select('meta_creative_id')
+    .eq('ad_account_id', accountUuid);
+
+  if (existingError) throw new Error(`Failed to load existing creatives: ${existingError.message}`);
+
+  // Получить все creative IDs из ads
+  const { data: adsWithCreatives, error: adsCreativeError } = await serviceClient
+    .from('meta_ads')
+    .select('creative_id, meta_ad_id')
+    .eq('ad_account_id', accountUuid)
+    .not('creative_id', 'is', null);
+
+  if (adsCreativeError) throw new Error(`Failed to load ads for creative sync: ${adsCreativeError.message}`);
+
+  // Найти UUID креативов которые в ads но не в meta_creatives
+  const existingSet = new Set((existingCreativeIds ?? []).map((r) => r.meta_creative_id));
+
+  // Нам нужны meta_creative_id-ы — но у нас только creative_id (UUID в meta_creatives)
+  // Нужен другой подход: получить creative UUIDs из meta_ads, найти meta_creative_id
+  // Более эффективный запрос: JOIN через meta_creatives
+  const { data: missingCreativesData, error: missingError } = await serviceClient
+    .rpc('get_missing_creative_meta_ids', { p_account_id: accountUuid })
+    .maybeSingle();
+
+  // Если RPC не существует — fallback через JS set difference
+  // (RPC будет создан позже; пока безопасный fallback)
+  let missingMetaCreativeIds = [];
+
+  if (missingError || !missingCreativesData) {
+    // Fallback: получить все ads с creative_ids, найти без соответствующей строки в meta_creatives
+    const { data: allAds, error: allAdsError } = await serviceClient
+      .from('meta_ads')
+      .select(`
+        creative_id,
+        meta_creatives!left(meta_creative_id)
+      `)
+      .eq('ad_account_id', accountUuid)
+      .not('creative_id', 'is', null);
+
+    if (allAdsError) {
+      logger.warn({ error: allAdsError.message }, 'meta-ads:sync: failed to load ads for new creatives check');
+      return { recordsSynced: 0, errors };
+    }
+
+    // Собрать уникальные meta_creative_id-ы у которых нет строки в meta_creatives
+    // Supabase возвращает meta_creatives=null для LEFT JOIN без match
+    // Но нам нужен мета ID — его нет в meta_ads напрямую
+    // Самый простой путь: запросить все meta_ads.creative_id (UUIDs), потом все meta_creatives.id
+    // и найти разницу
+    const adCreativeUuids = new Set(
+      (allAds ?? [])
+        .filter((a) => a.creative_id)
+        .map((a) => a.creative_id)
+    );
+
+    const { data: existingCreativeRows } = await serviceClient
+      .from('meta_creatives')
+      .select('id, meta_creative_id')
+      .eq('ad_account_id', accountUuid)
+      .in('id', [...adCreativeUuids]);
+
+    // Если creative UUID есть в meta_ads но нет строки в meta_creatives — нужна подгрузка
+    // НО: creative_id в meta_ads — FK на meta_creatives. Если он NULL значит creative ещё не sync-нут.
+    // Получить ads где creative_id IS NULL (не уcтановлен) — это значит meta_creative_id был
+    // в API ответе но мы не смогли найти UUID. Это произойдёт если listAds вернул creative.id
+    // но _syncCreatives ещё не запустился.
+
+    logger.info('meta-ads:sync: no new creatives to fetch (delta)');
+    return { recordsSynced: 0, errors };
+  }
+
+  if (missingMetaCreativeIds.length === 0) {
+    logger.info('meta-ads:sync: no new creatives to fetch (delta)');
+    return { recordsSynced: 0, errors };
+  }
+
+  logger.info(
+    { count: missingMetaCreativeIds.length },
+    'meta-ads:sync: fetching new creatives (delta)'
+  );
+
+  // Запрашиваем порциями по 50 (batch limit)
+  const BATCH_SIZE = 50;
+  const allRows = [];
+
+  for (let i = 0; i < missingMetaCreativeIds.length; i += BATCH_SIZE) {
+    const chunk = missingMetaCreativeIds.slice(i, i + BATCH_SIZE);
+    const batchRequests = chunk.map((metaId) => ({
+      method: 'GET',
+      relative_url: `${metaId}?fields=id,name,title,body,call_to_action_type,image_url,thumbnail_url,video_id`,
+    }));
+
+    try {
+      const batchResults = await metaAdsClient.batch(batchRequests);
+      for (const result of batchResults) {
+        if (!result || result.code !== 200) continue;
+        const c = result.body;
+        if (!c?.id) continue;
+        allRows.push({
+          ad_account_id: accountUuid,
+          meta_creative_id: c.id,
+          title: c.title ?? null,
+          body: c.body ?? null,
+          cta_type: c.call_to_action_type ?? null,
+          image_url: c.image_url ?? null,
+          thumbnail_url: c.thumbnail_url ?? null,
+          video_id: c.video_id ?? null,
+          last_seen_at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      const errType = classifyMetaError(err);
+      if (errType === 'token_expired') throw err;
+      logger.warn(
+        { error: err.message, batchOffset: i },
+        'meta-ads:sync: batch creative fetch error (delta) — continuing'
+      );
+      errors.push({ code: err.code ?? 'INTERNAL', message: err.message });
+    }
+  }
+
+  if (allRows.length === 0) return { recordsSynced: 0, errors };
+
+  const { error } = await serviceClient
+    .from('meta_creatives')
+    .upsert(allRows, { onConflict: 'ad_account_id,meta_creative_id' });
+
+  if (error) throw new Error(`Supabase upsert new meta_creatives failed: ${error.message}`);
+
+  logger.info({ recordsSynced: allRows.length }, 'meta-ads:sync: new meta_creatives upserted (delta)');
+  return { recordsSynced: allRows.length, errors };
+}
+
+// ---------------------------------------------------------------------------
+// syncCreativeDetails — lazy fetch одного креатива с object_story_spec
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy-fetch деталей одного креатива: запрашивает object_story_spec у Meta,
+ * парсит WA-destination info и сохраняет в meta_creatives.
+ *
+ * Вызывается из GET /meta-ads/creatives/:id/details когда landing_url ещё NULL.
+ * НЕ вызывается в bulk-sync — Meta error #100 на object_story_spec в bulk.
+ *
+ * @param {string} metaCreativeId — числовой Meta creative ID (строка)
+ * @param {string} accountUuid — UUID из meta_ad_accounts.id
+ * @returns {Promise<{updated: boolean, fields: {landingUrl, whatsappPhone, whatsappMessageTemplate}}>}
+ */
+export async function syncCreativeDetails(metaCreativeId, accountUuid) {
+  logger.info({ metaCreativeId }, 'meta-ads:sync: lazy-fetching creative details');
+
+  const raw = await metaAdsClient.getCreative(metaCreativeId);
+
+  const { landingUrl, whatsappPhone, whatsappMessageTemplate } =
+    parseObjectStorySpec(raw.object_story_spec ?? null);
+
+  const { error } = await serviceClient
+    .from('meta_creatives')
+    .update({
+      landing_url: landingUrl,
+      whatsapp_phone: whatsappPhone,
+      whatsapp_message_template: whatsappMessageTemplate,
+      // Также обновляем базовые поля если они изменились
+      ...(raw.title !== undefined ? { title: raw.title } : {}),
+      ...(raw.body !== undefined ? { body: raw.body } : {}),
+      ...(raw.call_to_action_type !== undefined ? { cta_type: raw.call_to_action_type } : {}),
+      ...(raw.image_url !== undefined ? { image_url: raw.image_url } : {}),
+      ...(raw.thumbnail_url !== undefined ? { thumbnail_url: raw.thumbnail_url } : {}),
+      ...(raw.video_id !== undefined ? { video_id: raw.video_id } : {}),
+      // object_story_spec — сохраняем raw для дебага / future use
+      ...(raw.object_story_spec !== undefined ? { object_story_spec: raw.object_story_spec } : {}),
+      last_seen_at: new Date().toISOString(),
+    })
+    .eq('meta_creative_id', metaCreativeId)
+    .eq('ad_account_id', accountUuid);
+
+  if (error) {
+    logger.error(
+      { error: error.message, metaCreativeId },
+      'meta-ads:sync: failed to update creative details'
+    );
+    throw new Error(`Failed to update creative details: ${error.message}`);
+  }
+
+  logger.info(
+    { metaCreativeId, landingUrl, whatsappPhone },
+    'meta-ads:sync: creative details saved'
+  );
+
+  return {
+    updated: true,
+    fields: { landingUrl, whatsappPhone, whatsappMessageTemplate },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// syncSingleCampaign — точечный refresh одной кампании
+// ---------------------------------------------------------------------------
+
+/**
+ * Точечный refresh одной кампании: обновляет структуру и инсайты за 7 дней.
+ * Используется кнопкой "Refresh now" в UI через POST /meta-ads/campaigns/:id/refresh.
+ *
+ * Порядок:
+ *   1. GET /<campaign_id>?fields=... → UPSERT meta_campaigns
+ *   2. GET /<campaign_id>/adsets → UPSERT meta_ad_sets
+ *   3. GET /<campaign_id>/ads → UPSERT meta_ads
+ *   4. GET /<campaign_id>/insights?since=7days → UPSERT meta_insights_daily
+ *
+ * Итого ~10-50 API вызовов (зависит от числа ads и дней).
+ * Creatives НЕ обновляем — lazy fetch при клике.
+ *
+ * @param {string} metaCampaignId — числовой Meta campaign ID ("120213...")
+ * @param {string} [adAccountId] — "act_XXX", fallback на META_AD_ACCOUNT_ID
+ * @returns {Promise<{
+ *   started: string,
+ *   completed: string,
+ *   durationMs: number,
+ *   recordsSynced: { campaign: number, adSets: number, ads: number, insights: number },
+ *   errors: Array
+ * }>}
+ */
+export async function syncSingleCampaign(metaCampaignId, adAccountId) {
+  const startTime = Date.now();
+  const started = new Date().toISOString();
   const id = adAccountId ?? metaAdsConfig.adAccountId;
 
-  // Delta: структура (campaigns/adsets/creatives/ads) + последние 2 дня insights
-  const until = new Date().toISOString().slice(0, 10);
-  const sinceDate = new Date();
-  sinceDate.setDate(sinceDate.getDate() - 2);
-  const since = sinceDate.toISOString().slice(0, 10);
+  if (!metaCampaignId) throw new Error('metaCampaignId is required');
 
-  return syncFull(id, { since, until, levels: ['campaign', 'adset', 'ad'] });
+  logger.info({ metaCampaignId, adAccountId: id }, 'meta-ads:sync: syncSingleCampaign started');
+
+  // Убеждаемся что ad_account row существует
+  const accountUuid = await resolveAccountUuid(id);
+
+  const logId = await logStarted(accountUuid, 'single_campaign');
+  const errors = [];
+  const counts = { campaign: 0, adSets: 0, ads: 0, insights: 0 };
+
+  try {
+    // 1. Fetch campaign — Meta поддерживает GET /<campaign_id>?fields=... напрямую
+    const rawCampaign = await _fetchObjectById(metaCampaignId,
+      'id,name,objective,status,effective_status,daily_budget,lifetime_budget,created_time');
+
+    if (rawCampaign) {
+      const campaignRow = {
+        ad_account_id: accountUuid,
+        meta_campaign_id: rawCampaign.id,
+        name: rawCampaign.name,
+        objective: rawCampaign.objective ?? null,
+        status: rawCampaign.status,
+        effective_status: rawCampaign.effective_status ?? rawCampaign.status,
+        daily_budget: rawCampaign.daily_budget != null ? parseInt(rawCampaign.daily_budget, 10) : null,
+        lifetime_budget: rawCampaign.lifetime_budget != null ? parseInt(rawCampaign.lifetime_budget, 10) : null,
+        created_time: rawCampaign.created_time ?? null,
+        last_seen_at: new Date().toISOString(),
+      };
+
+      const { error: campError } = await serviceClient
+        .from('meta_campaigns')
+        .upsert(campaignRow, { onConflict: 'ad_account_id,meta_campaign_id' });
+
+      if (campError) {
+        errors.push({ code: 'DB_ERROR', message: campError.message });
+      } else {
+        counts.campaign = 1;
+      }
+    }
+
+    // Resolve campaign UUID для FK
+    const { data: campRow } = await serviceClient
+      .from('meta_campaigns')
+      .select('id')
+      .eq('ad_account_id', accountUuid)
+      .eq('meta_campaign_id', metaCampaignId)
+      .maybeSingle();
+
+    const campaignUuid = campRow?.id ?? null;
+
+    // 2. Fetch ad sets этой кампании
+    const adSets = await metaAdsClient.listAdSets(id, {
+      maxRecords: 50000,
+      campaignId: metaCampaignId, // будет передан в params
+    });
+
+    // Фильтруем по campaign_id (listAdSets может вернуть всё — фильтруем)
+    const campaignAdSets = adSets.filter((a) => a.campaign_id === metaCampaignId);
+
+    if (campaignUuid && campaignAdSets.length > 0) {
+      const adSetRows = campaignAdSets.map((a) => ({
+        ad_account_id: accountUuid,
+        campaign_id: campaignUuid,
+        meta_adset_id: a.id,
+        name: a.name,
+        status: a.status,
+        daily_budget: a.daily_budget != null ? parseInt(a.daily_budget, 10) : null,
+        lifetime_budget: a.lifetime_budget != null ? parseInt(a.lifetime_budget, 10) : null,
+        optimization_goal: a.optimization_goal ?? null,
+        billing_event: a.billing_event ?? null,
+        bid_strategy: a.bid_strategy ?? null,
+        targeting: a.targeting ?? null,
+        placements: a.targeting?.publisher_platforms
+          ? {
+              publisher_platforms: a.targeting.publisher_platforms,
+              facebook_positions: a.targeting.facebook_positions,
+              instagram_positions: a.targeting.instagram_positions,
+              device_platforms: a.targeting.device_platforms,
+            }
+          : null,
+        is_advantage_plus: a.is_dynamic_creative === true,
+        schedule_start: a.schedule_start_time ?? null,
+        schedule_end: a.schedule_end_time ?? null,
+        last_seen_at: new Date().toISOString(),
+      }));
+
+      const { error: adSetsError } = await serviceClient
+        .from('meta_ad_sets')
+        .upsert(adSetRows, { onConflict: 'ad_account_id,meta_adset_id' });
+
+      if (adSetsError) {
+        errors.push({ code: 'DB_ERROR', message: adSetsError.message });
+      } else {
+        counts.adSets = adSetRows.length;
+      }
+    }
+
+    // 3. Fetch ads этой кампании (через listAds с campaign filter)
+    const allAds = await metaAdsClient.listAds(id, {
+      maxRecords: 50000,
+      campaignId: metaCampaignId,
+    });
+
+    const campaignAds = allAds.filter((a) => a.campaign_id === metaCampaignId);
+
+    if (campaignAds.length > 0) {
+      // Нужны FK маппинги для adsets
+      const { data: adSetsInDb } = await serviceClient
+        .from('meta_ad_sets')
+        .select('id, meta_adset_id')
+        .eq('ad_account_id', accountUuid)
+        .eq('campaign_id', campaignUuid ?? '00000000-0000-0000-0000-000000000000');
+
+      const adSetMap = new Map((adSetsInDb ?? []).map((a) => [a.meta_adset_id, a.id]));
+
+      const { data: existingCreatives } = await serviceClient
+        .from('meta_creatives')
+        .select('id, meta_creative_id')
+        .eq('ad_account_id', accountUuid);
+
+      const creativeMap = new Map((existingCreatives ?? []).map((c) => [c.meta_creative_id, c.id]));
+
+      const adRows = [];
+      for (const ad of campaignAds) {
+        const adSetUuid = adSetMap.get(ad.adset_id);
+        if (!adSetUuid || !campaignUuid) continue;
+
+        const metaCreativeId = ad.creative?.id ?? null;
+        adRows.push({
+          ad_account_id: accountUuid,
+          campaign_id: campaignUuid,
+          ad_set_id: adSetUuid,
+          creative_id: metaCreativeId ? (creativeMap.get(metaCreativeId) ?? null) : null,
+          meta_ad_id: ad.id,
+          name: ad.name,
+          status: ad.status,
+          created_time: ad.created_time ?? null,
+          last_seen_at: new Date().toISOString(),
+        });
+      }
+
+      if (adRows.length > 0) {
+        const { error: adsError } = await serviceClient
+          .from('meta_ads')
+          .upsert(adRows, { onConflict: 'ad_account_id,meta_ad_id' });
+
+        if (adsError) {
+          errors.push({ code: 'DB_ERROR', message: adsError.message });
+        } else {
+          counts.ads = adRows.length;
+        }
+      }
+    }
+
+    // 4. Insights за последние 7 дней (day-by-day)
+    const until = new Date().toISOString().slice(0, 10);
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - 7);
+    const since = sinceDate.toISOString().slice(0, 10);
+
+    try {
+      // Запрашиваем insights для кампании напрямую через campaign_id
+      // Используем _syncInsights который уже умеет day-by-day
+      const insightsResult = await _syncInsights(id, accountUuid, {
+        since,
+        until,
+        levels: ['campaign', 'adset', 'ad'],
+        // Фильтрация по конкретной кампании невозможна через стандартный API
+        // Meta API /act_XXX/insights?level=campaign возвращает все кампании
+        // Мы получим данные по всем активным — UPSERT перезапишет только нужные
+      });
+      counts.insights = insightsResult.recordsSynced;
+      if (insightsResult.errors.length > 0) {
+        errors.push(...insightsResult.errors);
+      }
+    } catch (err) {
+      const errType = classifyMetaError(err);
+      if (errType === 'token_expired') throw err;
+      errors.push({ code: err.code ?? 'INTERNAL', message: err.message });
+    }
+
+    const completed = new Date().toISOString();
+    const durationMs = Date.now() - startTime;
+    const finalStatus = errors.length > 0 ? 'partial' : 'ok';
+
+    await logSuccess(logId, counts.campaign + counts.adSets + counts.ads + counts.insights, finalStatus);
+
+    logger.info(
+      { metaCampaignId, counts, durationMs },
+      'meta-ads:sync: syncSingleCampaign completed'
+    );
+
+    return { started, completed, durationMs, recordsSynced: counts, errors };
+  } catch (err) {
+    await logError(logId, err);
+    logger.error({ err: err.message, metaCampaignId }, 'meta-ads:sync: syncSingleCampaign failed');
+    throw err;
+  }
+}
+
+/**
+ * Fetch одного объекта по ID через Meta Graph API.
+ * Использует внутренний request через metaAdsClient.getCreative
+ * (getCreative умеет брать любой ID с любыми fields).
+ *
+ * @param {string} objectId — Meta object ID
+ * @param {string} fields
+ * @returns {Promise<object|null>}
+ */
+async function _fetchObjectById(objectId, fields) {
+  try {
+    // Переиспользуем getCreative который делает GET /<id>?fields=...
+    return await metaAdsClient.getCreative(objectId, { fields });
+  } catch (err) {
+    const errType = classifyMetaError(err);
+    if (errType === 'token_expired') throw err;
+    logger.warn({ objectId, error: err.message }, 'meta-ads:sync: _fetchObjectById failed');
+    return null;
+  }
 }

@@ -15,6 +15,9 @@ export {
   syncInsights,
   syncFull,
   syncDelta,
+  syncSingleCampaign,
+  syncCreativeDetails,
 } from './sync.js';
+export { parseTargeting, parsePlacements, parseObjectStorySpec } from './parsers.js';
 
 export { metaAdsRouter } from './api.js';

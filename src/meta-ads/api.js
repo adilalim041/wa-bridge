@@ -64,6 +64,8 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { serviceClient } from '../storage/supabase.js';
 import { logger } from '../config.js';
+import { syncSingleCampaign, syncCreativeDetails } from './sync.js';
+import { parseTargeting, parsePlacements } from './parsers.js';
 
 export const metaAdsRouter = Router();
 
@@ -728,6 +730,434 @@ metaAdsRouter.get('/sync-status', async (req, res) => {
     req.log
       ? req.log.error({ err: err.message }, 'GET /meta-ads/sync-status failed')
       : logger.error({ err: err.message }, 'GET /meta-ads/sync-status failed');
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /meta-ads/tree
+// ---------------------------------------------------------------------------
+// Главный endpoint для audit-view дашборда.
+// Возвращает полное дерево: Кампании → AdSets → Ads → Creatives + метрики.
+//
+// Реализован через 4 SQL запроса + JS-сборка дерева (не N+1):
+//   1. Campaigns для периода (через EXISTS на insights)
+//   2. AdSets для этих кампаний
+//   3. Ads для этих AdSets с creative join
+//   4. Insights (campaign+adset+ad levels) за период
+//
+// Performance:
+//   - Limit 50 кампаний — пагинация через ?offset=N
+//   - Targeting/placements парсятся через parseTargeting()/parsePlacements()
+//   - landing_url/whatsapp_phone берётся из meta_creatives если уже lazy-fetched
+//
+// Query params:
+//   from          YYYY-MM-DD (default: today-7 days)
+//   to            YYYY-MM-DD (default: today)
+//   campaign_id   UUID — показать только эту кампанию (опционально)
+//   account       act_XXX или UUID ad account
+//   limit         кол-во кампаний (default: 50, max: 200)
+//   offset        пагинация
+// ---------------------------------------------------------------------------
+
+metaAdsRouter.get('/tree', async (req, res) => {
+  const treeQuerySchema = periodSchema.extend({
+    campaign_id: z.string().uuid().optional(),
+    limit: z.coerce.number().int().min(1).max(200).optional().default(50),
+    offset: z.coerce.number().int().min(0).optional().default(0),
+  });
+
+  const parsed = treeQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid query params', details: parsed.error.flatten().fieldErrors });
+  }
+
+  const { from: rawFrom, to: rawTo, account: accountParam, campaign_id: singleCampaignId, limit, offset } = parsed.data;
+  const defaults = defaultDateRange();
+  const from = rawFrom ?? defaults.from;
+  const to   = rawTo   ?? defaults.to;
+
+  try {
+    const account = await resolveAccount(accountParam);
+    if (!account) {
+      return res.status(404).json({ error: 'Ad account not found' });
+    }
+
+    // --- Query 1: Campaigns ---
+    let campaignsQuery = serviceClient
+      .from('meta_campaigns')
+      .select('id, meta_campaign_id, name, status, effective_status, objective, daily_budget, lifetime_budget, created_time', { count: 'exact' })
+      .eq('ad_account_id', account.id);
+
+    if (singleCampaignId) {
+      campaignsQuery = campaignsQuery.eq('id', singleCampaignId);
+    }
+
+    const { data: campaigns, error: campaignError, count: totalCampaigns } = await campaignsQuery
+      .order('name', { ascending: true })
+      .range(offset, offset + limit - 1);
+
+    if (campaignError) throw campaignError;
+    if (!campaigns || campaigns.length === 0) {
+      return res.json({
+        period: { from, to },
+        total: 0,
+        hasMore: false,
+        campaigns: [],
+      });
+    }
+
+    const campaignIds = campaigns.map((c) => c.id);
+    const metaCampaignIds = campaigns.map((c) => c.meta_campaign_id);
+
+    // --- Query 2: AdSets for these campaigns ---
+    const { data: adSets, error: adSetsError } = await serviceClient
+      .from('meta_ad_sets')
+      .select('id, meta_adset_id, name, status, campaign_id, daily_budget, lifetime_budget, optimization_goal, billing_event, bid_strategy, is_advantage_plus, schedule_start, schedule_end, targeting, placements')
+      .eq('ad_account_id', account.id)
+      .in('campaign_id', campaignIds)
+      .order('name', { ascending: true });
+
+    if (adSetsError) throw adSetsError;
+
+    const adSetIds = (adSets || []).map((a) => a.id);
+    const metaAdSetIds = (adSets || []).map((a) => a.meta_adset_id);
+
+    // --- Query 3: Ads + creatives for these adsets ---
+    const { data: ads, error: adsError } = await serviceClient
+      .from('meta_ads')
+      .select(`
+        id,
+        meta_ad_id,
+        name,
+        status,
+        ad_set_id,
+        campaign_id,
+        meta_creatives (
+          id,
+          meta_creative_id,
+          title,
+          body,
+          cta_type,
+          image_url,
+          thumbnail_url,
+          video_id,
+          landing_url,
+          whatsapp_phone,
+          whatsapp_message_template
+        )
+      `)
+      .eq('ad_account_id', account.id)
+      .in('ad_set_id', adSetIds.length > 0 ? adSetIds : ['00000000-0000-0000-0000-000000000000'])
+      .order('name', { ascending: true });
+
+    if (adsError) throw adsError;
+
+    const metaAdIds = (ads || []).map((a) => a.meta_ad_id);
+
+    // --- Query 4: Insights for all three levels ---
+    const allInsights = await Promise.all([
+      fetchInsightsMap({ accountId: account.id, level: 'campaign', objectIds: metaCampaignIds, from, to }),
+      fetchInsightsMap({ accountId: account.id, level: 'adset',    objectIds: metaAdSetIds,    from, to }),
+      fetchInsightsMap({ accountId: account.id, level: 'ad',       objectIds: metaAdIds,       from, to }),
+    ]);
+    const [campaignInsights, adSetInsights, adInsights] = allInsights;
+
+    // --- Helpers for active period ---
+    async function getActivePeriod(metaId, level) {
+      const { data } = await serviceClient
+        .from('meta_insights_daily')
+        .select('date_start')
+        .eq('ad_account_id', account.id)
+        .eq('level', level)
+        .eq('object_id', metaId)
+        .gt('spend', 0)
+        .order('date_start', { ascending: true })
+        .limit(1);
+      const { data: last } = await serviceClient
+        .from('meta_insights_daily')
+        .select('date_start')
+        .eq('ad_account_id', account.id)
+        .eq('level', level)
+        .eq('object_id', metaId)
+        .gt('spend', 0)
+        .order('date_start', { ascending: false })
+        .limit(1);
+      return {
+        from: data?.[0]?.date_start ?? null,
+        to: last?.[0]?.date_start ?? null,
+      };
+    }
+
+    // --- Build tree ---
+    // Group adsets by campaign_id
+    const adSetsByCampaign = new Map();
+    for (const as of adSets || []) {
+      if (!adSetsByCampaign.has(as.campaign_id)) adSetsByCampaign.set(as.campaign_id, []);
+      adSetsByCampaign.get(as.campaign_id).push(as);
+    }
+
+    // Group ads by ad_set_id
+    const adsByAdSet = new Map();
+    for (const ad of ads || []) {
+      if (!adsByAdSet.has(ad.ad_set_id)) adsByAdSet.set(ad.ad_set_id, []);
+      adsByAdSet.get(ad.ad_set_id).push(ad);
+    }
+
+    // Format metrics helper (extended with reach+frequency+linkClicks)
+    function formatMetricsExtended(raw) {
+      if (!raw) raw = { spendMinor: 0, impressions: 0, clicks: 0, reach: 0, linkClicks: 0 };
+      const base = deriveMetrics(raw);
+      return {
+        ...base,
+        spendCents: raw.spendMinor ?? 0,
+        reach:      raw.reach ?? 0,
+        linkClicks: raw.linkClicks ?? 0,
+      };
+    }
+
+    const tree = campaigns.map((camp) => {
+      const campInsightRaw = campaignInsights.get(camp.meta_campaign_id) ?? null;
+      const campMetrics = formatMetricsExtended(campInsightRaw);
+
+      const campAdSets = adSetsByCampaign.get(camp.id) ?? [];
+
+      const formattedAdSets = campAdSets.map((as) => {
+        const asInsightRaw = adSetInsights.get(as.meta_adset_id) ?? null;
+        const asMetrics = formatMetricsExtended(asInsightRaw);
+
+        const asAds = adsByAdSet.get(as.id) ?? [];
+
+        const formattedAds = asAds.map((ad) => {
+          const adInsightRaw = adInsights.get(ad.meta_ad_id) ?? null;
+          const adMetrics = formatMetricsExtended(adInsightRaw);
+          const cr = ad.meta_creatives;
+
+          return {
+            id:       ad.id,
+            metaAdId: ad.meta_ad_id,
+            name:     ad.name,
+            status:   ad.status,
+            creative: cr ? {
+              id:                     cr.id,
+              metaCreativeId:         cr.meta_creative_id,
+              title:                  cr.title ?? null,
+              body:                   cr.body ?? null,
+              ctaType:                cr.cta_type ?? null,
+              imageUrl:               cr.image_url ?? null,
+              thumbnailUrl:           cr.thumbnail_url ?? null,
+              videoId:                cr.video_id ?? null,
+              landingUrl:             cr.landing_url ?? null,
+              whatsappPhone:          cr.whatsapp_phone ?? null,
+              whatsappMessageTemplate: cr.whatsapp_message_template ?? null,
+            } : null,
+            metrics: adMetrics,
+          };
+        });
+
+        return {
+          id:               as.id,
+          metaAdSetId:      as.meta_adset_id,
+          name:             as.name,
+          status:           as.status,
+          dailyBudget:      toMajor(as.daily_budget),
+          lifetimeBudget:   toMajor(as.lifetime_budget),
+          optimizationGoal: as.optimization_goal ?? null,
+          billingEvent:     as.billing_event ?? null,
+          bidStrategy:      as.bid_strategy ?? null,
+          isAdvantagePlus:  as.is_advantage_plus ?? false,
+          schedule: {
+            start: as.schedule_start ?? null,
+            end:   as.schedule_end ?? null,
+          },
+          // Parsed human-readable targeting / placements
+          targeting:  parseTargeting(as.targeting),
+          placements: parsePlacements(as.placements),
+          metrics:    asMetrics,
+          ads:        formattedAds,
+        };
+      });
+
+      return {
+        id:             camp.id,
+        metaCampaignId: camp.meta_campaign_id,
+        name:           camp.name,
+        status:         camp.status,
+        effectiveStatus: camp.effective_status ?? camp.status,
+        objective:      camp.objective ?? null,
+        dailyBudget:    toMajor(camp.daily_budget),
+        lifetimeBudget: toMajor(camp.lifetime_budget),
+        createdTime:    camp.created_time ?? null,
+        metrics:        campMetrics,
+        adSets:         formattedAdSets,
+      };
+    });
+
+    return res.json({
+      period: { from, to },
+      account: {
+        id:       account.meta_account_id,
+        name:     account.account_name,
+        currency: account.currency,
+        timezone: account.timezone_name,
+      },
+      total:   totalCampaigns ?? campaigns.length,
+      hasMore: offset + campaigns.length < (totalCampaigns ?? campaigns.length),
+      campaigns: tree,
+    });
+  } catch (err) {
+    req.log
+      ? req.log.error({ err: err.message }, 'GET /meta-ads/tree failed')
+      : logger.error({ err: err.message }, 'GET /meta-ads/tree failed');
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /meta-ads/campaigns/:id/refresh
+// ---------------------------------------------------------------------------
+// Триггерит syncSingleCampaign для конкретной кампании.
+// Используется кнопкой "Refresh now" в UI.
+// :id — это наш UUID (из meta_campaigns.id), не Meta campaign ID.
+// ---------------------------------------------------------------------------
+
+metaAdsRouter.post('/campaigns/:id/refresh', async (req, res) => {
+  const { id } = req.params;
+
+  if (!/^[0-9a-f-]{36}$/i.test(id)) {
+    return res.status(400).json({ error: 'Invalid campaign id format' });
+  }
+
+  try {
+    const parsed = z.object({ account: z.string().optional() }).safeParse(req.query);
+    const accountParam = parsed.success ? parsed.data.account : undefined;
+
+    const account = await resolveAccount(accountParam);
+    if (!account) {
+      return res.status(404).json({ error: 'Ad account not found' });
+    }
+
+    // Resolve Meta campaign ID от нашего UUID
+    const { data: campaign, error: campError } = await serviceClient
+      .from('meta_campaigns')
+      .select('meta_campaign_id, name')
+      .eq('id', id)
+      .eq('ad_account_id', account.id)
+      .maybeSingle();
+
+    if (campError) throw campError;
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    const log = req.log ?? logger;
+    log.info(
+      { campaignId: id, metaCampaignId: campaign.meta_campaign_id },
+      'POST /meta-ads/campaigns/:id/refresh triggered'
+    );
+
+    const summary = await syncSingleCampaign(campaign.meta_campaign_id, account.meta_account_id);
+
+    return res.json({
+      started:     summary.started,
+      completed:   summary.completed,
+      durationMs:  summary.durationMs,
+      recordsSynced: summary.recordsSynced,
+      errors:      summary.errors ?? [],
+    });
+  } catch (err) {
+    req.log
+      ? req.log.error({ err: err.message, campaignId: id }, 'POST /meta-ads/campaigns/:id/refresh failed')
+      : logger.error({ err: err.message }, 'POST /meta-ads/campaigns/:id/refresh failed');
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /meta-ads/creatives/:id/details
+// ---------------------------------------------------------------------------
+// Lazy fetch деталей одного креатива: landing_url, whatsapp_phone, whatsapp_message_template.
+// Если в БД уже есть landing_url — возвращает из кэша без API вызова.
+// Если нет — дёргает Meta getCreative() + parseObjectStorySpec() + UPDATE.
+// :id — наш UUID (из meta_creatives.id)
+// ---------------------------------------------------------------------------
+
+metaAdsRouter.get('/creatives/:id/details', async (req, res) => {
+  const { id } = req.params;
+
+  if (!/^[0-9a-f-]{36}$/i.test(id)) {
+    return res.status(400).json({ error: 'Invalid creative id format' });
+  }
+
+  try {
+    const parsed = z.object({ account: z.string().optional() }).safeParse(req.query);
+    const accountParam = parsed.success ? parsed.data.account : undefined;
+
+    const account = await resolveAccount(accountParam);
+    if (!account) {
+      return res.status(404).json({ error: 'Ad account not found' });
+    }
+
+    // Fetch creative from DB
+    const { data: creative, error: creativeError } = await serviceClient
+      .from('meta_creatives')
+      .select('id, meta_creative_id, title, body, cta_type, image_url, thumbnail_url, video_id, landing_url, whatsapp_phone, whatsapp_message_template')
+      .eq('id', id)
+      .eq('ad_account_id', account.id)
+      .maybeSingle();
+
+    if (creativeError) throw creativeError;
+    if (!creative) return res.status(404).json({ error: 'Creative not found' });
+
+    let wasFetched = false;
+    let cr = creative;
+
+    // Lazy fetch если landing_url ещё не заполнен
+    if (cr.landing_url === null) {
+      const log = req.log ?? logger;
+      log.info(
+        { creativeId: id, metaCreativeId: cr.meta_creative_id },
+        'GET /meta-ads/creatives/:id/details — lazy fetching from Meta'
+      );
+
+      try {
+        const { fields } = await syncCreativeDetails(cr.meta_creative_id, account.id);
+
+        // Перечитать обновлённые данные из БД
+        const { data: updated } = await serviceClient
+          .from('meta_creatives')
+          .select('id, meta_creative_id, title, body, cta_type, image_url, thumbnail_url, video_id, landing_url, whatsapp_phone, whatsapp_message_template')
+          .eq('id', id)
+          .maybeSingle();
+
+        if (updated) cr = updated;
+        wasFetched = true;
+      } catch (fetchErr) {
+        // Lazy fetch не критичен — логируем и возвращаем что есть
+        const log = req.log ?? logger;
+        log.warn(
+          { err: fetchErr.message, creativeId: id },
+          'GET /meta-ads/creatives/:id/details — lazy fetch failed, returning cached'
+        );
+      }
+    }
+
+    return res.json({
+      id:                       cr.id,
+      metaCreativeId:           cr.meta_creative_id,
+      title:                    cr.title ?? null,
+      body:                     cr.body ?? null,
+      ctaType:                  cr.cta_type ?? null,
+      imageUrl:                 cr.image_url ?? null,
+      thumbnailUrl:             cr.thumbnail_url ?? null,
+      videoId:                  cr.video_id ?? null,
+      landingUrl:               cr.landing_url ?? null,
+      whatsappPhone:            cr.whatsapp_phone ?? null,
+      whatsappMessageTemplate:  cr.whatsapp_message_template ?? null,
+      wasFetched,
+    });
+  } catch (err) {
+    req.log
+      ? req.log.error({ err: err.message, creativeId: id }, 'GET /meta-ads/creatives/:id/details failed')
+      : logger.error({ err: err.message }, 'GET /meta-ads/creatives/:id/details failed');
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
