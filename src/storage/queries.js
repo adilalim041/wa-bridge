@@ -133,6 +133,11 @@ export async function saveMessage(data) {
     media_type: data.mediaType ?? null,
     file_name: data.fileName ?? null,
     timestamp: data.timestamp,
+    // ack_status: outgoing → 0 (pending), incoming → NULL.
+    // Without explicit 0 the row would be NULL and `.lt('ack_status', x)` in the
+    // delivery-receipt handler skips NULL rows (PG: NULL < n = NULL ≠ TRUE),
+    // freezing every new outgoing on a single ✓ forever.
+    ack_status: data.fromMe ? 0 : null,
   };
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
