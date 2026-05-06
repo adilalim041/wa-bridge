@@ -6,7 +6,7 @@ import { captureMessage } from '../observability/sentry.js';
 import { logAudit } from '../storage/auditLog.js';
 import { supabase } from '../storage/supabase.js';
 import { useSupabaseAuthState } from '../storage/authState.js';
-import { emitNewMessage, emitSessionStatus } from '../api/websocket.js';
+import { emitNewMessage, emitSessionStatus, emitAckUpdate } from '../api/websocket.js';
 import { setCurrentVersion, startVersionChecker } from '../versionChecker.js';
 import { handleMessage, registerSessionPhone, loadPhoneRegistry } from './messageHandler.js';
 import { handleCallEvent } from './callHandler.js';
@@ -549,7 +549,24 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
     console.log(`[${sessionId}] History sync: saved ${saved}/${msgCount} messages`);
   });
 
-  // Edited messages — update body in Supabase
+  // Edited messages + delivery ack updates
+  //
+  // Baileys WAMessageStatus enum (numeric values):
+  //   0 = ERROR       — treat as still-pending, skip
+  //   1 = PENDING     — queued locally, skip (already stored as 0 via backfill)
+  //   2 = SERVER_ACK  — WA server received → our ack_status 1 (single grey ✓)
+  //   3 = DELIVERY_ACK— recipient device received → our ack_status 2 (double grey ✓✓)
+  //   4 = READ        — recipient opened chat → our ack_status 3 (double blue ✓✓)
+  //   5 = PLAYED      — voice/video played → our ack_status 4
+  //
+  // Idempotency: UPDATE uses .lt('ack_status', newStatus) — no downgrade ever.
+  // Baileys frequently re-sends ack 2 after ack 3; the condition absorbs this silently.
+  //
+  // Safety filters:
+  //   .eq('from_me', true)      — ack only applies to our own outgoing messages
+  //   .eq('session_id', sessionId) — strict session scope, prevents cross-session races
+  const ACK_MAP = { 2: 1, 3: 2, 4: 3, 5: 4 };
+
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates ?? []) {
       try {
@@ -557,7 +574,31 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
           continue;
         }
 
-        // Handle edited messages
+        // ── Delivery ack ──────────────────────────────────────────────────────
+        if (typeof update.status === 'number') {
+          const newStatus = ACK_MAP[update.status];
+          if (newStatus !== undefined) {
+            const { data: updated, error: ackError } = await supabase
+              .from('messages')
+              .update({ ack_status: newStatus })
+              .eq('message_id', key.id)
+              .eq('session_id', sessionId)
+              .eq('from_me', true)       // safety: only outgoing messages carry ack
+              .lt('ack_status', newStatus) // idempotency: never downgrade
+              .select('id')              // cheapest way to detect if UPDATE hit a row
+              .maybeSingle();
+
+            if (ackError) {
+              logger.warn({ err: ackError, sessionId, messageId: key.id, newStatus }, 'Failed to update ack_status');
+            } else if (updated) {
+              // Only emit WS event when a row was actually changed (not a no-op).
+              emitAckUpdate(sessionId, key.id, key.remoteJid, newStatus);
+              logger.debug({ sessionId, messageId: key.id, newStatus }, 'ack_status updated');
+            }
+          }
+        }
+
+        // ── Edited message ────────────────────────────────────────────────────
         const editedMsg = update?.message?.editedMessage?.message;
         if (editedMsg) {
           const newBody =

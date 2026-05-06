@@ -140,6 +140,46 @@ export function emitSessionStatus(sessionId, status) {
   }
 }
 
+/**
+ * Broadcast a delivery-ack update to connected dashboard clients.
+ *
+ * Emitted after a successful ack_status UPDATE in the database — only
+ * fires when the UPDATE actually changed a row (no-op updates are skipped).
+ *
+ * Frontend listens for type='message.ack' and updates the tick indicators
+ * on the matching message bubble without a full refetch.
+ *
+ * @param {string} sessionId  - Baileys session the message belongs to
+ * @param {string} messageId  - Baileys/WA message key id (message_id column)
+ * @param {string} remoteJid  - WA JID of the chat
+ * @param {number} ackStatus  - New ack level: 1=sent, 2=delivered, 3=read, 4=played
+ */
+export function emitAckUpdate(sessionId, messageId, remoteJid, ackStatus) {
+  if (!wss) {
+    return;
+  }
+
+  const payload = JSON.stringify({
+    type: 'message.ack',
+    sessionId,
+    messageId,
+    remoteJid,
+    ackStatus,
+  });
+
+  for (const ws of wss.clients) {
+    if (ws.readyState !== WebSocket.OPEN) {
+      continue;
+    }
+
+    if (ws.subscribedSessions && !ws.subscribedSessions.has(sessionId)) {
+      continue;
+    }
+
+    ws.send(payload);
+  }
+}
+
 export function emitCallEvent(sessionId, callData) {
   if (!wss) {
     return;
