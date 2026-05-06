@@ -11,6 +11,7 @@ import { clearStaleLocks } from './storage/sessionLock.js';
 import { startVaultHeartbeat, stopVaultHeartbeat } from './heartbeat.js';
 import { startCleanupScheduler, stopCleanupScheduler } from './cleanup/scheduler.js';
 import { startMvRefreshScheduler, stopMvRefreshScheduler } from './cleanup/mvRefresh.js';
+import { startMetaAdsCron, stopMetaAdsCron } from './meta-ads/cron.js';
 
 let server;
 let keepAliveTimer;
@@ -54,6 +55,7 @@ async function bootstrap() {
   startVaultHeartbeat();
   startCleanupScheduler();
   startMvRefreshScheduler();
+  startMetaAdsCron();
 
   // Refresh phone registry every 60s to pick up new sessions
   phoneRefreshTimer = setInterval(async () => {
@@ -81,6 +83,7 @@ async function shutdown(signal) {
   stopVaultHeartbeat();
   stopCleanupScheduler();
   stopMvRefreshScheduler();
+  stopMetaAdsCron();
 
   // Hard timeout: force exit after 15s if graceful shutdown hangs
   const forceExitTimer = setTimeout(() => {
