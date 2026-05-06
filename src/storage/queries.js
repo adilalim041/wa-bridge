@@ -867,6 +867,9 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
             // Call-specific fields (null when last event was a message)
             lastCallMissed: callIsNewer ? Boolean(row.last_call_missed) : null,
             lastCallDurationSec: callIsNewer ? (row.last_call_duration_sec ?? null) : null,
+            // ACK status of last outgoing message (null when call is newest or msg is incoming).
+            // Frontend renders delivery ticks only when fromMe=true and lastAckStatus !== null.
+            lastAckStatus: callIsNewer ? null : (row.last_ack_status ?? null),
           };
         });
       // W7A overlay: phone-level chat_tags wins over legacy chats.tags
@@ -952,7 +955,7 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
           ] = await Promise.all([
             db
               .from('messages')
-              .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name')
+              .select('body, message_type, from_me, push_name, timestamp, sender, media_url, media_type, file_name, ack_status')
               .eq('session_id', sessionId)
               .eq('remote_jid', chat.remote_jid)
               .order('timestamp', { ascending: false })
@@ -1015,6 +1018,8 @@ export async function getChatsWithLastMessage(sessionId, db = supabase, userId =
             // Call-specific fields (null when last event was a message)
             lastCallMissed: callIsNewer ? Boolean(latestCall.missed) : null,
             lastCallDurationSec: callIsNewer ? (latestCall.duration_sec ?? null) : null,
+            // ACK status of last outgoing message (null when call is newest or msg is incoming).
+            lastAckStatus: callIsNewer ? null : (lastMessage?.from_me ? (lastMessage.ack_status ?? null) : null),
           };
         })
       );
