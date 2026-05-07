@@ -149,6 +149,29 @@ export async function saveMessage(data) {
 
       if (!error) {
         _touchLastMessageProcessed();
+
+        // UX: когда менеджер отправляет сообщение — автоматически пометить
+        // все непрочитанные incoming в этом чате как прочитанные. Если менеджер
+        // ответил, он очевидно увидел предыдущие сообщения клиента. Без этого
+        // unread_count в RPC get_chats_with_last_message (LATERAL COUNT WHERE
+        // from_me=false AND read_at IS NULL) остаётся ненулевым и chat list
+        // показывает чат как непрочитанный даже после ответа менеджера.
+        if (data.fromMe) {
+          try {
+            await supabase
+              .from('messages')
+              .update({ read_at: new Date().toISOString() })
+              .eq('session_id', data.sessionId)
+              .eq('remote_jid', data.remoteJid)
+              .eq('from_me', false)
+              .is('read_at', null);
+          } catch (markErr) {
+            logger.warn(
+              { err: markErr, sessionId: data.sessionId, remoteJid: data.remoteJid },
+              'Failed to auto-mark-read incoming on manager outgoing'
+            );
+          }
+        }
         return;
       }
 
