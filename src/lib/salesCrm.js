@@ -301,7 +301,7 @@ export async function getStudioCard(req, agencyId) {
     sb.from('agencies').select('*').eq('id', agencyId).maybeSingle(),
     sb.from('v_partner_full').select('*').eq('agency_id', agencyId).gt('orders_count', 0).order('total_revenue', { ascending: false }),
     sb.from('sales').select('id, sale_date, order_num, total_amount, customer_raw, partner_raw, manager, status_text, source_file')
-      .eq('agency_id', agencyId).order('sale_date', { ascending: false }).limit(200),
+      .eq('agency_id', agencyId).order('sale_date', { ascending: false }).limit(1000),
   ]);
   if (!agency) return null;
 
