@@ -180,7 +180,7 @@ export async function listPartners(req, params = {}) {
 // Полная карточка партнёра: основные поля + последние N заказов с позициями
 // + связанные WhatsApp-сессии + последние 3 AI-анализа диалогов.
 
-export async function getPartnerCard(req, contactId, { recentSales = 50, recentAi = 3 } = {}) {
+export async function getPartnerCard(req, contactId, { recentSales = 500, recentAi = 3 } = {}) {
   if (!isUuid(contactId)) throw new Error('invalid contact id');
   const sb = pickClient(req);
 
