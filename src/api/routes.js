@@ -2345,28 +2345,47 @@ export function setupRoutes(app) {
     });
   });
 
-  router.get('/health', async (_req, res) => {
-    const { data: configs } = await supabase
-      .from('session_config')
-      .select('session_id')
-      .order('created_at', { ascending: true });
-
-    const sessions = {};
-    for (const config of configs ?? []) {
-      const state = sessionManager.getSessionState(config.session_id);
-      sessions[config.session_id] = {
-        connected: state.connected,
-        hasQR: Boolean(state.qr),
-        // Don't expose user names in unauthenticated health endpoint
-      };
-    }
-
+  // Liveness check — must NEVER depend on Supabase or other downstream services.
+  // Railway healthcheck timeout (~60s) + slow Supabase = deploy failure cascade
+  // (incident 2026-05-14: Nano disk IO exhausted → /health timeout → Railway
+  // "Healthcheck failure" → Bridge can't deploy at all).
+  //
+  // Detailed session state (which requires DB) → /health/detailed (deprecated).
+  router.get('/health', (_req, res) => {
     res.json({
       status: 'ok',
-      sessions,
       uptime: process.uptime(),
-      messageQueue: getQueueStats(),
+      messageQueue: getQueueStats(), // in-memory failover queue size
     });
+  });
+
+  // Optional: legacy detailed health with DB query — separate endpoint так
+  // что Railway healthcheck не зависит от Supabase response time.
+  router.get('/health/detailed', async (_req, res) => {
+    try {
+      const { data: configs } = await supabase
+        .from('session_config')
+        .select('session_id')
+        .order('created_at', { ascending: true });
+
+      const sessions = {};
+      for (const config of configs ?? []) {
+        const state = sessionManager.getSessionState(config.session_id);
+        sessions[config.session_id] = {
+          connected: state.connected,
+          hasQR: Boolean(state.qr),
+        };
+      }
+
+      res.json({
+        status: 'ok',
+        sessions,
+        uptime: process.uptime(),
+        messageQueue: getQueueStats(),
+      });
+    } catch (e) {
+      res.status(503).json({ status: 'degraded', error: e.message });
+    }
   });
 
   router.get('/sessions', async (req, res) => {
