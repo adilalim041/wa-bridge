@@ -32,11 +32,16 @@ export function trackDisconnectEvent(sessionId, statusCode) {
     entry = { count: 0, loggedOut: 0, connectionReplaced: 0, alerted: false, date: today };
   }
   entry.count++;
-  // Only loggedOut (401) is a real ban indicator
-  // connectionReplaced (440) is a known Baileys v7 false positive — do NOT count
-  const isLoggedOut = statusCode === 401 || statusCode === 515;
+  // Only loggedOut (401) is a real ban indicator.
+  //   - 440 (connectionReplaced) is a known Baileys v7 false positive — do NOT count
+  //   - 515 (restartRequired) is normal Baileys internal restart handshake, NOT a ban.
+  //     Audit 2026-05-07 HIGH-3: counting 515 as loggedOut caused cascade-ban
+  //     false-positives during normal Baileys flapping (incident 2026-05-13 morning,
+  //     20+ false 'Mass disconnect' alerts in Telegram). Remove from isLoggedOut.
+  const isLoggedOut = statusCode === 401;
   if (isLoggedOut) entry.loggedOut++;
   if (statusCode === 440) entry.connectionReplaced++; // track but don't alert
+  if (statusCode === 515) entry.restartRequired = (entry.restartRequired || 0) + 1; // telemetry only
   dailyDisconnects.set(sessionId, entry);
 
   // Alert only for real loggedOut events, and only ONCE per day per session
@@ -113,29 +118,64 @@ export function trackDisconnectEvent(sessionId, statusCode) {
 }
 
 // Mass disconnect detection
+//
+// Triggers Telegram alert when ≥3 sessions AND ≥50% are simultaneously in
+// `disconnectedAt` state for longer than the grace period.
+//
+// Grace period was 60s — too short. Baileys `scheduleReconnect` уже ждёт 3s,
+// затем сам handshake занимает 15-30s, при cascade restartRequired (несколько
+// сессий одновременно) handshake может затянуться до 90-120s. Inflated до 180s
+// чтобы reconnect успел завершиться до false alert.
+// Incident 2026-05-13 morning: 20+ Telegram alerts при нормальном Baileys
+// flapping. См. также `trackDisconnectEvent` где 515 убран из isLoggedOut.
+//
+// Also: track recent statusCode per session in `recentDisconnectReasons` Map.
+// Sessions disconnected by 515 (restartRequired) are EXPECTED to recover —
+// don't count them in mass-disconnect tally.
+const MASS_DISCONNECT_GRACE_MS = 3 * 60 * 1000; // 3 min (was 60s)
+const recentDisconnectReasons = new Map(); // sessionId → { statusCode, at }
 let massDisconnectTimer = null;
+
+export function recordDisconnectReason(sessionId, statusCode) {
+  recentDisconnectReasons.set(sessionId, { statusCode, at: Date.now() });
+}
+
+function isExpectedRecovery(sessionId) {
+  const r = recentDisconnectReasons.get(sessionId);
+  if (!r) return false;
+  // 515 = restartRequired (Baileys internal). 440 = connectionReplaced (false positive).
+  // Both auto-recover quickly. Don't count them as 'down' for mass-disconnect.
+  if (r.statusCode === 515 || r.statusCode === 440) {
+    // Stale entries: if disconnect older than 5 min, assume genuine outage and count.
+    if (Date.now() - r.at < 5 * 60 * 1000) return true;
+  }
+  return false;
+}
+
 export function checkMassDisconnect(allSessionsCount) {
-  const disconnectedNow = disconnectedAt.size;
+  // Count only sessions that are NOT expected to auto-recover.
+  const realDown = Array.from(disconnectedAt.keys()).filter((sid) => !isExpectedRecovery(sid));
+  const disconnectedNow = realDown.length;
   if (disconnectedNow >= 3 && disconnectedNow >= allSessionsCount * 0.5) {
     if (!massDisconnectTimer) {
       massDisconnectTimer = setTimeout(() => {
-        // Still many disconnected after 60s?
-        if (disconnectedAt.size >= 3) {
-          const downCount = disconnectedAt.size;
+        // Re-check after grace period — still many genuinely down?
+        const stillDown = Array.from(disconnectedAt.keys()).filter((sid) => !isExpectedRecovery(sid));
+        if (stillDown.length >= 3) {
           sendTelegramAlert(
-            `🚨 Mass disconnect: ${downCount}/${allSessionsCount} sessions down! Possible network/Railway issue.`
+            `🚨 Mass disconnect: ${stillDown.length}/${allSessionsCount} sessions down! Possible network/Railway issue.`
           ).catch(() => {});
           captureMessage('Mass disconnect', {
             level: 'error',
             tags: { kind: 'mass-disconnect', sessionCount: String(allSessionsCount) },
             extra: {
-              disconnectedCount: downCount,
-              disconnectedSessions: Array.from(disconnectedAt.keys()),
+              disconnectedCount: stillDown.length,
+              disconnectedSessions: stillDown,
             },
           });
         }
         massDisconnectTimer = null;
-      }, 60000);
+      }, MASS_DISCONNECT_GRACE_MS);
     }
   }
 }

@@ -1,7 +1,7 @@
 import qrcode from 'qrcode-terminal';
 import { fetchLatestBaileysVersion, makeWASocket, DisconnectReason } from 'baileys';
 import { logger, baileysLogger } from '../config.js';
-import { sendTelegramAlert, startHealthMonitor, updateConnectionStatus, trackDisconnectEvent, checkMassDisconnect } from '../monitor.js';
+import { sendTelegramAlert, startHealthMonitor, updateConnectionStatus, trackDisconnectEvent, checkMassDisconnect, recordDisconnectReason } from '../monitor.js';
 import { captureMessage } from '../observability/sentry.js';
 import { logAudit } from '../storage/auditLog.js';
 import { supabase } from '../storage/supabase.js';
@@ -381,6 +381,12 @@ export async function startConnection({ sessionId, onSocket, _prevSock }) {
         user: null,
         lastError: `Status ${statusCode || 'unknown'}: ${reason}`,
       });
+      // Record reason BEFORE updateConnectionStatus + checkMassDisconnect so
+      // mass-disconnect checker can skip sessions whose statusCode is 515
+      // (restartRequired) or 440 (connectionReplaced) — both auto-recover.
+      // Без этого 515 flapping → false-positive 'Mass disconnect' Telegram
+      // alerts (incident 2026-05-13 morning).
+      if (statusCode) recordDisconnectReason(sessionId, statusCode);
       updateConnectionStatus(sessionId, false);
       logAudit('session.disconnected', sessionId, { statusCode, reason });
 
