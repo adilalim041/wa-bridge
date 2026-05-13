@@ -54,7 +54,11 @@ async function bootstrap() {
   startKeepAlive();
   startVaultHeartbeat();
   startCleanupScheduler();
-  startMvRefreshScheduler();
+  // MV refresh cron DISABLED 2026-05-14 — Adil: продажи импортируются раз
+  // в месяц, daily refresh жрал disk IO budget Supabase Nano (98% сожжено,
+  // 522 Cloudflare timeouts). Manual refresh теперь только через
+  // POST /admin/sales-crm/refresh-mvs (дёргать после import_sales.mjs).
+  // startMvRefreshScheduler();
   startMetaAdsCron();
 
   // Refresh phone registry every 60s to pick up new sessions
