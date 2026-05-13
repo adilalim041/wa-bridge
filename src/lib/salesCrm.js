@@ -689,31 +689,62 @@ export async function getSalesAnalytics(req, params = {}) {
 
   // ─── 2-7. Top studios / top partners / categories / movers ─────────────────
   //
-  // Эти секции по-прежнему требуют individual sale rows (нужны agency_id,
-  // partner_id, customer_id которых нет в mv_sales_monthly). Загружаем sales
-  // с теми же фильтрами что выше — после миграции 0018 у sales есть индекс
-  // по sale_date, так что date-фильтр снизит row count если задан.
-  let filters = {};
-  if (args.date_from) filters.gte = { sale_date: args.date_from };
-  if (args.date_to) filters.lte = { sale_date: args.date_to };
-  if (args.channel === 'b2b') filters.notNull = ['partner_id'];
-  if (args.channel === 'b2c') filters.isNull = ['partner_id'];
-  filters = addCityFilter(filters, args.city);
-  const sales = await loadAllParallel(sb, 'sales',
-    'id, sale_date, total_amount, agency_id, partner_id, customer_id',
-    filters
-  );
+  // Stage B1.1 (миграция 0026): теперь читаем из 3 дополнительных MV вместо
+  // loadAllParallel('sales'). Все 3 MV refreshed cron-ом mvRefresh.js 04:30
+  // Almaty + manual /admin/sales-crm/refresh-mvs после импорта.
+  //
+  // Filter buyers (water_filter customers) — SQL JOIN, не помещается в MV.
 
-  // 2. Top studios
+  // Common filter applier (city / channel / month range)
+  const applyMvFilters = (q) => {
+    if (args.city && args.city !== 'all') q = q.eq('shop_city', args.city);
+    if (args.channel === 'b2b') q = q.eq('channel', 'b2b');
+    if (args.channel === 'b2c') q = q.eq('channel', 'b2c');
+    if (args.date_from) q = q.gte('month', args.date_from.slice(0, 7) + '-01');
+    if (args.date_to)   q = q.lte('month', args.date_to.slice(0, 7) + '-01');
+    return q;
+  };
+
+  // Параллельно тянем 3 MV + filter_buyers query
+  const [agencyMvRes, contactMvRes, catMvRes, filterBuyersRes] = await Promise.all([
+    applyMvFilters(sb.from('mv_sales_agency_monthly')
+      .select('agency_id, month, orders_count, total_revenue')
+      .range(0, 49999)),
+    applyMvFilters(sb.from('mv_sales_contact_monthly')
+      .select('contact_id, role, month, orders_count, total_revenue')
+      .range(0, 49999)),
+    applyMvFilters(sb.from('mv_sale_items_category_monthly')
+      .select('category, items_count, total_revenue')
+      .range(0, 9999)),
+    // Filter buyers — customers с заказами категории water_filter.
+    // PostgREST JOIN syntax: sale_items!inner(...) с filter на parent.
+    sb.from('sale_items')
+      .select('sales!inner(customer_id)')
+      .eq('category', 'water_filter')
+      .not('sales.customer_id', 'is', null)
+      .range(0, 49999),
+  ]);
+
+  if (agencyMvRes.error)  throw new Error(`mv_sales_agency_monthly: ${agencyMvRes.error.message}`);
+  if (contactMvRes.error) throw new Error(`mv_sales_contact_monthly: ${contactMvRes.error.message}`);
+  if (catMvRes.error)     throw new Error(`mv_sale_items_category_monthly: ${catMvRes.error.message}`);
+
+  const agencyRows  = agencyMvRes.data  || [];
+  const contactRows = contactMvRes.data || [];
+  const catRows     = catMvRes.data     || [];
+
+  // 2. Top studios — group by agency_id across all months in scope
   const byAgency = {};
-  for (const s of sales) {
-    if (!s.agency_id) continue;
-    if (!byAgency[s.agency_id]) byAgency[s.agency_id] = { agency_id: s.agency_id, orders: 0, revenue: 0 };
-    byAgency[s.agency_id].orders++;
-    byAgency[s.agency_id].revenue += s.total_amount || 0;
+  for (const r of agencyRows) {
+    if (!r.agency_id) continue;
+    if (!byAgency[r.agency_id]) byAgency[r.agency_id] = { agency_id: r.agency_id, orders: 0, revenue: 0 };
+    byAgency[r.agency_id].orders  += Number(r.orders_count  || 0);
+    byAgency[r.agency_id].revenue += Number(r.total_revenue || 0);
   }
   const topAgenciesIds = Object.values(byAgency).sort((a, b) => b.revenue - a.revenue).slice(0, 15);
-  const { data: agencies } = await sb.from('agencies').select('id, canonical_name, city').in('id', topAgenciesIds.map(a => a.agency_id));
+  const { data: agencies } = topAgenciesIds.length > 0
+    ? await sb.from('agencies').select('id, canonical_name, city').in('id', topAgenciesIds.map(a => a.agency_id))
+    : { data: [] };
   const aMap = new Map((agencies || []).map(a => [a.id, a]));
   const top_studios = topAgenciesIds.map(a => ({
     ...a,
@@ -721,19 +752,19 @@ export async function getSalesAnalytics(req, params = {}) {
     city: aMap.get(a.agency_id)?.city || null,
   }));
 
-  // 3. Top partners (any role: customer or partner)
+  // 3. Top partners — group by contact_id (любая роль), dedup т.к. customer и
+  //    partner могут быть одним и тем же контактом на разных продажах
   const byContact = {};
-  for (const s of sales) {
-    for (const id of [s.customer_id, s.partner_id].filter(Boolean)) {
-      if (!byContact[id]) byContact[id] = { contact_id: id, orders: 0, revenue: 0 };
-      byContact[id].orders++;
-      byContact[id].revenue += s.total_amount || 0;
-    }
+  for (const r of contactRows) {
+    if (!r.contact_id) continue;
+    if (!byContact[r.contact_id]) byContact[r.contact_id] = { contact_id: r.contact_id, orders: 0, revenue: 0 };
+    byContact[r.contact_id].orders  += Number(r.orders_count  || 0);
+    byContact[r.contact_id].revenue += Number(r.total_revenue || 0);
   }
   const topPartnersIds = Object.values(byContact).sort((a, b) => b.revenue - a.revenue).slice(0, 15);
-  const { data: contacts } = await sb.from('partner_contacts')
-    .select('id, canonical_name, primary_phone, agency_id')
-    .in('id', topPartnersIds.map(p => p.contact_id));
+  const { data: contacts } = topPartnersIds.length > 0
+    ? await sb.from('partner_contacts').select('id, canonical_name, primary_phone, agency_id').in('id', topPartnersIds.map(p => p.contact_id))
+    : { data: [] };
   const cMap = new Map((contacts || []).map(c => [c.id, c]));
   const top_partners = topPartnersIds.map(p => ({
     ...p,
@@ -742,67 +773,30 @@ export async function getSalesAnalytics(req, params = {}) {
     agency_id: cMap.get(p.contact_id)?.agency_id || null,
   }));
 
-  // 4. Categories — city-aware: если city задан, берём только items продаж этого города.
-  // sale_items не имеют поля city, поэтому сначала получаем sale_ids нужного города,
-  // потом items батчами по 500 (PostgREST .in() limit).
-  let items;
-  if (args.city && args.city !== 'all') {
-    // Используем уже загруженные sales — они уже city-filtered (addCityFilter выше).
-    //
-    // FIX 2026-05-04 (Bug B — empty pies): прежний код использовал .in('sale_id', [500 UUIDs])
-    // что давало URL ~18.5KB. PostgREST URL length limit ~16KB → запросы тихо
-    // failed на Астане (2955 sales × 6 batches), возвращая 0 items → pie chart пустой.
-    // Алматы (1711 sales) частично работал: последний меньший batch проходил.
-    //
-    // Решение: батчи по 100 UUIDs (URL ~3.7KB, well under limit) + range(0, 9999)
-    // чтобы default 1000-row cap не truncate'ал items в больших партиях.
-    const cityFilteredSaleIds = sales.map(s => s.id).filter(Boolean);
-    if (cityFilteredSaleIds.length === 0) {
-      items = [];
-    } else {
-      const batches = [];
-      for (let i = 0; i < cityFilteredSaleIds.length; i += 100) {
-        batches.push(cityFilteredSaleIds.slice(i, i + 100));
-      }
-      const batchResults = await Promise.all(
-        batches.map(batch =>
-          sb.from('sale_items')
-            .select('category, sale_id, amount')
-            .in('sale_id', batch)
-            .range(0, 9999)
-        )
-      );
-      items = batchResults.flatMap(r => r.data || []);
-    }
-  } else {
-    items = await loadAllParallel(sb, 'sale_items', 'category, sale_id, amount');
-  }
+  // 4. Categories — pre-aggregated в mv_sale_items_category_monthly
   const cats = {};
-  for (const it of items || []) {
-    const c = it.category || 'other';
+  for (const r of catRows) {
+    const c = r.category || 'other';
     if (!cats[c]) cats[c] = { category: c, count: 0, revenue: 0 };
-    cats[c].count++;
-    cats[c].revenue += it.amount || 0;
+    cats[c].count   += Number(r.items_count   || 0);
+    cats[c].revenue += Number(r.total_revenue || 0);
   }
   const categories = Object.values(cats).sort((a, b) => b.count - a.count);
 
-  // 5. Segments (one-time vs repeat customers, filter buyers)
+  // 5. Segments — one-time vs repeat customers (только role='customer')
   const customerOrders = {};
-  for (const s of sales) {
-    const cid = s.customer_id;
-    if (!cid) continue;
-    customerOrders[cid] = (customerOrders[cid] || 0) + 1;
+  for (const r of contactRows) {
+    if (r.role !== 'customer' || !r.contact_id) continue;
+    customerOrders[r.contact_id] = (customerOrders[r.contact_id] || 0) + Number(r.orders_count || 0);
   }
   const oneTime = Object.values(customerOrders).filter(n => n === 1).length;
   const repeat = Object.values(customerOrders).filter(n => n > 1).length;
 
-  // Filter customers (по items)
+  // Filter buyers — distinct customer_id из products с category=water_filter.
   const filterCustomerIds = new Set();
-  for (const it of items || []) {
-    if (it.category !== 'water_filter') continue;
-    // sale_id → customer_id: ищем в sales
-    const sale = sales.find(s => s.id === it.sale_id);
-    if (sale?.customer_id) filterCustomerIds.add(sale.customer_id);
+  for (const row of filterBuyersRes.data || []) {
+    const cid = row.sales?.customer_id;
+    if (cid) filterCustomerIds.add(cid);
   }
 
   const segments = {
@@ -822,9 +816,9 @@ export async function getSalesAnalytics(req, params = {}) {
   const m_yoy  = yoyMo ? monthly[yoyMo] : null;
 
   const kpi = {
-    total_orders: sales.length,
+    total_orders: totalOrdersFromMv,
     total_revenue: totalRevenue,
-    avg_check: sales.length > 0 ? Math.round(totalRevenue / sales.length) : 0,
+    avg_check: totalOrdersFromMv > 0 ? Math.round(totalRevenue / totalOrdersFromMv) : 0,
     months_covered: timeline.length,
     current_month: currMonth,
     current_month_orders: m_curr?.orders || 0,
@@ -838,19 +832,20 @@ export async function getSalesAnalytics(req, params = {}) {
   };
 
   // 7. Movers — top-5 best & worst партнёры по дельте текущий vs прошлый месяц.
-  // Считаем выручку каждого партнёра в curr и prev, ранжируем.
+  // Из mv_sales_contact_monthly filter'нем по month=curr/prev.
   let movers_top = [], movers_bottom = [];
   if (currMonth && prevMo) {
+    const currMonthDate = `${currMonth}-01`;
+    const prevMoDate    = `${prevMo}-01`;
     const byPartnerCurr = {}, byPartnerPrev = {};
-    const cFrom = `${currMonth}-01`, cTo = nextMonth(currMonth) + '-01';
-    const pFrom = `${prevMo}-01`, pTo = nextMonth(prevMo) + '-01';
-    for (const s of sales) {
-      const id = s.partner_id || s.customer_id;
-      if (!id || !s.sale_date) continue;
-      if (s.sale_date >= cFrom && s.sale_date < cTo) {
-        byPartnerCurr[id] = (byPartnerCurr[id] || 0) + (s.total_amount || 0);
-      } else if (s.sale_date >= pFrom && s.sale_date < pTo) {
-        byPartnerPrev[id] = (byPartnerPrev[id] || 0) + (s.total_amount || 0);
+    for (const r of contactRows) {
+      if (!r.contact_id) continue;
+      const id = r.contact_id;
+      const rev = Number(r.total_revenue || 0);
+      if (r.month === currMonthDate) {
+        byPartnerCurr[id] = (byPartnerCurr[id] || 0) + rev;
+      } else if (r.month === prevMoDate) {
+        byPartnerPrev[id] = (byPartnerPrev[id] || 0) + rev;
       }
     }
     const allIds = new Set([...Object.keys(byPartnerCurr), ...Object.keys(byPartnerPrev)]);
@@ -903,20 +898,24 @@ export async function getSalesAnalytics(req, params = {}) {
       m = prevMonth(m);
     }
   }
+  // 9. Sparkline для top_partners + top_studios — последние 12 месяцев.
+  // Из mv_sales_contact_monthly + mv_sales_agency_monthly (filter по month).
+  const sparkMonthsDates = new Set(sparkMonths.map(m => `${m}-01`));
   const sparkByContact = {};
+  for (const r of contactRows) {
+    if (!r.contact_id || !sparkMonthsDates.has(r.month)) continue;
+    const ymKey = (r.month || '').slice(0, 7);
+    if (!sparkByContact[r.contact_id]) sparkByContact[r.contact_id] = {};
+    sparkByContact[r.contact_id][ymKey] =
+      (sparkByContact[r.contact_id][ymKey] || 0) + Number(r.total_revenue || 0);
+  }
   const sparkByAgency = {};
-  for (const s of sales) {
-    if (!s.sale_date) continue;
-    const m = s.sale_date.slice(0, 7);
-    if (!sparkMonths.includes(m)) continue;
-    for (const id of [s.customer_id, s.partner_id].filter(Boolean)) {
-      if (!sparkByContact[id]) sparkByContact[id] = {};
-      sparkByContact[id][m] = (sparkByContact[id][m] || 0) + (s.total_amount || 0);
-    }
-    if (s.agency_id) {
-      if (!sparkByAgency[s.agency_id]) sparkByAgency[s.agency_id] = {};
-      sparkByAgency[s.agency_id][m] = (sparkByAgency[s.agency_id][m] || 0) + (s.total_amount || 0);
-    }
+  for (const r of agencyRows) {
+    if (!r.agency_id || !sparkMonthsDates.has(r.month)) continue;
+    const ymKey = (r.month || '').slice(0, 7);
+    if (!sparkByAgency[r.agency_id]) sparkByAgency[r.agency_id] = {};
+    sparkByAgency[r.agency_id][ymKey] =
+      (sparkByAgency[r.agency_id][ymKey] || 0) + Number(r.total_revenue || 0);
   }
   for (const p of top_partners) {
     p.sparkline = sparkMonths.map(m => sparkByContact[p.contact_id]?.[m] || 0);
@@ -925,87 +924,83 @@ export async function getSalesAnalytics(req, params = {}) {
     a.sparkline = sparkMonths.map(m => sparkByAgency[a.agency_id]?.[m] || 0);
   }
 
-  // 10. B2B vs B2C breakdown (всегда, независимо от channel-фильтра — для KPI)
-  // Считаем по фильтрованной выборке (sales уже отфильтрованы channel)
+  // 10. B2B vs B2C breakdown — из mvRows (mv_sales_monthly уже содержит channel)
   let b2b_orders = 0, b2b_revenue = 0, b2c_orders = 0, b2c_revenue = 0;
-  for (const s of sales) {
-    if (s.partner_id) {
-      b2b_orders++; b2b_revenue += s.total_amount || 0;
-    } else {
-      b2c_orders++; b2c_revenue += s.total_amount || 0;
-    }
+  for (const r of mvRows || []) {
+    const orders = Number(r.orders_count || 0);
+    const rev = Number(r.total_revenue || 0);
+    if (r.channel === 'b2b') { b2b_orders += orders; b2b_revenue += rev; }
+    else if (r.channel === 'b2c') { b2c_orders += orders; b2c_revenue += rev; }
   }
 
-  // 11. B2B/B2C по месяцам — stacked timeline
+  // 11. B2B/B2C timeline — group mvRows по month + channel
   const b2bMonthly = {};
-  for (const s of sales) {
-    if (!s.sale_date) continue;
-    const m = s.sale_date.slice(0, 7);
+  for (const r of mvRows || []) {
+    const m = (r.month || '').slice(0, 7);
+    if (!m) continue;
     if (!b2bMonthly[m]) b2bMonthly[m] = { month: m, b2b_revenue: 0, b2c_revenue: 0, b2b_orders: 0, b2c_orders: 0 };
-    if (s.partner_id) {
-      b2bMonthly[m].b2b_revenue += s.total_amount || 0;
-      b2bMonthly[m].b2b_orders++;
-    } else {
-      b2bMonthly[m].b2c_revenue += s.total_amount || 0;
-      b2bMonthly[m].b2c_orders++;
-    }
+    const orders = Number(r.orders_count || 0);
+    const rev = Number(r.total_revenue || 0);
+    if (r.channel === 'b2b') { b2bMonthly[m].b2b_revenue += rev; b2bMonthly[m].b2b_orders += orders; }
+    else if (r.channel === 'b2c') { b2bMonthly[m].b2c_revenue += rev; b2bMonthly[m].b2c_orders += orders; }
   }
   const b2b_timeline = Object.values(b2bMonthly).sort((a, b) => a.month.localeCompare(b.month));
 
-  // Список доступных месяцев для UI-picker (последние 18 от сегодняшнего)
+  // Список доступных месяцев для UI-picker (последние 18)
   const availableMonths = Object.keys(monthly).sort().reverse().slice(0, 18);
 
-  // Multi-year overlay (legacy, для старого графика): для каждого месяца года —
-  // точка на каждый год. Только revenue, без channel breakdown.
-  // [{month_idx: 1, "2024": 21M, "2025": 22M, "2026": 33M}, ...]
-  const yearMonthly = {};
-  for (const s of sales) {
-    if (!s.sale_date) continue;
-    const y = s.sale_date.slice(0, 4);
-    const m = parseInt(s.sale_date.slice(5, 7), 10);
-    if (!yearMonthly[m]) yearMonthly[m] = { month: m };
-    yearMonthly[m][y] = (yearMonthly[m][y] || 0) + (s.total_amount || 0);
-  }
+  // 12-13. Multi-year overlay + multi-year-channel breakdown.
+  // ВАЖНО: yearChannelMonthly должен включать ОБА канала вне зависимости от
+  // фильтра args.channel (это independent под-график). Поэтому грузим
+  // mv_sales_monthly ещё раз БЕЗ channel-фильтра (но с city + date filter).
   const RU_MONTH = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+
+  let mvRowsAllChannels = mvRows;
+  if (args.channel === 'b2b' || args.channel === 'b2c') {
+    let bdQ = sb.from('mv_sales_monthly').select('month, channel, orders_count, total_revenue');
+    if (args.city && args.city !== 'all') bdQ = bdQ.eq('shop_city', args.city);
+    if (args.date_from) bdQ = bdQ.gte('month', args.date_from.slice(0, 7) + '-01');
+    if (args.date_to)   bdQ = bdQ.lte('month', args.date_to.slice(0, 7) + '-01');
+    const { data: allChRows, error: bdErr } = await bdQ.range(0, 9999);
+    if (bdErr) throw new Error(`mv_sales_monthly (no channel): ${bdErr.message}`);
+    mvRowsAllChannels = allChRows || [];
+  }
+
+  // Overlay by year — multi-year revenue per month
+  const yearMonthly = {};
+  const yearsSet = new Set();
+  for (const r of mvRowsAllChannels) {
+    const y = (r.month || '').slice(0, 4);
+    const m = parseInt((r.month || '').slice(5, 7), 10);
+    if (!y || !m) continue;
+    yearsSet.add(y);
+    if (!yearMonthly[m]) yearMonthly[m] = { month: m };
+    yearMonthly[m][y] = (yearMonthly[m][y] || 0) + Number(r.total_revenue || 0);
+  }
   const overlay_by_year = Array.from({ length: 12 }, (_, i) => ({
     month: RU_MONTH[i],
     month_idx: i + 1,
     ...(yearMonthly[i + 1] || {}),
   }));
-  const yearsAvailable = [...new Set(sales.map(s => s.sale_date?.slice(0, 4)).filter(Boolean))].sort();
+  const yearsAvailable = [...yearsSet].sort();
 
-  // Расширенный multi-year breakdown: (year, month, channel) → revenue + orders + avg_check.
-  // Wide-format для Recharts: каждая точка X (Jan-Dec) хранит все ключи "{year}__{channel}__{metric}".
-  // Frontend делает multi-select по (year, channel, metric) и просто берёт нужные dataKey.
-  //
-  // ВАЖНО: используем sales БЕЗ channel-фильтра (только date_from/date_to + city),
-  // иначе при args.channel='b2b' breakdown потеряет b2c данные. Это
-  // независимый под-график со своим фильтром каналов.
-  let salesForBreakdown = sales;
-  if (args.channel === 'b2b' || args.channel === 'b2c') {
-    let breakdownFilters = {};
-    if (args.date_from) breakdownFilters.gte = { sale_date: args.date_from };
-    if (args.date_to) breakdownFilters.lte = { sale_date: args.date_to };
-    breakdownFilters = addCityFilter(breakdownFilters, args.city);
-    salesForBreakdown = await loadAllParallel(sb, 'sales',
-      'sale_date, total_amount, partner_id',
-      breakdownFilters
-    );
-  }
+  // Multi-year breakdown by channel — wide format
   const yearChannelMonthly = {};
-  for (const s of salesForBreakdown) {
-    if (!s.sale_date) continue;
-    const y = s.sale_date.slice(0, 4);
-    const m = parseInt(s.sale_date.slice(5, 7), 10);
-    const ch = s.partner_id ? 'b2b' : 'b2c';
+  for (const r of mvRowsAllChannels) {
+    const y = (r.month || '').slice(0, 4);
+    const m = parseInt((r.month || '').slice(5, 7), 10);
+    if (!y || !m) continue;
+    const ch = r.channel;
     if (!yearChannelMonthly[m]) yearChannelMonthly[m] = {};
     const buckets = yearChannelMonthly[m];
-    // 2 канала + 'all' (агрегатный)
+    const orders = Number(r.orders_count || 0);
+    const rev = Number(r.total_revenue || 0);
     for (const channel of [ch, 'all']) {
+      if (!channel) continue;
       const key = `${y}__${channel}`;
       if (!buckets[key]) buckets[key] = { revenue: 0, orders: 0 };
-      buckets[key].revenue += s.total_amount || 0;
-      buckets[key].orders += 1;
+      buckets[key].revenue += rev;
+      buckets[key].orders += orders;
     }
   }
   const multi_year_breakdown = Array.from({ length: 12 }, (_, i) => {
