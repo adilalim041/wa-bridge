@@ -645,7 +645,54 @@ export async function getSalesAnalytics(req, params = {}) {
 
   const sb = pickClient(req);
 
-  // Параллельная пагинация для sales (с фильтрами)
+  // ─── 1. Timeline + monthly aggregates через mv_sales_monthly (FAST PATH) ───
+  //
+  // Раньше JS-бакетил 3931 sales для timeline → 1-2s. Теперь mv_sales_monthly
+  // даёт pre-aggregated rows (~50-100 строк по shop_city × channel × manager
+  // на год), bucketing в JS остаётся для merge по month но это копейки.
+  // Refresh MV: daily 04:30 Almaty cron + manual /admin/sales-crm/refresh-mvs.
+  // Adil 2026-05-13: «продажи раз в месяц — нет смысла каждый раз пересчитывать».
+  let mvQ = sb.from('mv_sales_monthly')
+    .select('month, shop_city, channel, orders_count, total_revenue');
+  if (args.city && args.city !== 'all') mvQ = mvQ.eq('shop_city', args.city);
+  if (args.channel === 'b2b') mvQ = mvQ.eq('channel', 'b2b');
+  if (args.channel === 'b2c') mvQ = mvQ.eq('channel', 'b2c');
+  // mv_sales_monthly.month — date_trunc('month'), всегда YYYY-MM-01.
+  // Truncate filter values до first-of-month чтобы захватить весь месяц.
+  if (args.date_from) {
+    mvQ = mvQ.gte('month', args.date_from.slice(0, 7) + '-01');
+  }
+  if (args.date_to) {
+    mvQ = mvQ.lte('month', args.date_to.slice(0, 7) + '-01');
+  }
+  const { data: mvRows, error: mvErr } = await mvQ;
+  if (mvErr) throw new Error(`mv_sales_monthly: ${mvErr.message}`);
+
+  const monthly = {};
+  let totalRevenue = 0;
+  let totalOrdersFromMv = 0;
+  for (const r of mvRows || []) {
+    const m = (r.month || '').slice(0, 7);
+    if (!m) continue;
+    if (!monthly[m]) monthly[m] = { month: m, orders: 0, revenue: 0 };
+    const orders = Number(r.orders_count || 0);
+    const revenue = Number(r.total_revenue || 0);
+    monthly[m].orders += orders;
+    monthly[m].revenue += revenue;
+    totalRevenue += revenue;
+    totalOrdersFromMv += orders;
+  }
+  for (const m of Object.values(monthly)) {
+    m.avg_check = m.orders > 0 ? Math.round(m.revenue / m.orders) : 0;
+  }
+  const timeline = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month));
+
+  // ─── 2-7. Top studios / top partners / categories / movers ─────────────────
+  //
+  // Эти секции по-прежнему требуют individual sale rows (нужны agency_id,
+  // partner_id, customer_id которых нет в mv_sales_monthly). Загружаем sales
+  // с теми же фильтрами что выше — после миграции 0018 у sales есть индекс
+  // по sale_date, так что date-фильтр снизит row count если задан.
   let filters = {};
   if (args.date_from) filters.gte = { sale_date: args.date_from };
   if (args.date_to) filters.lte = { sale_date: args.date_to };
@@ -656,23 +703,6 @@ export async function getSalesAnalytics(req, params = {}) {
     'id, sale_date, total_amount, agency_id, partner_id, customer_id',
     filters
   );
-
-  // Bucket by month
-  const monthly = {};
-  let totalRevenue = 0;
-  for (const s of sales) {
-    if (!s.sale_date) continue;
-    const m = s.sale_date.slice(0, 7);
-    if (!monthly[m]) monthly[m] = { month: m, orders: 0, revenue: 0 };
-    monthly[m].orders++;
-    monthly[m].revenue += s.total_amount || 0;
-    totalRevenue += s.total_amount || 0;
-  }
-  // Average check per month
-  for (const m of Object.values(monthly)) {
-    m.avg_check = m.orders > 0 ? Math.round(m.revenue / m.orders) : 0;
-  }
-  const timeline = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month));
 
   // 2. Top studios
   const byAgency = {};
