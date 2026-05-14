@@ -138,10 +138,13 @@ function _isLidJid(jid) {
 function _clientName(chatRow, jid, pushName = null) {
   if (chatRow?.display_name) return chatRow.display_name;
 
+  // chats.phone_number — реальный телефон от senderPn для LID-контактов
+  // (Baileys v7 передаёт PN отдельно от LID JID при первом сообщении).
+  if (chatRow?.phone_number) return `+${chatRow.phone_number}`;
+
   // Filter out push_name = JID local part. Для LID-контактов Baileys
   // иногда кладёт «205493331062950@lid» → push_name становится
   // "205493331062950" — выглядит как телефон, но это internal ID.
-  // Без фильтра frontend показывает Adil-у 15-digit число вместо имени.
   const jidLocal = (jid || '').split('@')[0];
   const isJunkPushName = pushName && (pushName === jidLocal || /^\d{13,}$/.test(pushName));
   if (pushName && !isJunkPushName) return pushName;
@@ -269,7 +272,7 @@ export async function getIssues({ category, page, limit, db, userId }) {
 
   const [chatsRes, sessionsRes] = await Promise.all([
     db.from('chats')
-      .select('session_id, remote_jid, display_name')
+      .select('session_id, remote_jid, display_name, phone_number')
       .in('session_id', uniqueSessions)
       .in('remote_jid', uniqueJids),
     db.from('session_config')
@@ -326,9 +329,11 @@ export async function getIssues({ category, page, limit, db, userId }) {
       chat_ai_id: r.id,
       remote_jid: r.remote_jid,
       client_name: _clientName(chat, r.remote_jid, pushName),
-      // Поддержка для UI: phone — реальный телефон или null если LID;
-      // is_lid — флаг для UI чтобы не показывать «номер».
-      phone: _phoneFromJid(r.remote_jid),
+      // Поддержка для UI:
+      //   - phone — реальный телефон (приоритет: chats.phone_number от senderPn
+      //     для LID, fallback на digits из @s.whatsapp.net JID)
+      //   - is_lid — флаг для UI чтобы не показывать «номер» если phone недоступен
+      phone: chat?.phone_number || _phoneFromJid(r.remote_jid),
       is_lid: _isLidJid(r.remote_jid),
       push_name: pushName,
       session_id: r.session_id,
