@@ -157,6 +157,68 @@ function _clientName(chatRow, jid, pushName = null) {
   return `Контакт #${tail}`;
 }
 
+async function _filterRowsWithMessages(rows, db) {
+  if (!rows.length) return rows;
+
+  const dialogIds = [...new Set(rows.map((r) => r.dialog_session_id).filter(Boolean))];
+  const uniqueSessions = [...new Set(rows.map((r) => r.session_id).filter(Boolean))];
+  const uniqueJids = [...new Set(rows.map((r) => r.remote_jid).filter(Boolean))];
+
+  const [dialogRes, exactRes] = await Promise.all([
+    dialogIds.length > 0
+      ? db.from('messages')
+          .select('dialog_session_id')
+          .in('dialog_session_id', dialogIds)
+          .limit(5000)
+      : Promise.resolve({ data: [] }),
+    uniqueSessions.length > 0 && uniqueJids.length > 0
+      ? db.from('messages')
+          .select('session_id, remote_jid')
+          .in('session_id', uniqueSessions)
+          .in('remote_jid', uniqueJids)
+          .limit(5000)
+      : Promise.resolve({ data: [] }),
+  ]);
+
+  const dialogsWithMessages = new Set(
+    (dialogRes.data || []).map((m) => String(m.dialog_session_id))
+  );
+  const exactPairsWithMessages = new Set(
+    (exactRes.data || []).map((m) => `${m.session_id}:::${m.remote_jid}`)
+  );
+
+  const bareLidRows = rows.filter((r) => {
+    const digits = String(r.remote_jid || '').replace(/[^0-9]/g, '');
+    return r.remote_jid === digits && digits.length >= 13;
+  });
+  const lidSuffixPairsWithMessages = new Set();
+
+  await Promise.all(bareLidRows.map(async (r) => {
+    const digits = String(r.remote_jid || '').replace(/[^0-9]/g, '');
+    const { data } = await db.from('messages')
+      .select('session_id, remote_jid')
+      .eq('session_id', r.session_id)
+      .like('remote_jid', `${digits}@%`)
+      .limit(1);
+    if ((data || []).length > 0) {
+      lidSuffixPairsWithMessages.add(`${r.session_id}:::${r.remote_jid}`);
+    }
+  }));
+
+  const filtered = rows.filter((r) =>
+    dialogsWithMessages.has(String(r.dialog_session_id)) ||
+    exactPairsWithMessages.has(`${r.session_id}:::${r.remote_jid}`) ||
+    lidSuffixPairsWithMessages.has(`${r.session_id}:::${r.remote_jid}`)
+  );
+
+  const orphanCount = rows.length - filtered.length;
+  if (orphanCount > 0) {
+    logger.warn({ orphanCount }, 'getIssues: skipped chat_ai rows without messages');
+  }
+
+  return filtered;
+}
+
 // ─── Main export: getIssues ───────────────────────────────────────────────────
 
 /**
@@ -255,10 +317,11 @@ export async function getIssues({ category, page, limit, db, userId }) {
       )
     : (rawRows || []);
 
-  const total = allRows.length;
+  const rowsWithMessages = await _filterRowsWithMessages(allRows, db);
+  const total = rowsWithMessages.length;
 
   // Paginate
-  const slice = allRows.slice(pg * lim, pg * lim + lim);
+  const slice = rowsWithMessages.slice(pg * lim, pg * lim + lim);
 
   if (slice.length === 0) {
     const result = _emptyResult(category, pg, lim, total);
