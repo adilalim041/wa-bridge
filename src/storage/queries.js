@@ -334,16 +334,20 @@ export async function saveContact(remoteJid, pushName) {
 export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0, db = supabase) {
   // W1.1 Phase 2: accept optional dbClient so RLS-filtered reads work via userClient
   try {
-    let query = db
+    // 2026-05-14: LID-aware lookup. Frontend нормализует JID до bare digits
+    // ('205493331062950') через normalizeChatId. Но в messages.remote_jid
+    // часто stored с @lid суффиксом ('205493331062950@lid'). Поэтому
+    // делаем 2 попытки:
+    //   1. Exact match (для @s.whatsapp.net / @g.us — там normalize стрипает суффикс
+    //      и записи stored bare же — старый Baileys).
+    //   2. Если нет результатов и remoteJid это 13+ digits (likely LID) —
+    //      пробуем LIKE 'digits@%' чтобы поймать @lid вариант.
+    let q = db
       .from('messages')
       .select('*')
       .eq('session_id', sessionId);
-
-    if (remoteJid) {
-      query = query.eq('remote_jid', remoteJid);
-    }
-
-    const { data, error } = await query
+    if (remoteJid) q = q.eq('remote_jid', remoteJid);
+    const { data: exact, error } = await q
       .order('timestamp', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -352,7 +356,21 @@ export async function getMessages(sessionId, remoteJid, limit = 50, offset = 0, 
       return [];
     }
 
-    return data ?? [];
+    if ((exact ?? []).length > 0 || !remoteJid) return exact ?? [];
+
+    // Fallback: try with @lid suffix if remoteJid is bare digits & 13+ длины
+    const digits = String(remoteJid).replace(/[^0-9]/g, '');
+    if (digits.length < 13 || remoteJid !== digits) return [];
+
+    const { data: withSuffix } = await db
+      .from('messages')
+      .select('*')
+      .eq('session_id', sessionId)
+      .like('remote_jid', `${digits}@%`)
+      .order('timestamp', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    return withSuffix ?? [];
   } catch (error) {
     logger.error({ err: error, sessionId, remoteJid }, 'Unexpected error while fetching messages');
     return [];

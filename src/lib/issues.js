@@ -104,11 +104,10 @@ function _phoneFromJid(jid) {
   if (jid.includes('@lid')) return null; // LID identifier, not a phone
   const digits = jid.replace(/[^0-9]/g, '');
   if (!digits) return null;
-  // Real phone numbers max 13 digits (country code + 12). LID JIDs are 14-15
-  // digits — even when stored WITHOUT @lid suffix in DB (Baileys v7 sometimes
-  // strips suffix during upsert). Adil 2026-05-14: «205493331062950» виден
-  // как «телефон» в Медленный ответ — это LID, не реальный номер.
-  if (digits.length >= 14) return null;
+  // Real phone numbers ≤12 digits (e.g. KZ +77771234567 = 11, UK +447812345678 = 12).
+  // LID JIDs are 13-15 digits — even when stored WITHOUT @lid suffix in DB
+  // (Baileys v7 quirk). Adil 2026-05-14: ещё пара 13-digit LIDs не отсеивались.
+  if (digits.length >= 13) return null;
   return digits;
 }
 
@@ -120,10 +119,11 @@ function _phoneFromJid(jid) {
 function _isLidJid(jid) {
   if (!jid) return false;
   if (jid.includes('@lid')) return true;
-  // Bare-digit JID без @suffix длиной 14+ цифр — это тоже LID,
+  // Bare-digit JID без @suffix длиной 13+ цифр — это тоже LID,
   // просто сохранён без явного маркера (Baileys v7 quirk).
+  // 13+ т.к. real phone (даже UK +44 12 digits max) <= 12 digits.
   const digits = jid.replace(/[^0-9]/g, '');
-  if (jid === digits && digits.length >= 14) return true;
+  if (jid === digits && digits.length >= 13) return true;
   return false;
 }
 
@@ -143,7 +143,7 @@ function _clientName(chatRow, jid, pushName = null) {
   // "205493331062950" — выглядит как телефон, но это internal ID.
   // Без фильтра frontend показывает Adil-у 15-digit число вместо имени.
   const jidLocal = (jid || '').split('@')[0];
-  const isJunkPushName = pushName && (pushName === jidLocal || /^\d{12,}$/.test(pushName));
+  const isJunkPushName = pushName && (pushName === jidLocal || /^\d{13,}$/.test(pushName));
   if (pushName && !isJunkPushName) return pushName;
 
   const phone = _phoneFromJid(jid);
