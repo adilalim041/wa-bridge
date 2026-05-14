@@ -270,7 +270,22 @@ export async function getIssues({ category, page, limit, db, userId }) {
   const uniqueJids = [...new Set(slice.map((r) => r.remote_jid))];
   const uniqueSessions = [...new Set(slice.map((r) => r.session_id))];
 
-  const [chatsRes, sessionsRes] = await Promise.all([
+  // LID→phone resolution: для bare-digit LIDs (13+ digits, no @suffix)
+  // ищем real phone в auth_state.lid-mapping. Baileys saves reverse map
+  // там при resolving LID → PN. Key format: '${sessionId}:lid-mapping:${lid}_reverse',
+  // value: JSON-string phone number.
+  // Adil 2026-05-14 root cause: chat_ai создавался pipeline'ом с
+  // remote_jid=BARE_LID, chats.phone_number = тот же LID (existing bug
+  // в messageHandler:431). Real phone доступен только через auth_state lookup.
+  const lidCandidates = [...new Set(
+    uniqueJids
+      .filter((j) => {
+        const digits = String(j || '').replace(/[^0-9]/g, '');
+        return j === digits && digits.length >= 13;
+      })
+  )];
+
+  const [chatsRes, sessionsRes, lidMapRes] = await Promise.all([
     db.from('chats')
       .select('session_id, remote_jid, display_name, phone_number')
       .in('session_id', uniqueSessions)
@@ -278,7 +293,28 @@ export async function getIssues({ category, page, limit, db, userId }) {
     db.from('session_config')
       .select('session_id, display_name')
       .in('session_id', uniqueSessions),
+    lidCandidates.length > 0
+      ? db.from('auth_state')
+          .select('key, value')
+          .like('key', '%:lid-mapping:%_reverse')
+      : Promise.resolve({ data: [] }),
   ]);
+
+  // Build LID→phone map from auth_state
+  const lidPhoneMap = new Map(); // lid_digits → phone (E.164 digits)
+  for (const row of lidMapRes.data ?? []) {
+    const m = /:lid-mapping:(\d+)_reverse$/.exec(row.key || '');
+    if (!m) continue;
+    const lid = m[1];
+    if (!lidCandidates.includes(lid)) continue;
+    try {
+      const phone = typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
+      const phoneStr = String(phone || '').replace(/[^0-9]/g, '');
+      if (phoneStr.length >= 7 && phoneStr.length <= 13) {
+        lidPhoneMap.set(lid, phoneStr);
+      }
+    } catch { /* skip bad json */ }
+  }
 
   // Push-name lookup из messages — нужен fallback для LID-формат JIDs
   // (новый WhatsApp protocol: remote_jid="...@lid", display_name=null,
@@ -324,16 +360,35 @@ export async function getIssues({ category, page, limit, db, userId }) {
     const chat = chatsMap.get(chatKey);
     const pushName = pushNameMap.get(chatKey) || null;
     const fb = footballMeta?.get(r.remote_jid) || null;
+
+    // Resolve LID→phone via auth_state map (priority over chats.phone_number,
+    // т.к. messageHandler.upsertChat saved BARE LID туда как «phone» — bug).
+    const resolvedFromLidMap = lidPhoneMap.get(r.remote_jid);
+
+    // For phone field: prefer auth_state resolved → chats.phone_number (if
+    // not = LID itself) → _phoneFromJid.
+    let phoneOut = resolvedFromLidMap;
+    if (!phoneOut && chat?.phone_number && chat.phone_number !== r.remote_jid) {
+      phoneOut = chat.phone_number;
+    }
+    if (!phoneOut) phoneOut = _phoneFromJid(r.remote_jid);
+
+    // chatRowForName — temporary override чтобы _clientName увидел
+    // resolved phone (если есть). Не мутируем real chat row.
+    const chatRowForName = resolvedFromLidMap
+      ? { ...chat, phone_number: resolvedFromLidMap }
+      : chat;
+
     return {
       dialog_session_id: r.dialog_session_id,
       chat_ai_id: r.id,
       remote_jid: r.remote_jid,
-      client_name: _clientName(chat, r.remote_jid, pushName),
+      client_name: _clientName(chatRowForName, r.remote_jid, pushName),
       // Поддержка для UI:
-      //   - phone — реальный телефон (приоритет: chats.phone_number от senderPn
-      //     для LID, fallback на digits из @s.whatsapp.net JID)
-      //   - is_lid — флаг для UI чтобы не показывать «номер» если phone недоступен
-      phone: chat?.phone_number || _phoneFromJid(r.remote_jid),
+      //   - phone — приоритет: auth_state LID-mapping → chats.phone_number (если ≠ LID)
+      //              → _phoneFromJid. Для unresolvable LID — null.
+      //   - is_lid — флаг для UI чтобы не показывать «номер» если phone недоступен.
+      phone: phoneOut,
       is_lid: _isLidJid(r.remote_jid),
       push_name: pushName,
       session_id: r.session_id,
