@@ -124,11 +124,20 @@ function _isLidJid(jid) {
  */
 function _clientName(chatRow, jid, pushName = null) {
   if (chatRow?.display_name) return chatRow.display_name;
-  if (pushName) return pushName;
+
+  // Filter out push_name = JID local part. Для LID-контактов Baileys
+  // иногда кладёт «205493331062950@lid» → push_name становится
+  // "205493331062950" — выглядит как телефон, но это internal ID.
+  // Без фильтра frontend показывает Adil-у 15-digit число вместо имени.
+  const jidLocal = (jid || '').split('@')[0];
+  const isJunkPushName = pushName && (pushName === jidLocal || /^\d{12,}$/.test(pushName));
+  if (pushName && !isJunkPushName) return pushName;
+
   const phone = _phoneFromJid(jid);
   if (phone) return phone;
-  // LID или group fallback
-  const tail = (jid || '').replace(/[^0-9]/g, '').slice(-4) || '????';
+
+  // LID или group fallback — последние 4 цифры JID
+  const tail = jidLocal.replace(/[^0-9]/g, '').slice(-4) || '????';
   return `Контакт #${tail}`;
 }
 
