@@ -102,7 +102,14 @@ const CHAT_AI_SELECT = [
 function _phoneFromJid(jid) {
   if (!jid || jid.includes('-') || jid.includes('120363')) return null;
   if (jid.includes('@lid')) return null; // LID identifier, not a phone
-  return jid.replace(/[^0-9]/g, '') || null;
+  const digits = jid.replace(/[^0-9]/g, '');
+  if (!digits) return null;
+  // Real phone numbers max 13 digits (country code + 12). LID JIDs are 14-15
+  // digits — even when stored WITHOUT @lid suffix in DB (Baileys v7 sometimes
+  // strips suffix during upsert). Adil 2026-05-14: «205493331062950» виден
+  // как «телефон» в Медленный ответ — это LID, не реальный номер.
+  if (digits.length >= 14) return null;
+  return digits;
 }
 
 /**
@@ -111,7 +118,13 @@ function _phoneFromJid(jid) {
  * вводит Adil-а в заблуждение (выглядит как номер, но не звонится).
  */
 function _isLidJid(jid) {
-  return Boolean(jid && jid.includes('@lid'));
+  if (!jid) return false;
+  if (jid.includes('@lid')) return true;
+  // Bare-digit JID без @suffix длиной 14+ цифр — это тоже LID,
+  // просто сохранён без явного маркера (Baileys v7 quirk).
+  const digits = jid.replace(/[^0-9]/g, '');
+  if (jid === digits && digits.length >= 14) return true;
+  return false;
 }
 
 /**
