@@ -16,6 +16,7 @@ import { startMetaAdsCron, stopMetaAdsCron } from './meta-ads/cron.js';
 let server;
 let keepAliveTimer;
 let phoneRefreshTimer;
+let phoneRefreshRunning = false;
 
 function startKeepAlive() {
   const INTERVAL = 4 * 60 * 1000; // every 4 minutes
@@ -61,14 +62,25 @@ async function bootstrap() {
   // startMvRefreshScheduler();
   startMetaAdsCron();
 
-  // Refresh phone registry every 60s to pick up new sessions
+  // Refresh phone registry periodically to pick up new sessions. Keep this
+  // conservative: during Supabase outages overlapping refreshes can pile up
+  // and add noise to an already throttled DB.
+  const phoneRefreshIntervalMs = Number(process.env.PHONE_REGISTRY_REFRESH_MS || 5 * 60_000);
   phoneRefreshTimer = setInterval(async () => {
+    if (phoneRefreshRunning) {
+      logger.debug('Phone registry refresh skipped: previous refresh still running');
+      return;
+    }
+
+    phoneRefreshRunning = true;
     try {
       await loadPhoneRegistry();
     } catch (err) {
       logger.debug({ err: err.message }, 'Phone registry refresh failed');
+    } finally {
+      phoneRefreshRunning = false;
     }
-  }, 60_000);
+  }, phoneRefreshIntervalMs);
 
   logger.info('WA Bridge multi-session started');
 }

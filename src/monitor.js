@@ -1,5 +1,6 @@
 import { config } from './config.js';
 import { supabase } from './storage/supabase.js';
+import { getQueueStats } from './storage/queries.js';
 import { captureMessage } from './observability/sentry.js';
 
 const TELEGRAM_BOT_TOKEN = config.telegramBotToken;
@@ -133,8 +134,12 @@ export function trackDisconnectEvent(sessionId, statusCode) {
 // Sessions disconnected by 515 (restartRequired) are EXPECTED to recover —
 // don't count them in mass-disconnect tally.
 const MASS_DISCONNECT_GRACE_MS = 3 * 60 * 1000; // 3 min (was 60s)
+const MASS_DISCONNECT_ALERT_COOLDOWN = Number(process.env.MASS_DISCONNECT_ALERT_COOLDOWN_MS || 30 * 60 * 1000);
+const DB_DEGRADED_ALERT_COOLDOWN = Number(process.env.DB_DEGRADED_ALERT_COOLDOWN_MS || 2 * 60 * 60 * 1000);
 const recentDisconnectReasons = new Map(); // sessionId → { statusCode, at }
 let massDisconnectTimer = null;
+let lastMassDisconnectAlertAt = 0;
+let lastDbDegradedAlertAt = 0;
 
 export function recordDisconnectReason(sessionId, statusCode) {
   recentDisconnectReasons.set(sessionId, { statusCode, at: Date.now() });
@@ -152,6 +157,31 @@ function isExpectedRecovery(sessionId) {
   return false;
 }
 
+function getDbDegradedHint() {
+  const queueStats = getQueueStats();
+  return {
+    degraded: queueStats.size > 0 || queueStats.timerActive,
+    queueStats,
+  };
+}
+
+function maybeSendDbDegradedAlert(reason, extra = {}) {
+  const now = Date.now();
+  if (now - lastDbDegradedAlertAt < DB_DEGRADED_ALERT_COOLDOWN) return false;
+
+  lastDbDegradedAlertAt = now;
+  const { queueStats } = getDbDegradedHint();
+  sendTelegramAlert(
+    `⚠️ Supabase degraded: ${reason}. WhatsApp reconnect alerts are suppressed while DB is unhealthy. Queue: ${queueStats.size}/${queueStats.maxSize}.`
+  ).catch(() => {});
+  captureMessage('Supabase degraded', {
+    level: 'warning',
+    tags: { kind: 'supabase-degraded' },
+    extra: { queueStats, ...extra },
+  });
+  return true;
+}
+
 export function checkMassDisconnect(allSessionsCount) {
   // Count only sessions that are NOT expected to auto-recover.
   const realDown = Array.from(disconnectedAt.keys()).filter((sid) => !isExpectedRecovery(sid));
@@ -162,6 +192,22 @@ export function checkMassDisconnect(allSessionsCount) {
         // Re-check after grace period — still many genuinely down?
         const stillDown = Array.from(disconnectedAt.keys()).filter((sid) => !isExpectedRecovery(sid));
         if (stillDown.length >= 3) {
+          const dbHint = getDbDegradedHint();
+          if (dbHint.degraded) {
+            maybeSendDbDegradedAlert(`${stillDown.length}/${allSessionsCount} sessions down`, {
+              disconnectedSessions: stillDown,
+            });
+            massDisconnectTimer = null;
+            return;
+          }
+
+          const now = Date.now();
+          if (now - lastMassDisconnectAlertAt < MASS_DISCONNECT_ALERT_COOLDOWN) {
+            massDisconnectTimer = null;
+            return;
+          }
+          lastMassDisconnectAlertAt = now;
+
           sendTelegramAlert(
             `🚨 Mass disconnect: ${stillDown.length}/${allSessionsCount} sessions down! Possible network/Railway issue.`
           ).catch(() => {});
@@ -355,6 +401,15 @@ export function startHealthMonitor(sessionId) {
     const downtime = Date.now() - dcStart;
     const lastAlert = lastAlertTime.get(sessionId) || 0;
     if (downtime > DOWNTIME_THRESHOLD && !alertSent.get(sessionId) && (Date.now() - lastAlert > ALERT_COOLDOWN)) {
+      const dbHint = getDbDegradedHint();
+      if (dbHint.degraded) {
+        maybeSendDbDegradedAlert(`session ${sessionId} disconnected for ${Math.round(downtime / 60000)} minutes`, {
+          sessionId,
+          downtimeMinutes: Math.round(downtime / 60000),
+        });
+        return;
+      }
+
       alertSent.set(sessionId, true);
       lastAlertTime.set(sessionId, Date.now());
       const minutes = Math.round(downtime / 60000);
