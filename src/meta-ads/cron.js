@@ -7,7 +7,7 @@
  *
  * Guards:
  *  - metaAdsConfig.enabled must be true (token present + config valid).
- *  - META_ADS_CRON_ENABLED !== 'false' (opt-out env flag).
+ *  - META_ADS_CRON_ENABLED === 'true' (explicit opt-in env flag).
  *  - Idempotent: calling startMetaAdsCron() twice is safe.
  *
  * Alert policy (Telegram):
@@ -140,8 +140,8 @@ export function startMetaAdsCron() {
     return;
   }
 
-  if (process.env.META_ADS_CRON_ENABLED === 'false') {
-    logger.info('meta-ads:cron: disabled via META_ADS_CRON_ENABLED=false');
+  if (process.env.META_ADS_CRON_ENABLED !== 'true') {
+    logger.info('meta-ads:cron: disabled (set META_ADS_CRON_ENABLED=true to enable)');
     return;
   }
 
