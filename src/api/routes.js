@@ -1180,6 +1180,7 @@ export function setupRoutes(app) {
 
   // ---------------------------------------------------------------------------
   // GET /ai/issues?category=slow|no_followup|critical|football|lost&page=N&limit=20
+  // Optional filters: session_id, date_from/date_to, days.
   //
   // Paginated list of problem conversations for the Analytics carousel.
   // 5 categories (spec: backlog.md 2026-04-29):
@@ -1209,7 +1210,17 @@ export function setupRoutes(app) {
       const db = req.userClient ?? supabase;
       const userId = req.user?.userId || req.user?.id || null;
 
-      const result = await getIssues({ category, page, limit, db, userId });
+      const result = await getIssues({
+        category,
+        page,
+        limit,
+        sessionId: req.query.session_id,
+        dateFrom: req.query.date_from,
+        dateTo: req.query.date_to,
+        days: req.query.days,
+        db,
+        userId,
+      });
       return res.json(result);
     } catch (err) {
       if (err.statusCode === 400) return res.status(400).json({ error: err.message });
