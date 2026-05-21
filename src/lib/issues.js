@@ -32,10 +32,16 @@ import { logger } from '../config.js';
 const ISSUES_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 const _issuesCache = new Map();
 
-function _cacheKey(userId, category, page, limit) {
+function _cacheKey(userId, category, page, limit, filters = {}) {
   // service-role callers (x-api-key) don't cache — would leak across users
   if (!userId) return null;
-  return `issues|${userId}|${category}|${page}|${limit}`;
+  const filterKey = [
+    filters.sessionId || '',
+    filters.dateFrom || '',
+    filters.dateTo || '',
+    filters.days || '',
+  ].join('|');
+  return `issues|${userId}|${category}|${page}|${limit}|${filterKey}`;
 }
 
 function _cacheGet(key) {
@@ -90,6 +96,7 @@ const CHAT_AI_SELECT = [
   'action_suggestion',
   'problem_dismissed_action',
   'problem_dismissed_at',
+  'customer_type',
 ].join(', ');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -228,20 +235,36 @@ async function _filterRowsWithMessages(rows, db) {
  * @param {string} opts.category - 'slow' | 'no_followup' | 'critical' | 'football' | 'lost'
  * @param {number} opts.page - 0-based page index
  * @param {number} opts.limit - items per page (max 50)
+ * @param {string} [opts.sessionId] - optional session filter
+ * @param {string} [opts.dateFrom] - optional YYYY-MM-DD analysis_date lower bound
+ * @param {string} [opts.dateTo] - optional YYYY-MM-DD analysis_date upper bound
+ * @param {number} [opts.days] - optional rolling window when dateFrom is absent
  * @param {object} opts.db - Supabase client (req.userClient or serviceClient)
  * @param {string|null} opts.userId - for cache key (req.user?.userId)
  * @returns {Promise<{category, items, page, limit, total, has_more}>}
  */
-export async function getIssues({ category, page, limit, db, userId }) {
+export async function getIssues({ category, page, limit, sessionId, dateFrom, dateTo, days, db, userId }) {
   if (!VALID_CATEGORIES.has(category)) {
     throw Object.assign(new Error(`Invalid category: ${category}`), { statusCode: 400 });
   }
 
   const pg = Math.max(0, Math.floor(page));
   const lim = Math.min(Math.max(1, Math.floor(limit)), 50);
+  const safeSessionId = sessionId && sessionId !== '__all__' ? String(sessionId) : null;
+  const safeDateFrom = dateFrom && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFrom)) ? String(dateFrom) : null;
+  const safeDateTo = dateTo && /^\d{4}-\d{2}-\d{2}$/.test(String(dateTo)) ? String(dateTo) : null;
+  const safeDays = Math.min(Math.max(parseInt(days) || 7, 1), 90);
+  const rollingDateFrom = new Date(Date.now() - (safeDays - 1) * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
 
   // Cache check
-  const ck = _cacheKey(userId, category, pg, lim);
+  const ck = _cacheKey(userId, category, pg, lim, {
+    sessionId: safeSessionId,
+    dateFrom: safeDateFrom,
+    dateTo: safeDateTo,
+    days: safeDateFrom ? null : safeDays,
+  });
   const cached = _cacheGet(ck);
   if (cached) return cached;
 
@@ -272,6 +295,13 @@ export async function getIssues({ category, page, limit, db, userId }) {
 
   // Build base query
   let q = db.from('chat_ai').select(CHAT_AI_SELECT);
+  q = q.in('customer_type', ['end_client', 'partner']);
+  if (safeSessionId) q = q.eq('session_id', safeSessionId);
+  if (safeDateFrom) {
+    q = q.gte('analysis_date', safeDateFrom).lte('analysis_date', safeDateTo || safeDateFrom);
+  } else {
+    q = q.gte('analysis_date', rollingDateFrom);
+  }
 
   // All categories except 'lost' exclude already-dismissed rows
   if (category !== 'lost') {
