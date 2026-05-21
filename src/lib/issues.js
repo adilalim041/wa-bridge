@@ -69,6 +69,10 @@ export function invalidateIssuesCache() {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const VALID_CATEGORIES = new Set(['slow', 'no_followup', 'critical', 'football', 'lost']);
+const ALMATY_UTC_OFFSET_MIN = 5 * 60;
+const WORK_START_HOUR = 10;
+const WORK_END_HOUR = 20;
+const SLOW_RESPONSE_MINUTES = 60;
 
 // Stages where the deal moved forward — dismiss = won.
 // All other stages (NULL, consultation stuck, refused, needs_review) = lost.
@@ -100,6 +104,71 @@ const CHAT_AI_SELECT = [
 ].join(', ');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function _localParts(date) {
+  const shifted = new Date(date.getTime() + ALMATY_UTC_OFFSET_MIN * 60000);
+  return {
+    y: shifted.getUTCFullYear(),
+    m: shifted.getUTCMonth(),
+    d: shifted.getUTCDate(),
+    h: shifted.getUTCHours(),
+  };
+}
+
+function _utcFromLocal(y, m, d, h) {
+  return new Date(Date.UTC(y, m, d, h, 0, 0) - ALMATY_UTC_OFFSET_MIN * 60000);
+}
+
+function _businessMinutesBetween(a, b) {
+  let cursor = new Date(a);
+  const end = new Date(b);
+  if (!Number.isFinite(cursor.getTime()) || !Number.isFinite(end.getTime()) || end <= cursor) return 0;
+
+  let total = 0;
+  while (cursor < end && total < 60 * 24 * 30) {
+    const p = _localParts(cursor);
+    const dayStart = _utcFromLocal(p.y, p.m, p.d, WORK_START_HOUR);
+    const dayEnd = _utcFromLocal(p.y, p.m, p.d, WORK_END_HOUR);
+
+    if (cursor < dayStart) cursor = dayStart;
+    if (cursor >= dayEnd) {
+      cursor = _utcFromLocal(p.y, p.m, p.d + 1, WORK_START_HOUR);
+      continue;
+    }
+
+    const segmentEnd = end < dayEnd ? end : dayEnd;
+    total += Math.max(0, Math.round((segmentEnd - cursor) / 60000));
+    cursor = segmentEnd >= dayEnd ? _utcFromLocal(p.y, p.m, p.d + 1, WORK_START_HOUR) : segmentEnd;
+  }
+  return total;
+}
+
+async function _getSlowDialogIds({ db, sessionId, dateFrom, dateTo }) {
+  let q = db
+    .from('manager_analytics')
+    .select('dialog_session_id, customer_message_at, manager_response_at');
+
+  if (sessionId) q = q.eq('session_id', sessionId);
+  if (dateFrom) q = q.gte('customer_message_at', `${dateFrom}T00:00:00+05:00`);
+  if (dateTo) q = q.lte('customer_message_at', `${dateTo}T23:59:59+05:00`);
+  q = q.limit(1000);
+
+  const { data, error } = await q;
+  if (error) {
+    logger.error({ err: error }, 'getIssues: manager_analytics slow query failed');
+    throw new Error('manager_analytics query failed');
+  }
+
+  const slow = new Set();
+  for (const row of data || []) {
+    if (!row.dialog_session_id || !row.customer_message_at) continue;
+    const responseAt = row.manager_response_at || new Date();
+    if (_businessMinutesBetween(row.customer_message_at, responseAt) > SLOW_RESPONSE_MINUTES) {
+      slow.add(row.dialog_session_id);
+    }
+  }
+  return slow;
+}
 
 /**
  * Format phone digits from JID (e.g. "77001234567@s.whatsapp.net" → "77001234567").
@@ -226,6 +295,29 @@ async function _filterRowsWithMessages(rows, db) {
   return filtered;
 }
 
+async function _filterRowsByPhoneTags(rows, db) {
+  if (!rows.length) return rows;
+  const jids = [...new Set(rows.map((r) => r.remote_jid).filter(Boolean))];
+  if (!jids.length) return rows;
+
+  const { data, error } = await db
+    .from('chat_tags')
+    .select('remote_jid, tags')
+    .in('remote_jid', jids);
+  if (error) {
+    logger.warn({ err: error }, 'getIssues: chat_tags filter failed');
+    return rows;
+  }
+
+  const nonBusinessTags = new Set(['сотрудник', 'спам', 'личное', 'коллега', 'неизвестно']);
+  const tagsByJid = new Map((data || []).map((r) => [r.remote_jid, r.tags || []]));
+
+  return rows.filter((r) => {
+    const tags = tagsByJid.get(r.remote_jid) || [];
+    return !tags.some((tag) => nonBusinessTags.has(String(tag).toLowerCase()));
+  });
+}
+
 // ─── Main export: getIssues ───────────────────────────────────────────────────
 
 /**
@@ -257,6 +349,10 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
   const rollingDateFrom = new Date(Date.now() - (safeDays - 1) * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10);
+  const effectiveDateFrom = safeDateFrom || rollingDateFrom;
+  const effectiveDateTo = safeDateFrom
+    ? (safeDateTo || safeDateFrom)
+    : new Date().toISOString().slice(0, 10);
 
   // Cache check
   const ck = _cacheKey(userId, category, pg, lim, {
@@ -267,6 +363,21 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
   });
   const cached = _cacheGet(ck);
   if (cached) return cached;
+
+  let slowDialogIds = null;
+  if (category === 'slow') {
+    slowDialogIds = await _getSlowDialogIds({
+      db,
+      sessionId: safeSessionId,
+      dateFrom: effectiveDateFrom,
+      dateTo: effectiveDateTo,
+    });
+    if (slowDialogIds.size === 0) {
+      const result = _emptyResult(category, pg, lim);
+      _cacheSet(ck, result);
+      return result;
+    }
+  }
 
   // For 'football' we need the remote_jid set from v_football_cases first
   let footballMeta = null; // Map<jid, { sessions, count, last_outbound_at }>
@@ -310,7 +421,7 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
 
   // Category-specific filters
   if (category === 'slow') {
-    q = q.contains('manager_issues', ['slow_first_response']);
+    q = q.in('dialog_session_id', [...slowDialogIds]);
   } else if (category === 'no_followup') {
     q = q.contains('manager_issues', ['no_followup']);
   } else if (category === 'critical') {
@@ -338,14 +449,16 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
     throw new Error('chat_ai query failed');
   }
 
+  const businessRows = await _filterRowsByPhoneTags(rawRows || [], db);
+
   // JS post-filter for 'critical' (array non-empty check)
   const allRows = category === 'critical'
-    ? (rawRows || []).filter((r) =>
+    ? businessRows.filter((r) =>
         r.sentiment === 'aggressive' ||
         r.intent === 'complaint' ||
         (Array.isArray(r.risk_flags) && r.risk_flags.length > 0)
       )
-    : (rawRows || []);
+    : businessRows;
 
   const rowsWithMessages = await _filterRowsWithMessages(allRows, db);
   const total = rowsWithMessages.length;
@@ -453,6 +566,8 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
     const chat = chatsMap.get(chatKey);
     const pushName = pushNameMap.get(chatKey) || null;
     const fb = footballMeta?.get(r.remote_jid) || null;
+    const managerIssues = new Set(r.manager_issues || []);
+    if (category === 'slow') managerIssues.add('slow_response');
 
     // Resolve LID→phone via auth_state map (priority over chats.phone_number,
     // т.к. messageHandler.upsertChat saved BARE LID туда как «phone» — bug).
@@ -489,7 +604,7 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
       summary_ru: r.summary_ru || null,
       deal_stage: r.deal_stage || null,
       analyzed_at: r.analyzed_at || r.analysis_date || null,
-      manager_issues: r.manager_issues || [],
+      manager_issues: [...managerIssues],
       risk_flags: r.risk_flags || [],
       action_required: r.action_required || false,
       action_suggestion: r.action_suggestion || null,
