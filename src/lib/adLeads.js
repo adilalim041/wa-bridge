@@ -38,6 +38,8 @@ const WORK_START_HOUR = 10;
 const WORK_END_HOUR = 20;
 const SLOW_MINUTES = 15;
 const VERY_SLOW_MINUTES = 60;
+const CONVERSION_WINDOW_DAYS = 45;
+const EVENT_BUCKET_LIMIT = 100;
 const CACHE_TTL_MS = 2 * 60 * 1000;
 
 const _cache = new Map();
@@ -229,32 +231,79 @@ function summarize(events) {
     verySlowFirstResponse: events.filter((e) => Number.isFinite(e.firstResponseWorkMinutes) && e.firstResponseWorkMinutes > VERY_SLOW_MINUTES).length,
     noFollowup: events.filter((e) => e.followupStatus === 'client_waiting').length,
     salesMatched: events.filter((e) => e.matchedSalesCount > 0).length,
+    customerSalesMatched: events.filter((e) => (e.matchedSalesByRole?.customer || 0) > 0).length,
+    partnerSalesMatched: events.filter((e) => (e.matchedSalesByRole?.partner || 0) > 0).length,
     revenue: events.reduce((sum, e) => sum + (Number(e.matchedRevenue) || 0), 0),
   };
 }
 
 function buildContactIndexes(contacts = []) {
   const byPhone = new Map();
+  const byJid = new Map();
   for (const contact of contacts) {
     const phones = [contact.primary_phone, ...(Array.isArray(contact.phones) ? contact.phones : [])];
     for (const raw of phones) {
       const phone = normalizePhone(raw);
       if (phone && !byPhone.has(phone)) byPhone.set(phone, contact);
     }
+    for (const jid of contact.linked_chat_jids || []) {
+      if (jid && !byJid.has(jid)) byJid.set(jid, contact);
+    }
   }
-  return { byPhone };
+  return { byPhone, byJid };
 }
 
 function buildSalesIndex(sales = []) {
   const byContact = new Map();
   for (const sale of sales) {
-    for (const id of [sale.customer_id, sale.partner_id]) {
+    for (const [role, id] of [['customer', sale.customer_id], ['partner', sale.partner_id]]) {
       if (!id) continue;
       if (!byContact.has(id)) byContact.set(id, []);
-      byContact.get(id).push(sale);
+      byContact.get(id).push({ ...sale, matchRole: role });
     }
   }
   return byContact;
+}
+
+function contactsForLead({ remoteJid, phone, byPhone, byJid }) {
+  const matches = [];
+  const seen = new Set();
+  const add = (contact, method) => {
+    if (!contact || seen.has(contact.id)) return;
+    seen.add(contact.id);
+    matches.push({ contact, method });
+  };
+
+  add(byJid.get(remoteJid), 'linked_chat_jid');
+  if (phone) add(byPhone.get(phone), 'phone');
+
+  return matches;
+}
+
+function salesForLead({ contactMatches, triggerAt, salesByContact }) {
+  const triggerDate = almatyDateString(triggerAt);
+  const windowEnd = new Date(triggerAt);
+  windowEnd.setUTCDate(windowEnd.getUTCDate() + CONVERSION_WINDOW_DAYS);
+  const windowEndDate = almatyDateString(windowEnd);
+  const bySaleId = new Map();
+
+  for (const { contact, method } of contactMatches) {
+    for (const sale of salesByContact.get(contact.id) || []) {
+      if (!sale.sale_date) continue;
+      if (sale.sale_date < triggerDate || sale.sale_date > windowEndDate) continue;
+      const existing = bySaleId.get(sale.id);
+      const match = {
+        ...sale,
+        matchedContactId: contact.id,
+        matchedContactName: contact.canonical_name || null,
+        matchMethod: method,
+        matchRole: sale.matchRole,
+      };
+      if (!existing || existing.matchRole !== 'customer') bySaleId.set(sale.id, match);
+    }
+  }
+
+  return [...bySaleId.values()];
 }
 
 function deriveStatus(event) {
@@ -306,13 +355,13 @@ export async function getAdLeadAnalytics({
     ),
     db.from('chat_tags').select('remote_jid, tags'),
     db.from('session_config').select('session_id, display_name').in('session_id', adSessions),
-    fetchAll(db.from('partner_contacts').select('id, canonical_name, primary_phone, phones'), 1000, 30000),
-    fetchAll(db.from('sales').select('id, customer_id, partner_id, sale_date, total_amount, order_num, city'), 1000, 40000),
+    fetchAll(db.from('partner_contacts').select('id, canonical_name, primary_phone, phones, roles, linked_chat_jids'), 1000, 30000),
+    fetchAll(db.from('sales').select('id, customer_id, partner_id, sale_date, total_amount, order_num, city, customer_raw, partner_raw'), 1000, 40000),
   ]);
 
   const sessionNames = new Map((sessionRows.data || []).map((s) => [s.session_id, s.display_name || s.session_id]));
   const tagsByJid = new Map((tagRows.data || []).map((row) => [row.remote_jid, row.tags || []]));
-  const { byPhone } = buildContactIndexes(contacts);
+  const { byPhone, byJid } = buildContactIndexes(contacts);
   const salesByContact = buildSalesIndex(sales);
 
   const messagesByChat = new Map();
@@ -355,14 +404,16 @@ export async function getAdLeadAnalytics({
       const lastMessageAt = new Date(lastMessage.timestamp);
       const clientWaiting = !lastMessage.from_me && (Date.now() - lastMessageAt.getTime()) > 24 * 60 * 60 * 1000;
       const phone = phoneFromJid(remoteJid);
-      const contact = phone ? byPhone.get(phone) : null;
-      const matchedSales = contact
-        ? (salesByContact.get(contact.id) || []).filter((sale) => {
-            if (!sale.sale_date) return false;
-            return sale.sale_date >= almatyDateString(triggerAt);
-          })
-        : [];
+      const contactMatches = contactsForLead({ remoteJid, phone, byPhone, byJid });
+      const primaryMatch = contactMatches.find((m) => m.method === 'linked_chat_jid') || contactMatches[0];
+      const contact = primaryMatch?.contact || null;
+      const matchedSales = salesForLead({ contactMatches, triggerAt, salesByContact });
       const matchedRevenue = matchedSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0);
+      const matchedSalesByRole = matchedSales.reduce((acc, sale) => {
+        const role = sale.matchRole || 'unknown';
+        acc[role] = (acc[role] || 0) + 1;
+        return acc;
+      }, {});
       const chatMessagesAfterTrigger = rows.filter((m) => new Date(m.timestamp) >= triggerAt);
 
       const event = {
@@ -390,7 +441,9 @@ export async function getAdLeadAnalytics({
         tags,
         matchedContactId: contact?.id || null,
         matchedContactName: contact?.canonical_name || null,
+        matchedContactMethod: primaryMatch?.method || null,
         matchedSalesCount: matchedSales.length,
+        matchedSalesByRole,
         matchedRevenue,
       };
       event.status = deriveStatus(event);
@@ -422,6 +475,14 @@ export async function getAdLeadAnalytics({
     statusCounts[event.status] = (statusCounts[event.status] || 0) + 1;
   }
 
+  const eventBuckets = {
+    recent: events.slice(0, safeLimit),
+    sales: events.filter((event) => event.matchedSalesCount > 0).slice(0, EVENT_BUCKET_LIMIT),
+    slow: events.filter((event) => Number.isFinite(event.firstResponseWorkMinutes) && event.firstResponseWorkMinutes > SLOW_MINUTES).slice(0, EVENT_BUCKET_LIMIT),
+    noFollowup: events.filter((event) => event.followupStatus === 'client_waiting').slice(0, EVENT_BUCKET_LIMIT),
+    noResponse: events.filter((event) => !event.firstResponseAt).slice(0, EVENT_BUCKET_LIMIT),
+  };
+
   const response = {
     range: { dateFrom: range.dateFrom, dateTo: range.dateTo },
     summary: {
@@ -432,12 +493,13 @@ export async function getAdLeadAnalytics({
     bySession,
     productCounts,
     statusCounts,
-    events: events.slice(0, safeLimit),
+    events: eventBuckets.recent,
+    eventBuckets,
     patterns: DEFAULT_PATTERNS.map(({ key: patternKey, label, campaignLabel }) => ({ key: patternKey, label, campaignLabel })),
     notes: {
       definition: 'Ad lead event = first inbound message in an ad WhatsApp account, or any inbound message matching a known ad template.',
       businessHours: '10:00-20:00 UTC+5',
-      conversion: 'Lower-bound phone match against partner_contacts and sales after trigger date.',
+      conversion: `Sales attribution matches WhatsApp chat to partner_contacts by linked_chat_jids or phone, then counts customer_id and partner_id sales within ${CONVERSION_WINDOW_DAYS} days after the ad lead.`,
     },
   };
 
