@@ -25,6 +25,7 @@ import * as salesCrm from '../lib/salesCrm.js';
 import * as salesCrmExtras from '../lib/salesCrmExtras.js';
 import * as dailyRun from '../lib/dailyRun.js';
 import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
+import { getAdLeadAnalytics, refreshPersistedAdLeadEvents, invalidateAdLeadsCache } from '../lib/adLeads.js';
 import { metaAdsRouter } from '../meta-ads/api.js';
 import { mountSettingsRoutes } from './routes/settings.js';
 
@@ -724,6 +725,25 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error }, 'Analytics summary failed');
       return res.status(500).json({ error: 'Failed to fetch analytics' });
+    }
+  });
+
+  router.get('/analytics/ad-leads', async (req, res) => {
+    try {
+      const db = req.userClient ?? supabase;
+      const payload = await getAdLeadAnalytics({
+        db,
+        sessionId: req.query.session_id || null,
+        dateFrom: req.query.date_from || req.query.date || null,
+        dateTo: req.query.date_to || req.query.date || null,
+        days: req.query.days || 30,
+        limit: req.query.limit || 20,
+        userId: req.user?.userId ?? '__service__',
+      });
+      return res.json(payload);
+    } catch (error) {
+      logger.error({ err: error }, 'GET /analytics/ad-leads failed');
+      return res.status(500).json({ error: 'Failed to load ad leads analytics' });
     }
   });
 
@@ -1777,6 +1797,21 @@ export function setupRoutes(app) {
     }
     next();
   }
+
+  // POST /admin/ad-leads/refresh
+  // Optional persisted refresh for the ad_lead_events table (migration 0027).
+  // The dashboard endpoint can compute from raw messages even before this table
+  // exists, but this keeps a durable layer ready for Ads Manager attribution.
+  router.post('/admin/ad-leads/refresh', adminOnly, async (req, res) => {
+    try {
+      const result = await refreshPersistedAdLeadEvents({ db: supabase });
+      invalidateAdLeadsCache();
+      res.json({ ok: true, result });
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'ad_leads_refresh_failed');
+      res.status(500).json({ error: e.message });
+    }
+  });
 
   // POST /admin/daily-run/auto-dismiss
   // Закрывает «висящие» проблемные переписки если менеджер уже отвечал клиенту
