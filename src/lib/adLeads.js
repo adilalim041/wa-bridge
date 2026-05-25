@@ -28,7 +28,7 @@ const DEFAULT_PATTERNS = [
     key: 'brand_interest',
     label: 'Omoikiri',
     campaignLabel: 'Рекламная заявка: бренд',
-    needles: ['бренда omoikiri', 'бренд omoikiri', 'омойкири'],
+    needles: ['бренда omoikiri', 'бренд omoikiri'],
   },
 ];
 
@@ -207,6 +207,14 @@ async function fetchAll(query, pageSize = 1000, maxRows = 50000) {
 }
 
 function summarize(events) {
+  const salesById = new Map();
+  for (const event of events) {
+    for (const sale of event.matchedSales || []) {
+      if (!sale.id || salesById.has(sale.id)) continue;
+      salesById.set(sale.id, sale);
+    }
+  }
+  const uniqueSales = [...salesById.values()];
   const responseMinutes = events
     .map((e) => e.firstResponseWorkMinutes)
     .filter((v) => Number.isFinite(v));
@@ -230,10 +238,10 @@ function summarize(events) {
     slowFirstResponse: events.filter((e) => Number.isFinite(e.firstResponseWorkMinutes) && e.firstResponseWorkMinutes > SLOW_MINUTES).length,
     verySlowFirstResponse: events.filter((e) => Number.isFinite(e.firstResponseWorkMinutes) && e.firstResponseWorkMinutes > VERY_SLOW_MINUTES).length,
     noFollowup: events.filter((e) => e.followupStatus === 'client_waiting').length,
-    salesMatched: events.filter((e) => e.matchedSalesCount > 0).length,
-    customerSalesMatched: events.filter((e) => (e.matchedSalesByRole?.customer || 0) > 0).length,
-    partnerSalesMatched: events.filter((e) => (e.matchedSalesByRole?.partner || 0) > 0).length,
-    revenue: events.reduce((sum, e) => sum + (Number(e.matchedRevenue) || 0), 0),
+    salesMatched: uniqueSales.length,
+    customerSalesMatched: uniqueSales.filter((sale) => sale.matchRole === 'customer').length,
+    partnerSalesMatched: uniqueSales.filter((sale) => sale.matchRole === 'partner').length,
+    revenue: uniqueSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0),
   };
 }
 
@@ -312,6 +320,28 @@ function deriveStatus(event) {
   if (event.firstResponseWorkMinutes > VERY_SLOW_MINUTES) return 'very_slow';
   if (event.firstResponseWorkMinutes > SLOW_MINUTES) return 'slow';
   return 'ok';
+}
+
+function dedupeSalesEvents(events) {
+  const seenSales = new Set();
+  const out = [];
+  for (const event of events) {
+    const freshSales = (event.matchedSales || []).filter((sale) => sale.id && !seenSales.has(sale.id));
+    if (!freshSales.length) continue;
+    for (const sale of freshSales) seenSales.add(sale.id);
+    out.push({
+      ...event,
+      matchedSales: freshSales,
+      matchedSalesCount: freshSales.length,
+      matchedRevenue: freshSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0),
+      matchedSalesByRole: freshSales.reduce((acc, sale) => {
+        const role = sale.matchRole || 'unknown';
+        acc[role] = (acc[role] || 0) + 1;
+        return acc;
+      }, {}),
+    });
+  }
+  return out;
 }
 
 export async function getAdLeadAnalytics({
@@ -393,8 +423,7 @@ export async function getAdLeadAnalytics({
       if (triggerAt < rangeStart || triggerAt > rangeEnd) continue;
 
       const pattern = matchPattern(message.body);
-      const isFirstInbound = message.id === firstInboundId;
-      if (!pattern && !isFirstInbound) continue;
+      if (!pattern) continue;
 
       const firstResponse = rows.find((m) => m.from_me && new Date(m.timestamp) > triggerAt);
       const firstResponseWorkMinutes = firstResponse
@@ -427,9 +456,9 @@ export async function getAdLeadAnalytics({
         triggerAt: triggerAt.toISOString(),
         triggerAtLabel: toAlmatyLabel(triggerAt),
         triggerBody: textPreview(message.body),
-        triggerKind: pattern ? 'template' : 'ad_account_first_inbound',
-        patternKey: pattern?.key || 'ad_account_first_inbound',
-        campaignLabel: pattern?.campaignLabel || 'Рекламный WhatsApp-аккаунт',
+        triggerKind: 'template',
+        patternKey: pattern.key,
+        campaignLabel: pattern.campaignLabel,
         firstResponseAt: firstResponse?.timestamp || null,
         firstResponseWorkMinutes,
         followupStatus: clientWaiting ? 'client_waiting' : (firstResponse ? 'responded' : 'no_response'),
@@ -442,6 +471,7 @@ export async function getAdLeadAnalytics({
         matchedContactId: contact?.id || null,
         matchedContactName: contact?.canonical_name || null,
         matchedContactMethod: primaryMatch?.method || null,
+        matchedSales,
         matchedSalesCount: matchedSales.length,
         matchedSalesByRole,
         matchedRevenue,
@@ -477,7 +507,7 @@ export async function getAdLeadAnalytics({
 
   const eventBuckets = {
     recent: events.slice(0, safeLimit),
-    sales: events.filter((event) => event.matchedSalesCount > 0).slice(0, EVENT_BUCKET_LIMIT),
+    sales: dedupeSalesEvents(events).slice(0, EVENT_BUCKET_LIMIT),
     slow: events.filter((event) => Number.isFinite(event.firstResponseWorkMinutes) && event.firstResponseWorkMinutes > SLOW_MINUTES).slice(0, EVENT_BUCKET_LIMIT),
     noFollowup: events.filter((event) => event.followupStatus === 'client_waiting').slice(0, EVENT_BUCKET_LIMIT),
     noResponse: events.filter((event) => !event.firstResponseAt).slice(0, EVENT_BUCKET_LIMIT),
@@ -497,7 +527,7 @@ export async function getAdLeadAnalytics({
     eventBuckets,
     patterns: DEFAULT_PATTERNS.map(({ key: patternKey, label, campaignLabel }) => ({ key: patternKey, label, campaignLabel })),
     notes: {
-      definition: 'Ad lead event = first inbound message in an ad WhatsApp account, or any inbound message matching a known ad template.',
+      definition: 'Ad lead event = inbound message matching a known ad template/pattern. Regular first inbound messages in ad WhatsApp accounts are not counted as ads.',
       businessHours: '10:00-20:00 UTC+5',
       conversion: `Sales attribution matches WhatsApp chat to partner_contacts by linked_chat_jids or phone, then counts customer_id and partner_id sales within ${CONVERSION_WINDOW_DAYS} days after the ad lead.`,
     },
