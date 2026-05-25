@@ -39,6 +39,7 @@ const WORK_END_HOUR = 20;
 const SLOW_MINUTES = 15;
 const VERY_SLOW_MINUTES = 60;
 const CONVERSION_WINDOW_DAYS = 45;
+const EVENT_BUCKET_LIMIT = 100;
 const CACHE_TTL_MS = 2 * 60 * 1000;
 
 const _cache = new Map();
@@ -474,6 +475,14 @@ export async function getAdLeadAnalytics({
     statusCounts[event.status] = (statusCounts[event.status] || 0) + 1;
   }
 
+  const eventBuckets = {
+    recent: events.slice(0, safeLimit),
+    sales: events.filter((event) => event.matchedSalesCount > 0).slice(0, EVENT_BUCKET_LIMIT),
+    slow: events.filter((event) => Number.isFinite(event.firstResponseWorkMinutes) && event.firstResponseWorkMinutes > SLOW_MINUTES).slice(0, EVENT_BUCKET_LIMIT),
+    noFollowup: events.filter((event) => event.followupStatus === 'client_waiting').slice(0, EVENT_BUCKET_LIMIT),
+    noResponse: events.filter((event) => !event.firstResponseAt).slice(0, EVENT_BUCKET_LIMIT),
+  };
+
   const response = {
     range: { dateFrom: range.dateFrom, dateTo: range.dateTo },
     summary: {
@@ -484,7 +493,8 @@ export async function getAdLeadAnalytics({
     bySession,
     productCounts,
     statusCounts,
-    events: events.slice(0, safeLimit),
+    events: eventBuckets.recent,
+    eventBuckets,
     patterns: DEFAULT_PATTERNS.map(({ key: patternKey, label, campaignLabel }) => ({ key: patternKey, label, campaignLabel })),
     notes: {
       definition: 'Ad lead event = first inbound message in an ad WhatsApp account, or any inbound message matching a known ad template.',
