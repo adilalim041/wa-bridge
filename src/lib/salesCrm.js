@@ -2399,9 +2399,12 @@ export async function getSalesWithChats(req, params = {}) {
   const sb = pickClient(req);
   const limit = Math.min(parseInt(params.limit) || 100, 500);
   const offset = Math.max(parseInt(params.offset) || 0, 0);
+  const dateFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(params.dateFrom || '')) ? String(params.dateFrom) : null;
+  const dateTo = /^\d{4}-\d{2}-\d{2}$/.test(String(params.dateTo || '')) ? String(params.dateTo) : null;
+  const city = params.city && params.city !== 'all' ? String(params.city) : null;
 
   // Cache: 1h TTL (linked_chat_jids меняются только при новом WA-диалоге)
-  const ck = cacheKey('sales-with-chats', req, { limit, offset });
+  const ck = cacheKey('sales-with-chats', req, { limit, offset, dateFrom, dateTo, city });
   const cached = cacheGet(ck);
   if (cached) return cached;
 
@@ -2430,11 +2433,15 @@ export async function getSalesWithChats(req, params = {}) {
   async function fetchSalesForIds(col, ids) {
     for (let i = 0; i < ids.length; i += batchSize) {
       const batch = ids.slice(i, i + batchSize);
-      const { data } = await sb.from('sales')
+      let q = sb.from('sales')
         .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
         .in(col, batch)
         .order('sale_date', { ascending: false })
         .limit(limit + offset + 200); // slight over-fetch for merge dedup
+      if (dateFrom) q = q.gte('sale_date', dateFrom);
+      if (dateTo) q = q.lte('sale_date', dateTo);
+      if (city) q = q.eq('city', city);
+      const { data } = await q;
       for (const s of data || []) if (!salesByIdMap.has(s.id)) salesByIdMap.set(s.id, s);
     }
   }

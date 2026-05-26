@@ -25,7 +25,7 @@ import * as salesCrm from '../lib/salesCrm.js';
 import * as salesCrmExtras from '../lib/salesCrmExtras.js';
 import * as dailyRun from '../lib/dailyRun.js';
 import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
-import { getAdLeadAnalytics, refreshPersistedAdLeadEvents, invalidateAdLeadsCache } from '../lib/adLeads.js';
+import { getAdLeadAnalytics, getSaleChatDrilldown, refreshPersistedAdLeadEvents, invalidateAdLeadsCache } from '../lib/adLeads.js';
 import { metaAdsRouter } from '../meta-ads/api.js';
 import { mountSettingsRoutes } from './routes/settings.js';
 
@@ -744,6 +744,21 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error }, 'GET /analytics/ad-leads failed');
       return res.status(500).json({ error: 'Failed to load ad leads analytics' });
+    }
+  });
+
+  router.get('/analytics/sales/:sale_id/chats', async (req, res) => {
+    try {
+      const db = req.userClient ?? supabase;
+      const payload = await getSaleChatDrilldown({
+        db,
+        saleId: req.params.sale_id,
+      });
+      return res.json(payload);
+    } catch (error) {
+      const status = error.statusCode || 500;
+      logger.error({ err: error, saleId: req.params.sale_id }, 'GET /analytics/sales/:sale_id/chats failed');
+      return res.status(status).json({ error: status === 404 ? 'Sale not found' : 'Failed to load sale chats' });
     }
   });
 
@@ -2207,7 +2222,11 @@ export function setupRoutes(app) {
   router.get('/sales-crm/sales-with-chats', async (req, res) => {
     try {
       const r = await salesCrm.getSalesWithChats(req, {
-        limit: req.query.limit, offset: req.query.offset,
+        limit: req.query.limit,
+        offset: req.query.offset,
+        dateFrom: req.query.date_from || null,
+        dateTo: req.query.date_to || null,
+        city: req.query.city || null,
       });
       res.json(r);
     } catch (e) {

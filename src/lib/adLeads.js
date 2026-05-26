@@ -36,7 +36,7 @@ const NON_BUSINESS_TAGS = new Set(['сотрудник', 'спам', 'лично
 const ALMATY_OFFSET_MIN = 5 * 60;
 const WORK_START_HOUR = 10;
 const WORK_END_HOUR = 20;
-const SLOW_MINUTES = 15;
+const SLOW_MINUTES = 30;
 const VERY_SLOW_MINUTES = 60;
 const CONVERSION_WINDOW_DAYS = 45;
 const EVENT_BUCKET_LIMIT = 100;
@@ -312,6 +312,145 @@ function salesForLead({ contactMatches, triggerAt, salesByContact }) {
   }
 
   return [...bySaleId.values()];
+}
+
+function roleForSaleContact(sale, contactId) {
+  if (!sale || !contactId) return 'unknown';
+  if (sale.customer_id === contactId) return 'customer';
+  if (sale.partner_id === contactId) return 'partner';
+  return 'unknown';
+}
+
+function saleContactRoleLabel(role) {
+  if (role === 'customer') return 'Клиент';
+  if (role === 'partner') return 'Дизайнер / партнёр';
+  return 'Связанный контакт';
+}
+
+export async function getSaleChatDrilldown({ db, saleId }) {
+  const safeSaleId = String(saleId || '').trim();
+  if (!safeSaleId || safeSaleId.length > 80) {
+    throw Object.assign(new Error('sale_id is required'), { statusCode: 400 });
+  }
+
+  const { data: sale, error: saleError } = await db
+    .from('sales')
+    .select('id, customer_id, partner_id, sale_date, total_amount, order_num, city, customer_raw, partner_raw, manager')
+    .eq('id', safeSaleId)
+    .maybeSingle();
+
+  if (saleError) throw saleError;
+  if (!sale) {
+    throw Object.assign(new Error('Sale not found'), { statusCode: 404 });
+  }
+
+  const contactIds = [...new Set([sale.customer_id, sale.partner_id].filter(Boolean))];
+  if (!contactIds.length) {
+    return { sale, contacts: [], chats: [] };
+  }
+
+  const { data: contacts, error: contactsError } = await db
+    .from('partner_contacts')
+    .select('id, canonical_name, primary_phone, phones, roles, linked_chat_jids')
+    .in('id', contactIds);
+  if (contactsError) throw contactsError;
+
+  const contactByJid = new Map();
+  const jidSet = new Set();
+  for (const contact of contacts || []) {
+    for (const jid of contact.linked_chat_jids || []) {
+      if (!jid) continue;
+      jidSet.add(jid);
+      if (!contactByJid.has(jid)) contactByJid.set(jid, []);
+      contactByJid.get(jid).push(contact);
+    }
+  }
+
+  const jids = [...jidSet];
+  if (!jids.length) {
+    return { sale, contacts: contacts || [], chats: [] };
+  }
+
+  const [chatsRes, messagesRes] = await Promise.all([
+    db.from('chats')
+      .select('session_id, remote_jid, display_name, phone_number, last_message_at, tags')
+      .in('remote_jid', jids),
+    db.from('messages')
+      .select('session_id, remote_jid, push_name, timestamp')
+      .in('remote_jid', jids)
+      .order('timestamp', { ascending: false })
+      .limit(1000),
+  ]);
+  if (chatsRes.error) throw chatsRes.error;
+  if (messagesRes.error) throw messagesRes.error;
+
+  const messagePairMap = new Map();
+  for (const message of messagesRes.data || []) {
+    const key = `${message.session_id}:::${message.remote_jid}`;
+    if (!messagePairMap.has(key)) messagePairMap.set(key, message);
+  }
+
+  const pairMap = new Map();
+  for (const chat of chatsRes.data || []) {
+    pairMap.set(`${chat.session_id}:::${chat.remote_jid}`, chat);
+  }
+  for (const [key, message] of messagePairMap) {
+    if (!pairMap.has(key)) {
+      pairMap.set(key, {
+        session_id: message.session_id,
+        remote_jid: message.remote_jid,
+        display_name: message.push_name,
+        phone_number: phoneFromJid(message.remote_jid),
+        last_message_at: message.timestamp,
+        tags: [],
+      });
+    }
+  }
+
+  const sessionIds = [...new Set([...pairMap.values()].map((c) => c.session_id).filter(Boolean))];
+  const { data: sessions, error: sessionsError } = sessionIds.length
+    ? await db.from('session_config').select('session_id, display_name').in('session_id', sessionIds)
+    : { data: [], error: null };
+  if (sessionsError) throw sessionsError;
+  const sessionNames = new Map((sessions || []).map((s) => [s.session_id, s.display_name || s.session_id]));
+
+  const chats = [...pairMap.values()].map((chat) => {
+    const contactsForJid = contactByJid.get(chat.remote_jid) || [];
+    const contact = contactsForJid[0] || null;
+    const role = roleForSaleContact(sale, contact?.id);
+    const lastMessage = messagePairMap.get(`${chat.session_id}:::${chat.remote_jid}`);
+    const phone = chat.phone_number || phoneFromJid(chat.remote_jid);
+    const title = chat.display_name || lastMessage?.push_name || contact?.canonical_name || phone || chat.remote_jid;
+    return {
+      session_id: chat.session_id,
+      sessionId: chat.session_id,
+      remote_jid: chat.remote_jid,
+      remoteJid: chat.remote_jid,
+      display_name: title,
+      displayName: title,
+      contact_name: contact?.canonical_name || title,
+      phone,
+      sessionDisplayName: sessionNames.get(chat.session_id) || chat.session_id,
+      session_display_name: sessionNames.get(chat.session_id) || chat.session_id,
+      last_message_at: chat.last_message_at || lastMessage?.timestamp || null,
+      saleRole: role,
+      saleRoleLabel: saleContactRoleLabel(role),
+      summary_ru: [
+        `${saleContactRoleLabel(role)} по продаже ${sale.order_num ? `#${sale.order_num}` : sale.id}`,
+        `${Math.round(Number(sale.total_amount) || 0).toLocaleString('ru-RU')} ₸`,
+      ].join(' · '),
+      tags: chat.tags || [],
+    };
+  });
+
+  chats.sort((a, b) => {
+    const roleOrder = { customer: 0, partner: 1, unknown: 2 };
+    const roleDiff = (roleOrder[a.saleRole] ?? 2) - (roleOrder[b.saleRole] ?? 2);
+    if (roleDiff !== 0) return roleDiff;
+    return new Date(b.last_message_at || 0) - new Date(a.last_message_at || 0);
+  });
+
+  return { sale, contacts: contacts || [], chats };
 }
 
 function deriveStatus(event) {
