@@ -72,7 +72,7 @@ const VALID_CATEGORIES = new Set(['slow', 'no_followup', 'critical', 'football',
 const ALMATY_UTC_OFFSET_MIN = 5 * 60;
 const WORK_START_HOUR = 10;
 const WORK_END_HOUR = 20;
-const SLOW_RESPONSE_MINUTES = 60;
+const SLOW_RESPONSE_MINUTES = 30;
 
 // Stages where the deal moved forward — dismiss = won.
 // All other stages (NULL, consultation stuck, refused, needs_review) = lost.
