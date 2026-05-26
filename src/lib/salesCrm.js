@@ -2396,7 +2396,7 @@ export async function getAutoInsights(req, opts = {}) {
 // Добавлен 1h cache (данные меняются редко, достаточно свежести для воронки).
 //
 export async function getSalesWithChats(req, params = {}) {
-  const sb = pickClient(req);
+  const sb = params.useServiceRole ? serviceClient : pickClient(req);
   const limit = Math.min(parseInt(params.limit) || 100, 500);
   const offset = Math.max(parseInt(params.offset) || 0, 0);
   const dateFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(params.dateFrom || '')) ? String(params.dateFrom) : null;
@@ -2440,8 +2440,9 @@ export async function getSalesWithChats(req, params = {}) {
         .limit(limit + offset + 200); // slight over-fetch for merge dedup
       if (dateFrom) q = q.gte('sale_date', dateFrom);
       if (dateTo) q = q.lte('sale_date', dateTo);
-      if (city) q = q.eq('city', city);
-      const { data } = await q;
+      if (city) q = applyCity(q, city);
+      const { data, error } = await q;
+      if (error) throw error;
       for (const s of data || []) if (!salesByIdMap.has(s.id)) salesByIdMap.set(s.id, s);
     }
   }
@@ -2501,13 +2502,15 @@ export async function getSalesWithChats(req, params = {}) {
       Promise.all(aiBatches),
     ]);
 
-    for (const { data } of msgResults) {
+    for (const { data, error } of msgResults) {
+      if (error) throw error;
       for (const m of data || []) {
         if (!msgsByJid[m.remote_jid]) msgsByJid[m.remote_jid] = [];
         msgsByJid[m.remote_jid].push(m);
       }
     }
-    for (const { data } of aiResults) {
+    for (const { data, error } of aiResults) {
+      if (error) throw error;
       for (const a of data || []) {
         // keep only most recent per JID (already ordered by analyzed_at DESC)
         if (!aiByJid[a.remote_jid]) aiByJid[a.remote_jid] = a;
@@ -2570,10 +2573,8 @@ export async function getSalesWithChats(req, params = {}) {
   }
 
   const out = { items: result, total: salesByIdMap.size };
-  // Cache 1h — воронка не требует real-time свежести (24h стандартный TTL избыточен)
-  if (ck) {
-    _cache.set(ck, { data: out, expiresAt: Date.now() + 60 * 60 * 1000 });
-  }
+  // Cache via shared helper; sales import/cache invalidation refreshes this view.
+  cacheSet(ck, out);
   return out;
 }
 
