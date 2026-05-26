@@ -749,9 +749,8 @@ export function setupRoutes(app) {
 
   router.get('/analytics/sales/:sale_id/chats', async (req, res) => {
     try {
-      const db = req.userClient ?? supabase;
       const payload = await getSaleChatDrilldown({
-        db,
+        db: supabase,
         saleId: req.params.sale_id,
       });
       return res.json(payload);
@@ -2227,6 +2226,7 @@ export function setupRoutes(app) {
         dateFrom: req.query.date_from || null,
         dateTo: req.query.date_to || null,
         city: req.query.city || null,
+        useServiceRole: true,
       });
       res.json(r);
     } catch (e) {
