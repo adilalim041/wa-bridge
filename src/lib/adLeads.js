@@ -174,6 +174,22 @@ function phoneFromJid(jid) {
   return normalizePhone(String(jid).split('@')[0]);
 }
 
+function contactRemoteJidCandidates(contact) {
+  const out = new Set();
+  for (const jid of contact?.linked_chat_jids || []) {
+    if (jid) out.add(String(jid));
+  }
+  const phones = [
+    contact?.primary_phone,
+    ...(Array.isArray(contact?.phones) ? contact.phones : []),
+  ];
+  for (const raw of phones) {
+    const phone = normalizePhone(raw);
+    if (phone) out.add(phone);
+  }
+  return [...out];
+}
+
 function textPreview(value = '', max = 160) {
   const clean = String(value || '').replace(/\s+/g, ' ').trim();
   return clean.length > max ? `${clean.slice(0, max)}...` : clean;
@@ -358,7 +374,7 @@ export async function getSaleChatDrilldown({ db, saleId }) {
   const contactByJid = new Map();
   const jidSet = new Set();
   for (const contact of contacts || []) {
-    for (const jid of contact.linked_chat_jids || []) {
+    for (const jid of contactRemoteJidCandidates(contact)) {
       if (!jid) continue;
       jidSet.add(jid);
       if (!contactByJid.has(jid)) contactByJid.set(jid, []);
