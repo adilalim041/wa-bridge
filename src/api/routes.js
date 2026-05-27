@@ -2235,6 +2235,32 @@ export function setupRoutes(app) {
     }
   });
 
+  // GET /sales-crm/repeat-customers — repeat buyers and brand fans.
+  // Repeatness is based on sales.customer_id lifetime order count; the selected
+  // period only decides which customers are active in the current slice.
+  router.get('/sales-crm/repeat-customers', async (req, res) => {
+    try {
+      const cp = parseCitiesQueryRoute(req.query);
+      if (!cp.ok) return res.status(400).json({ error: cp.error });
+
+      const r = await salesCrm.getRepeatCustomers(req, {
+        date_from: req.query.date_from || undefined,
+        date_to: req.query.date_to || undefined,
+        city: cp.city,
+        limit: req.query.limit,
+        offset: req.query.offset,
+        min_orders: req.query.min_orders,
+        fan_min_orders: req.query.fan_min_orders,
+        fan_min_revenue: req.query.fan_min_revenue,
+        useServiceRole: true,
+      });
+      res.json(r);
+    } catch (e) {
+      req.log?.warn({ err: e.message }, 'sales_crm_repeat_customers_failed');
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // GET /sales-crm/lead-funnel?city=Алматы|Астана|all&cities=Алматы,Астана — chat_ai → sales conversion (Group E)
   // При mode='multi': возвращает byCity breakdown.
   router.get('/sales-crm/lead-funnel', async (req, res) => {

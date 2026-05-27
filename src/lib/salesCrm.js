@@ -597,6 +597,17 @@ const analyticsInput = z.object({
   city: citySchema,
 });
 
+const repeatCustomersInput = z.object({
+  date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  date_to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  city: citySchema,
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+  min_orders: z.coerce.number().int().min(2).max(100).default(2),
+  fan_min_orders: z.coerce.number().int().min(2).max(100).default(3),
+  fan_min_revenue: z.coerce.number().int().min(0).default(1_000_000),
+});
+
 // Helper: добавляем 1 месяц к YYYY-MM
 function nextMonth(ym) {
   const [y, m] = ym.split('-').map(Number);
@@ -2411,6 +2422,263 @@ export async function getAutoInsights(req, opts = {}) {
 // Также убрали `.slice(0, 500)` на linkedIds — теперь батчим через loadAllParallel-style batches.
 // Добавлен 1h cache (данные меняются редко, достаточно свежести для воронки).
 //
+// `partner_contacts.roles` is global history and can contain both "customer"
+// and "partner". For sales segmentation the source of truth is the sale row:
+// sales.customer_id = buyer in this order, sales.partner_id = designer/partner
+// influence in this order.
+export async function getRepeatCustomers(req, params = {}) {
+  const args = repeatCustomersInput.parse(params);
+  const sb = params.useServiceRole ? serviceClient : pickClient(req);
+
+  const ck = cacheKey('repeat-customers', req, args);
+  const cached = cacheGet(ck);
+  if (cached) return cached;
+
+  let periodFilters = { notNull: ['customer_id'] };
+  if (args.date_from) periodFilters = { ...periodFilters, gte: { sale_date: args.date_from } };
+  if (args.date_to) periodFilters = { ...periodFilters, lte: { ...(periodFilters.lte || {}), sale_date: args.date_to } };
+  periodFilters = addCityFilter(periodFilters, args.city);
+
+  const periodSales = await loadAllParallel(
+    sb,
+    'sales',
+    'id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager',
+    periodFilters
+  );
+
+  const emptyResult = () => ({
+    period: { date_from: args.date_from || null, date_to: args.date_to || null, city: args.city },
+    total: 0,
+    limit: args.limit,
+    offset: args.offset,
+    items: [],
+    summary: {
+      repeat_customers: 0,
+      fan_customers: 0,
+      period_orders: 0,
+      period_revenue: 0,
+      lifetime_orders: 0,
+      lifetime_revenue: 0,
+      direct_period_orders: 0,
+      via_designer_period_orders: 0,
+      direct_lifetime_orders: 0,
+      via_designer_lifetime_orders: 0,
+      with_chats: 0,
+    },
+  });
+
+  const activeCustomerIds = [...new Set(periodSales.map((s) => s.customer_id).filter(Boolean))];
+  if (activeCustomerIds.length === 0) {
+    const empty = emptyResult();
+    cacheSet(ck, empty);
+    return empty;
+  }
+
+  const lifetimeSales = [];
+  for (let i = 0; i < activeCustomerIds.length; i += 500) {
+    const batch = activeCustomerIds.slice(i, i + 500);
+    const { data, error } = await sb
+      .from('sales')
+      .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
+      .in('customer_id', batch);
+    if (error) throw new Error(`repeat lifetime sales: ${error.message}`);
+    lifetimeSales.push(...(data || []));
+  }
+
+  const periodByCustomer = new Map();
+  for (const s of periodSales) {
+    if (!s.customer_id) continue;
+    if (!periodByCustomer.has(s.customer_id)) periodByCustomer.set(s.customer_id, []);
+    periodByCustomer.get(s.customer_id).push(s);
+  }
+
+  const lifetimeByCustomer = new Map();
+  for (const s of lifetimeSales) {
+    if (!s.customer_id) continue;
+    if (!lifetimeByCustomer.has(s.customer_id)) lifetimeByCustomer.set(s.customer_id, []);
+    lifetimeByCustomer.get(s.customer_id).push(s);
+  }
+
+  const repeatCustomerIds = activeCustomerIds.filter((id) => (
+    (lifetimeByCustomer.get(id) || []).length >= args.min_orders
+  ));
+  if (repeatCustomerIds.length === 0) {
+    const empty = emptyResult();
+    cacheSet(ck, empty);
+    return empty;
+  }
+
+  const repeatSet = new Set(repeatCustomerIds);
+  const partnerIds = [...new Set(
+    lifetimeSales
+      .filter((s) => repeatSet.has(s.customer_id))
+      .map((s) => s.partner_id)
+      .filter(Boolean)
+  )];
+  const contactIds = [...new Set([...repeatCustomerIds, ...partnerIds])];
+
+  const contacts = [];
+  for (let i = 0; i < contactIds.length; i += 500) {
+    const batch = contactIds.slice(i, i + 500);
+    const { data, error } = await sb
+      .from('partner_contacts')
+      .select('id, canonical_name, primary_phone, phones, roles, linked_chat_jids, agency_id')
+      .in('id', batch);
+    if (error) throw new Error(`repeat contacts: ${error.message}`);
+    contacts.push(...(data || []));
+  }
+  const contactMap = new Map(contacts.map((c) => [c.id, c]));
+
+  const { data: chatRows, error: chatErr } = await sb.from('chats').select('remote_jid');
+  if (chatErr) throw new Error(`repeat chats: ${chatErr.message}`);
+  const knownJids = new Set((chatRows || []).map((c) => c.remote_jid).filter(Boolean));
+
+  const repeatedSaleIds = [...new Set(
+    repeatCustomerIds.flatMap((id) => (lifetimeByCustomer.get(id) || []).map((s) => s.id))
+  )];
+  const categoryBySale = new Map();
+  for (let i = 0; i < repeatedSaleIds.length; i += 500) {
+    const batch = repeatedSaleIds.slice(i, i + 500);
+    const { data, error } = await sb
+      .from('sale_items')
+      .select('sale_id, category, amount, qty')
+      .in('sale_id', batch);
+    if (error) throw new Error(`repeat sale_items: ${error.message}`);
+    for (const it of data || []) {
+      if (!categoryBySale.has(it.sale_id)) categoryBySale.set(it.sale_id, []);
+      categoryBySale.get(it.sale_id).push(it);
+    }
+  }
+
+  function summarizeSales(rows) {
+    let revenue = 0;
+    let directOrders = 0;
+    let viaDesignerOrders = 0;
+    let directRevenue = 0;
+    let viaDesignerRevenue = 0;
+    const partnerSet = new Set();
+    for (const s of rows || []) {
+      const amount = Number(s.total_amount || 0);
+      revenue += amount;
+      if (s.partner_id) {
+        viaDesignerOrders++;
+        viaDesignerRevenue += amount;
+        partnerSet.add(s.partner_id);
+      } else {
+        directOrders++;
+        directRevenue += amount;
+      }
+    }
+    const sorted = [...(rows || [])].sort((a, b) => (a.sale_date || '').localeCompare(b.sale_date || ''));
+    return {
+      orders: rows?.length || 0,
+      revenue,
+      direct_orders: directOrders,
+      direct_revenue: directRevenue,
+      via_designer_orders: viaDesignerOrders,
+      via_designer_revenue: viaDesignerRevenue,
+      first_purchase_date: sorted[0]?.sale_date || null,
+      last_purchase_date: sorted[sorted.length - 1]?.sale_date || null,
+      partner_ids: [...partnerSet],
+    };
+  }
+
+  const allItems = repeatCustomerIds.map((customerId) => {
+    const customer = contactMap.get(customerId) || {};
+    const periodRows = periodByCustomer.get(customerId) || [];
+    const lifetimeRows = lifetimeByCustomer.get(customerId) || [];
+    const period = summarizeSales(periodRows);
+    const lifetime = summarizeSales(lifetimeRows);
+    const chatJids = contactRemoteJidCandidates(customer).filter((jid) => knownJids.has(jid));
+    const catAgg = new Map();
+
+    for (const sale of lifetimeRows) {
+      for (const it of categoryBySale.get(sale.id) || []) {
+        const key = it.category || 'unknown';
+        const prev = catAgg.get(key) || { category: key, items: 0, revenue: 0, orders: new Set() };
+        prev.items += Number(it.qty || 1);
+        prev.revenue += Number(it.amount || 0);
+        prev.orders.add(sale.id);
+        catAgg.set(key, prev);
+      }
+    }
+
+    const topCategories = [...catAgg.values()]
+      .map((c) => ({ ...c, orders: c.orders.size }))
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 5);
+    const partnerList = lifetime.partner_ids.map((id) => {
+      const p = contactMap.get(id) || {};
+      const rows = lifetimeRows.filter((s) => s.partner_id === id);
+      return {
+        id,
+        name: p.canonical_name || null,
+        phone: p.primary_phone || null,
+        orders: rows.length,
+        revenue: rows.reduce((sum, s) => sum + Number(s.total_amount || 0), 0),
+      };
+    }).sort((a, b) => b.revenue - a.revenue);
+
+    const isFan = lifetime.orders >= args.fan_min_orders || lifetime.revenue >= args.fan_min_revenue;
+    return {
+      customer_id: customerId,
+      name: customer.canonical_name || periodRows[0]?.customer_raw || lifetimeRows[0]?.customer_raw || 'Без имени',
+      phone: customer.primary_phone || null,
+      roles: customer.roles || [],
+      segment: isFan ? 'fan' : 'repeat',
+      has_chat: chatJids.length > 0,
+      chat_jids: chatJids,
+      period,
+      lifetime,
+      partners: partnerList,
+      top_categories: topCategories,
+      recent_orders: [...lifetimeRows]
+        .sort((a, b) => (b.sale_date || '').localeCompare(a.sale_date || ''))
+        .slice(0, 8)
+        .map((s) => ({
+          id: s.id,
+          order_num: s.order_num,
+          sale_date: s.sale_date,
+          total_amount: Number(s.total_amount || 0),
+          partner_id: s.partner_id,
+          partner_name: s.partner_id ? (contactMap.get(s.partner_id)?.canonical_name || s.partner_raw || null) : null,
+          channel: s.partner_id ? 'via_designer' : 'direct',
+          source_file: s.source_file,
+        })),
+    };
+  }).sort((a, b) => {
+    const byFan = Number(b.segment === 'fan') - Number(a.segment === 'fan');
+    if (byFan) return byFan;
+    return b.lifetime.revenue - a.lifetime.revenue;
+  });
+
+  const summary = allItems.reduce((acc, item) => {
+    acc.repeat_customers++;
+    if (item.segment === 'fan') acc.fan_customers++;
+    acc.period_orders += item.period.orders;
+    acc.period_revenue += item.period.revenue;
+    acc.lifetime_orders += item.lifetime.orders;
+    acc.lifetime_revenue += item.lifetime.revenue;
+    acc.direct_period_orders += item.period.direct_orders;
+    acc.via_designer_period_orders += item.period.via_designer_orders;
+    acc.direct_lifetime_orders += item.lifetime.direct_orders;
+    acc.via_designer_lifetime_orders += item.lifetime.via_designer_orders;
+    if (item.has_chat) acc.with_chats++;
+    return acc;
+  }, emptyResult().summary);
+
+  const result = {
+    period: { date_from: args.date_from || null, date_to: args.date_to || null, city: args.city },
+    total: allItems.length,
+    limit: args.limit,
+    offset: args.offset,
+    summary,
+    items: allItems.slice(args.offset, args.offset + args.limit),
+  };
+  cacheSet(ck, result);
+  return result;
+}
+
 export async function getSalesWithChats(req, params = {}) {
   const sb = params.useServiceRole ? serviceClient : pickClient(req);
   const limit = Math.min(parseInt(params.limit) || 100, 500);
