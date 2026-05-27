@@ -337,6 +337,13 @@ function roleForSaleContact(sale, contactId) {
   return 'unknown';
 }
 
+function bestSaleContactForJid(sale, contacts = []) {
+  return contacts.find((contact) => contact?.id === sale?.customer_id)
+    || contacts.find((contact) => contact?.id === sale?.partner_id)
+    || contacts[0]
+    || null;
+}
+
 function saleContactRoleLabel(role) {
   if (role === 'customer') return 'Клиент';
   if (role === 'partner') return 'Дизайнер / партнёр';
@@ -432,7 +439,7 @@ export async function getSaleChatDrilldown({ db, saleId }) {
 
   const chats = [...pairMap.values()].map((chat) => {
     const contactsForJid = contactByJid.get(chat.remote_jid) || [];
-    const contact = contactsForJid[0] || null;
+    const contact = bestSaleContactForJid(sale, contactsForJid);
     const role = roleForSaleContact(sale, contact?.id);
     const lastMessage = messagePairMap.get(`${chat.session_id}:::${chat.remote_jid}`);
     const phone = chat.phone_number || phoneFromJid(chat.remote_jid);

@@ -413,6 +413,22 @@ function normalizePhoneForLookup(raw) {
   return digits;
 }
 
+function contactRemoteJidCandidates(contact) {
+  const out = new Set();
+  for (const jid of contact?.linked_chat_jids || []) {
+    if (jid) out.add(String(jid));
+  }
+  const phones = [
+    contact?.primary_phone,
+    ...(Array.isArray(contact?.phones) ? contact.phones : []),
+  ];
+  for (const raw of phones) {
+    const phone = normalizePhoneForLookup(raw);
+    if (phone) out.add(phone);
+  }
+  return [...out];
+}
+
 export async function findPartnerByPhone(req, phoneRaw) {
   const phone = normalizePhoneForLookup(phoneRaw);
   if (!phone) return null;
@@ -2408,14 +2424,20 @@ export async function getSalesWithChats(req, params = {}) {
   const cached = cacheGet(ck);
   if (cached) return cached;
 
-  // 1. Все contacts с jids (loadAllParallel — нет row limit)
-  const linked = await loadAllParallel(sb, 'partner_contacts',
-    'id, canonical_name, primary_phone, linked_chat_jids',
-    { notNull: ['linked_chat_jids'] }
-  );
+  // 1. Contacts with WhatsApp chats. Do not rely only on linked_chat_jids:
+  // imported sales contacts can have a phone match while linked_chat_jids is empty.
+  const [linked, chatRows] = await Promise.all([
+    loadAllParallel(sb, 'partner_contacts',
+      'id, canonical_name, primary_phone, phones, linked_chat_jids'
+    ),
+    loadAllParallel(sb, 'chats', 'remote_jid'),
+  ]);
+  const knownJids = new Set((chatRows || []).map((c) => c.remote_jid).filter(Boolean));
   const contactsMap = new Map();
   for (const c of linked) {
-    if ((c.linked_chat_jids || []).length > 0) {
+    const candidateJids = contactRemoteJidCandidates(c);
+    if (candidateJids.some((jid) => knownJids.has(jid))) {
+      c._candidate_jids = candidateJids;
       contactsMap.set(c.id, c);
     }
   }
@@ -2461,10 +2483,14 @@ export async function getSalesWithChats(req, params = {}) {
   const allJids = new Set();
   const saleJidsMap = new Map(); // sale_id → { jids, contact }
   for (const s of sortedSales) {
-    const linkedContact = (s.customer_id && contactsMap.get(s.customer_id))
-      || (s.partner_id && contactsMap.get(s.partner_id));
-    const jids = linkedContact?.linked_chat_jids || [];
-    saleJidsMap.set(s.id, { jids, linkedContact });
+    const saleContacts = [
+      s.customer_id && contactsMap.get(s.customer_id),
+      s.partner_id && contactsMap.get(s.partner_id),
+    ].filter(Boolean);
+    const jids = [...new Set(saleContacts.flatMap((contact) => (
+      contact._candidate_jids || contactRemoteJidCandidates(contact)
+    )))];
+    saleJidsMap.set(s.id, { jids, saleContacts });
     for (const j of jids) allJids.add(j);
   }
 
@@ -2475,26 +2501,31 @@ export async function getSalesWithChats(req, params = {}) {
   let aiByJid = {};   // jid → chat_ai record (most recent)
 
   if (jidsArr.length > 0) {
-    // Split into batches of 100 JIDs (PostgREST IN safety)
-    const JID_BATCH = 100;
+    const saleTimes = sortedSales.map((s) => new Date(s.sale_date).getTime()).filter(Number.isFinite);
+    const globalFrom = saleTimes.length ? new Date(Math.min(...saleTimes) - 14 * 24 * 3600 * 1000).toISOString() : null;
+    const globalTo = saleTimes.length ? new Date(Math.max(...saleTimes) + 8 * 24 * 3600 * 1000).toISOString() : null;
+    const JID_BATCH = 25;
     const msgBatches = [];
     const aiBatches = [];
     for (let i = 0; i < jidsArr.length; i += JID_BATCH) {
       const jBatch = jidsArr.slice(i, i + JID_BATCH);
-      msgBatches.push(
-        sb.from('messages')
-          .select('id, remote_jid, body, from_me, timestamp, session_id')
-          .in('remote_jid', jBatch)
-          .order('timestamp', { ascending: false })
-          .limit(200) // top-200 messages across all JIDs in batch
-      );
-      aiBatches.push(
-        sb.from('chat_ai')
-          .select('id, remote_jid, intent, lead_temperature, deal_stage, summary_ru, manager_issues, risk_flags, analyzed_at')
-          .in('remote_jid', jBatch)
-          .order('analyzed_at', { ascending: false })
-          .limit(JID_BATCH) // latest one per JID is enough
-      );
+      let msgQ = sb.from('messages')
+        .select('id, remote_jid, body, from_me, timestamp, session_id')
+        .in('remote_jid', jBatch)
+        .order('timestamp', { ascending: false })
+        .limit(3000);
+      if (globalFrom) msgQ = msgQ.gte('timestamp', globalFrom);
+      if (globalTo) msgQ = msgQ.lte('timestamp', globalTo);
+      msgBatches.push(msgQ);
+
+      let aiQ = sb.from('chat_ai')
+        .select('id, remote_jid, intent, lead_temperature, deal_stage, summary_ru, manager_issues, risk_flags, analyzed_at')
+        .in('remote_jid', jBatch)
+        .order('analyzed_at', { ascending: false })
+        .limit(JID_BATCH * 10);
+      if (globalFrom) aiQ = aiQ.gte('analyzed_at', globalFrom);
+      if (globalTo) aiQ = aiQ.lte('analyzed_at', globalTo);
+      aiBatches.push(aiQ);
     }
 
     const [msgResults, aiResults] = await Promise.all([
@@ -2521,7 +2552,8 @@ export async function getSalesWithChats(req, params = {}) {
   // 4. Assemble result — pure in-memory join, no more DB calls per sale
   const result = [];
   for (const s of sortedSales) {
-    const { jids, linkedContact } = saleJidsMap.get(s.id) || { jids: [], linkedContact: null };
+    const { jids, saleContacts } = saleJidsMap.get(s.id) || { jids: [], saleContacts: [] };
+    const linkedContact = saleContacts[0] || null;
 
     // Collect messages from all jids for this sale, filter to ±14/+7 day window
     let recentMessages = [];
@@ -2563,6 +2595,13 @@ export async function getSalesWithChats(req, params = {}) {
         phone: linkedContact.primary_phone,
         jids,
       } : null,
+      contacts: saleContacts.map((contact) => ({
+        id: contact.id,
+        name: contact.canonical_name,
+        phone: contact.primary_phone,
+        role: contact.id === s.customer_id ? 'customer' : contact.id === s.partner_id ? 'partner' : 'linked',
+        jids: contact._candidate_jids || contactRemoteJidCandidates(contact),
+      })),
       messages_in_window: recentMessages.length,
       messages_sample: recentMessages.slice(0, 6).map(m => ({
         id: m.id, body: (m.body || '').slice(0, 200),
