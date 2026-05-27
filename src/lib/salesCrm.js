@@ -608,6 +608,8 @@ const repeatCustomersInput = z.object({
   fan_min_revenue: z.coerce.number().int().min(0).default(1_000_000),
 });
 
+const REPEAT_CUSTOMERS_IN_BATCH = 100;
+
 // Helper: добавляем 1 месяц к YYYY-MM
 function nextMonth(ym) {
   const [y, m] = ym.split('-').map(Number);
@@ -2474,15 +2476,18 @@ export async function getRepeatCustomers(req, params = {}) {
     return empty;
   }
 
-  const lifetimeSales = [];
-  for (let i = 0; i < activeCustomerIds.length; i += 500) {
-    const batch = activeCustomerIds.slice(i, i + 500);
-    const { data, error } = await sb
-      .from('sales')
-      .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
-      .in('customer_id', batch);
-    if (error) throw new Error(`repeat lifetime sales: ${error.message}`);
-    lifetimeSales.push(...(data || []));
+  const hasPeriodFilter = Boolean(args.date_from || args.date_to);
+  const lifetimeSales = hasPeriodFilter ? [] : [...periodSales];
+  if (hasPeriodFilter) {
+    for (let i = 0; i < activeCustomerIds.length; i += REPEAT_CUSTOMERS_IN_BATCH) {
+      const batch = activeCustomerIds.slice(i, i + REPEAT_CUSTOMERS_IN_BATCH);
+      const { data, error } = await sb
+        .from('sales')
+        .select('id, sale_date, total_amount, source_file, order_num, customer_id, partner_id, customer_raw, partner_raw, manager')
+        .in('customer_id', batch);
+      if (error) throw new Error(`repeat lifetime sales: ${error.message}`);
+      lifetimeSales.push(...(data || []));
+    }
   }
 
   const periodByCustomer = new Map();
@@ -2518,8 +2523,8 @@ export async function getRepeatCustomers(req, params = {}) {
   const contactIds = [...new Set([...repeatCustomerIds, ...partnerIds])];
 
   const contacts = [];
-  for (let i = 0; i < contactIds.length; i += 500) {
-    const batch = contactIds.slice(i, i + 500);
+  for (let i = 0; i < contactIds.length; i += REPEAT_CUSTOMERS_IN_BATCH) {
+    const batch = contactIds.slice(i, i + REPEAT_CUSTOMERS_IN_BATCH);
     const { data, error } = await sb
       .from('partner_contacts')
       .select('id, canonical_name, primary_phone, phones, roles, linked_chat_jids, agency_id')
@@ -2537,8 +2542,8 @@ export async function getRepeatCustomers(req, params = {}) {
     repeatCustomerIds.flatMap((id) => (lifetimeByCustomer.get(id) || []).map((s) => s.id))
   )];
   const categoryBySale = new Map();
-  for (let i = 0; i < repeatedSaleIds.length; i += 500) {
-    const batch = repeatedSaleIds.slice(i, i + 500);
+  for (let i = 0; i < repeatedSaleIds.length; i += REPEAT_CUSTOMERS_IN_BATCH) {
+    const batch = repeatedSaleIds.slice(i, i + REPEAT_CUSTOMERS_IN_BATCH);
     const { data, error } = await sb
       .from('sale_items')
       .select('sale_id, category, amount, qty')
