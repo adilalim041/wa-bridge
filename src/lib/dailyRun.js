@@ -36,7 +36,7 @@ export async function autoDismissResolved() {
     .select('id, session_id, remote_jid, analyzed_at, manager_issues, risk_flags')
     .is('problem_dismissed_at', null)
     .lt('analyzed_at', cutoff)
-    .or('manager_issues.cs.{slow_first_response},manager_issues.cs.{no_followup},risk_flags.cs.{lost_lead},risk_flags.cs.{client_unhappy}')
+    .or('manager_issues.cs.{slow_response},manager_issues.cs.{slow_first_response},manager_issues.cs.{no_response},manager_issues.cs.{no_followup},risk_flags.cs.{lost_lead},risk_flags.cs.{client_unhappy}')
     .limit(200);
   if (fetchErr) throw new Error(`autoDismissResolved fetch: ${fetchErr.message}`);
 

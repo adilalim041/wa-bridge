@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { CUSTOMER_TYPES } from './tagConstants.js';
 import { LEAD_SOURCE_ENUM } from './leadSourceConstants.js';
+import { normalizeManagerIssues } from './managerIssueConstants.js';
 
 // === Tool input schemas for chatEndpoint.js ===
 // Validated BEFORE any DB call — defense against hallucinated limits, injection via IDs,
@@ -110,12 +111,7 @@ export const DailyAnalysisSchema = z.object({
 
   followup_status: z.enum(['not_needed', 'done', 'missed', 'pending']).catch('not_needed'),
 
-  manager_issues: z.array(
-    z.enum([
-      'slow_first_response', 'no_followup', 'poor_consultation', 'no_photos',
-      'no_showroom_invite', 'no_upsell', 'rude_tone', 'formal_tone', 'no_alternative',
-    ])
-  ).catch([]),
+  manager_issues: z.array(z.string()).catch([]).transform(normalizeManagerIssues),
 
   summary_ru: z.string().max(500).nullable().catch(null),
   action_required: z.boolean().catch(false),

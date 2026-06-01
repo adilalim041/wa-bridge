@@ -28,6 +28,7 @@ import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js
 import { getAdLeadAnalytics, getSaleChatDrilldown, refreshPersistedAdLeadEvents, invalidateAdLeadsCache } from '../lib/adLeads.js';
 import { metaAdsRouter } from '../meta-ads/api.js';
 import { mountSettingsRoutes } from './routes/settings.js';
+import { MANAGER_ISSUES, resolveManagerIssue, normalizeManagerIssues } from '../ai/managerIssueConstants.js';
 
 const BRAND = process.env.BRAND_NAME || 'Omoikiri';
 
@@ -92,10 +93,7 @@ const VALID_TEMPERATURES = new Set(['hot', 'warm', 'cold', 'dead']);
 // NOTE: deal_stage is no longer validated against a hardcoded whitelist.
 // Valid stages are tenant-defined in the funnel_stages table.
 // Soft validation (string, 1-40 chars) is applied at the handler level.
-const VALID_MANAGER_ISSUES = new Set([
-  'slow_first_response', 'no_followup', 'poor_consultation', 'no_photos',
-  'no_showroom_invite', 'no_upsell', 'rude_tone', 'formal_tone', 'no_alternative',
-]);
+const VALID_MANAGER_ISSUES = new Set(MANAGER_ISSUES);
 
 // Settings/funnel/managers/templates Zod schemas + zodErrorMessage moved to
 // src/api/routes/settings.js as part of Phase 1 C-2 split (2026-05-05).
@@ -846,7 +844,12 @@ export function setupRoutes(app) {
       if (type === 'risk') {
         aiQuery = aiQuery.contains('risk_flags', [value]);
       } else if (type === 'issue') {
-        aiQuery = aiQuery.contains('manager_issues', [value]);
+        const issueValue = resolveManagerIssue(value);
+        if (issueValue === 'slow_response') {
+          aiQuery = aiQuery.or('manager_issues.cs.{slow_response},manager_issues.cs.{slow_first_response}');
+        } else {
+          aiQuery = aiQuery.contains('manager_issues', [issueValue || value]);
+        }
       } else if (type === 'action_required') {
         aiQuery = aiQuery.eq('action_required', true);
       } else if (type === 'temperature') {
@@ -859,7 +862,7 @@ export function setupRoutes(app) {
         // superset and filter client-side — we're already limited to 100 rows per call.
         aiQuery = aiQuery.or('sentiment.eq.aggressive,intent.eq.complaint,risk_flags.not.is.null');
       } else if (type === 'slow') {
-        aiQuery = aiQuery.contains('manager_issues', ['slow_first_response']);
+        aiQuery = aiQuery.or('manager_issues.cs.{slow_response},manager_issues.cs.{slow_first_response}');
       } else if (type === 'no_followup') {
         aiQuery = aiQuery.contains('manager_issues', ['no_followup']);
       } else if (type === 'football') {
@@ -1021,12 +1024,13 @@ export function setupRoutes(app) {
       if (!Array.isArray(updates.manager_issues)) {
         return res.status(400).json({ error: 'manager_issues must be an array' });
       }
-      const invalid = updates.manager_issues.filter((i) => !VALID_MANAGER_ISSUES.has(i));
+      const invalid = updates.manager_issues.filter((i) => !resolveManagerIssue(i));
       if (invalid.length > 0) {
         return res.status(400).json({
           error: `Invalid manager_issues values: ${invalid.join(', ')}. Valid: ${[...VALID_MANAGER_ISSUES].join(', ')}`,
         });
       }
+      updates.manager_issues = normalizeManagerIssues(updates.manager_issues);
     }
     if ('risk_flags' in updates && !Array.isArray(updates.risk_flags)) {
       return res.status(400).json({ error: 'risk_flags must be an array' });
@@ -1218,7 +1222,7 @@ export function setupRoutes(app) {
   //
   // Paginated list of problem conversations for the Analytics carousel.
   // 5 categories (spec: backlog.md 2026-04-29):
-  //   slow        — manager_issues contains 'slow_first_response'
+  //   slow        — working-time response is >30 min (legacy rows may contain slow_first_response)
   //   no_followup — manager_issues contains 'no_followup'
   //   critical    — sentiment=aggressive OR intent=complaint OR risk_flags non-empty
   //   football    — same remote_jid handled by ≥2 different sessions in 7 days
