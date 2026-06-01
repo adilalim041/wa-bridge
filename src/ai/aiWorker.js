@@ -9,6 +9,7 @@ import {
   resolveTag,
 } from './tagConstants.js';
 import { LEAD_SOURCE_PROMPT_LIST } from './leadSourceConstants.js';
+import { MANAGER_ISSUE_PROMPT_LIST, normalizeManagerIssues } from './managerIssueConstants.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AI_MODEL = 'claude-sonnet-4-20250514';
@@ -74,7 +75,7 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании ${BRAND} ${
     "upsell_offered": true/false
   },
   "followup_status": "одно из: not_needed, done, missed, pending",
-  "manager_issues": ["массив из возможных: slow_first_response, no_followup, poor_consultation, no_photos, no_showroom_invite, no_upsell, rude_tone, formal_tone, no_alternative"],
+  "manager_issues": ["массив из возможных: ${MANAGER_ISSUE_PROMPT_LIST}"],
   "summary_ru": "Краткое резюме на русском, 2-3 предложения максимум",
   "action_required": true/false,
   "action_suggestion": "Что менеджеру стоит сделать дальше (на русском), или null",
@@ -93,9 +94,9 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании ${BRAND} ${
 
 ВАЖНО — Рабочие часы менеджера: 10:00–20:00 по времени Алматы (UTC+5).
 - Сообщения от клиентов вне рабочих часов (до 10:00 или после 20:00) НЕ считаются как медленный ответ, если менеджер ответил на следующий рабочий день до 11:00.
-- slow_first_response ставь ТОЛЬКО если менеджер не ответил в течение 2 часов ВНУТРИ рабочего времени.
-- Если клиент написал в 23:00 а менеджер ответил в 10:15 — это НОРМАЛЬНО, НЕ slow_first_response.
-- Если клиент написал в 14:00 а менеджер ответил в 17:00 — это slow_first_response (3 часа в рабочее время).
+- slow_response ставь ТОЛЬКО если менеджер ответил дольше 30 минут ВНУТРИ рабочего времени.
+- Если клиент написал в 23:00 а менеджер ответил в 10:15 — это НОРМАЛЬНО, НЕ slow_response.
+- Если клиент написал в 14:00 а менеджер ответил в 15:10 — это slow_response (70 минут в рабочее время).
 
 Правила для customer_type:
 - end_client = клиент (покупает для себя, дизайнер интерьера, подрядчик, строитель — все кто покупают или подбирают продукцию)
@@ -123,8 +124,10 @@ const SYSTEM_PROMPT = `Ты — AI-аналитик компании ${BRAND} ${
 - not_needed = разговор активный, завершён сделкой или отказом
 
 Правила для manager_issues (конкретные ошибки менеджера):
-- slow_first_response = первый ответ менеджера дольше 2 часов
+- slow_response = менеджер ответил дольше 30 минут рабочего времени; дольше 1 часа считается критично
+- no_response = клиент ждёт ответа, а менеджер ещё не ответил
 - no_followup = не написал повторно заинтересованному клиенту
+- short_template_only = ответил коротким шаблоном/ценой без выявления потребности и следующего шага
 - poor_consultation = не задал обязательные вопросы из чек-листа
 - no_photos = клиент просил фото/каталог, менеджер не отправил
 - no_showroom_invite = не предложил посетить шоурум
@@ -370,7 +373,7 @@ async function analyzeDialogForDate(dialogSessionId, sessionId, remoteJid, analy
         upsell_offered: Boolean(cq.upsell_offered),
       },
       followup_status: analysis.followup_status || 'not_needed',
-      manager_issues: Array.isArray(analysis.manager_issues) ? analysis.manager_issues : [],
+      manager_issues: normalizeManagerIssues(analysis.manager_issues),
     };
 
     // Check if existing record has manual stage override — preserve it

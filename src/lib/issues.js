@@ -26,6 +26,7 @@
 
 import { supabase as serviceClient } from '../storage/supabase.js';
 import { logger } from '../config.js';
+import { normalizeManagerIssues } from '../ai/managerIssueConstants.js';
 
 // ─── Cache ───────────────────────────────────────────────────────────────────
 
@@ -566,7 +567,7 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
     const chat = chatsMap.get(chatKey);
     const pushName = pushNameMap.get(chatKey) || null;
     const fb = footballMeta?.get(r.remote_jid) || null;
-    const managerIssues = new Set(r.manager_issues || []);
+    const managerIssues = new Set(normalizeManagerIssues(r.manager_issues || []));
     if (category === 'slow') managerIssues.add('slow_response');
 
     // Resolve LID→phone via auth_state map (priority over chats.phone_number,
