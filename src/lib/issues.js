@@ -2,7 +2,7 @@
  * Issues module — helpers for GET /ai/issues and POST /ai/issues/:dialog_session_id/dismiss.
  *
  * Powers the "проблемные переписки" carousel on the Analytics dashboard.
- * 5 categories: slow | no_followup | critical | football | lost.
+ * 6 categories: slow | no_response | no_followup | critical | football | lost.
  *
  * Design notes:
  * - Uses req.userClient (RLS-aware) for all DB reads/writes — never service_role
@@ -67,13 +67,20 @@ export function invalidateIssuesCache() {
   _issuesCache.clear();
 }
 
+function _chunks(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const VALID_CATEGORIES = new Set(['slow', 'no_followup', 'critical', 'football', 'lost']);
+const VALID_CATEGORIES = new Set(['slow', 'no_response', 'no_followup', 'critical', 'football', 'lost']);
 const ALMATY_UTC_OFFSET_MIN = 5 * 60;
 const WORK_START_HOUR = 10;
 const WORK_END_HOUR = 20;
 const SLOW_RESPONSE_MINUTES = 30;
+const POSTGREST_PAGE_SIZE = 1000;
 
 // Stages where the deal moved forward — dismiss = won.
 // All other stages (NULL, consultation stuck, refused, needs_review) = lost.
@@ -145,29 +152,36 @@ function _businessMinutesBetween(a, b) {
 }
 
 async function _getSlowDialogIds({ db, sessionId, dateFrom, dateTo }) {
-  let q = db
-    .from('manager_analytics')
-    .select('dialog_session_id, customer_message_at, manager_response_at');
-
-  if (sessionId) q = q.eq('session_id', sessionId);
-  if (dateFrom) q = q.gte('customer_message_at', `${dateFrom}T00:00:00+05:00`);
-  if (dateTo) q = q.lte('customer_message_at', `${dateTo}T23:59:59+05:00`);
-  q = q.limit(1000);
-
-  const { data, error } = await q;
-  if (error) {
-    logger.error({ err: error }, 'getIssues: manager_analytics slow query failed');
-    throw new Error('manager_analytics query failed');
-  }
-
   const slow = new Set();
-  for (const row of data || []) {
-    if (!row.dialog_session_id || !row.customer_message_at) continue;
-    const responseAt = row.manager_response_at || new Date();
-    if (_businessMinutesBetween(row.customer_message_at, responseAt) > SLOW_RESPONSE_MINUTES) {
-      slow.add(row.dialog_session_id);
+
+  for (let from = 0; ; from += POSTGREST_PAGE_SIZE) {
+    let q = db
+      .from('manager_analytics')
+      .select('dialog_session_id, customer_message_at, manager_response_at')
+      .order('customer_message_at', { ascending: true })
+      .range(from, from + POSTGREST_PAGE_SIZE - 1);
+
+    if (sessionId) q = q.eq('session_id', sessionId);
+    if (dateFrom) q = q.gte('customer_message_at', `${dateFrom}T00:00:00+05:00`);
+    if (dateTo) q = q.lte('customer_message_at', `${dateTo}T23:59:59+05:00`);
+
+    const { data, error } = await q;
+    if (error) {
+      logger.error({ err: error }, 'getIssues: manager_analytics slow query failed');
+      throw new Error('manager_analytics query failed');
     }
+
+    for (const row of data || []) {
+      if (!row.dialog_session_id || !row.customer_message_at) continue;
+      const responseAt = row.manager_response_at || new Date();
+      if (_businessMinutesBetween(row.customer_message_at, responseAt) > SLOW_RESPONSE_MINUTES) {
+        slow.add(row.dialog_session_id);
+      }
+    }
+
+    if (!data || data.length < POSTGREST_PAGE_SIZE) break;
   }
+
   return slow;
 }
 
@@ -238,31 +252,41 @@ async function _filterRowsWithMessages(rows, db) {
   if (!rows.length) return rows;
 
   const dialogIds = [...new Set(rows.map((r) => r.dialog_session_id).filter(Boolean))];
-  const uniqueSessions = [...new Set(rows.map((r) => r.session_id).filter(Boolean))];
-  const uniqueJids = [...new Set(rows.map((r) => r.remote_jid).filter(Boolean))];
+  const dialogsWithMessages = new Set();
+  for (const part of _chunks(dialogIds, 20)) {
+    const { data, error } = await db.from('messages')
+      .select('dialog_session_id')
+      .in('dialog_session_id', part)
+      .limit(10000);
+    if (error) {
+      logger.warn({ err: error }, 'getIssues: messages dialog existence filter failed');
+      return rows;
+    }
+    for (const m of data || []) dialogsWithMessages.add(String(m.dialog_session_id));
+  }
 
-  const [dialogRes, exactRes] = await Promise.all([
-    dialogIds.length > 0
-      ? db.from('messages')
-          .select('dialog_session_id')
-          .in('dialog_session_id', dialogIds)
-          .limit(5000)
-      : Promise.resolve({ data: [] }),
-    uniqueSessions.length > 0 && uniqueJids.length > 0
-      ? db.from('messages')
-          .select('session_id, remote_jid')
-          .in('session_id', uniqueSessions)
-          .in('remote_jid', uniqueJids)
-          .limit(5000)
-      : Promise.resolve({ data: [] }),
-  ]);
+  const exactPairsWithMessages = new Set();
+  const jidsBySession = new Map();
+  for (const row of rows) {
+    if (!row.session_id || !row.remote_jid) continue;
+    if (!jidsBySession.has(row.session_id)) jidsBySession.set(row.session_id, new Set());
+    jidsBySession.get(row.session_id).add(row.remote_jid);
+  }
 
-  const dialogsWithMessages = new Set(
-    (dialogRes.data || []).map((m) => String(m.dialog_session_id))
-  );
-  const exactPairsWithMessages = new Set(
-    (exactRes.data || []).map((m) => `${m.session_id}:::${m.remote_jid}`)
-  );
+  for (const [session, jidsSet] of jidsBySession) {
+    for (const part of _chunks([...jidsSet], 20)) {
+      const { data, error } = await db.from('messages')
+        .select('session_id, remote_jid')
+        .eq('session_id', session)
+        .in('remote_jid', part)
+        .limit(10000);
+      if (error) {
+        logger.warn({ err: error }, 'getIssues: messages pair existence filter failed');
+        return rows;
+      }
+      for (const m of data || []) exactPairsWithMessages.add(`${m.session_id}:::${m.remote_jid}`);
+    }
+  }
 
   const bareLidRows = rows.filter((r) => {
     const digits = String(r.remote_jid || '').replace(/[^0-9]/g, '');
@@ -405,61 +429,83 @@ export async function getIssues({ category, page, limit, sessionId, dateFrom, da
     }
   }
 
-  // Build base query
-  let q = db.from('chat_ai').select(CHAT_AI_SELECT);
-  q = q.in('customer_type', ['end_client', 'partner']);
-  if (safeSessionId) q = q.eq('session_id', safeSessionId);
-  if (safeDateFrom) {
-    q = q.gte('analysis_date', safeDateFrom).lte('analysis_date', safeDateTo || safeDateFrom);
-  } else {
-    q = q.gte('analysis_date', rollingDateFrom);
-  }
+  const applyBaseFilters = (query) => {
+    let next = query.in('customer_type', ['end_client', 'partner']);
+    if (safeSessionId) next = next.eq('session_id', safeSessionId);
+    if (safeDateFrom) {
+      next = next.gte('analysis_date', safeDateFrom).lte('analysis_date', safeDateTo || safeDateFrom);
+    } else {
+      next = next.gte('analysis_date', rollingDateFrom);
+    }
+    if (category !== 'lost') next = next.is('problem_dismissed_at', null);
+    return next;
+  };
 
-  // All categories except 'lost' exclude already-dismissed rows
-  if (category !== 'lost') {
-    q = q.is('problem_dismissed_at', null);
-  }
-
-  // Category-specific filters
+  let rawRows = null;
   if (category === 'slow') {
-    q = q.in('dialog_session_id', [...slowDialogIds]);
-  } else if (category === 'no_followup') {
-    q = q.contains('manager_issues', ['no_followup']);
-  } else if (category === 'critical') {
-    // PostgREST can't filter "array non-empty" directly — fetch superset, JS-filter.
-    // Superset: sentiment=aggressive OR intent=complaint OR risk_flags not null.
-    // The OR uses PostgREST's .or() syntax which is safe here (no user-supplied values).
-    q = q.or('sentiment.eq.aggressive,intent.eq.complaint,risk_flags.not.is.null');
-  } else if (category === 'football') {
-    q = q.in('remote_jid', [...footballMeta.keys()]);
-  } else if (category === 'lost') {
-    q = q.eq('problem_dismissed_action', 'lost');
+    rawRows = [];
+    for (const part of _chunks([...slowDialogIds], 100)) {
+      const { data, error } = await applyBaseFilters(db.from('chat_ai').select(CHAT_AI_SELECT))
+        .in('dialog_session_id', part)
+        .order('analysis_date', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1000);
+      if (error) {
+        logger.error({ err: error, category }, 'getIssues: chat_ai slow chunk query failed');
+        throw new Error('chat_ai query failed');
+      }
+      rawRows.push(...(data || []));
+    }
   }
 
-  // Order: newest analysis first
-  q = q.order('analysis_date', { ascending: false }).order('id', { ascending: false });
+  const buildChatAiQuery = () => {
+    let q = applyBaseFilters(db.from('chat_ai').select(CHAT_AI_SELECT));
 
-  // Fetch all matching rows (we need total count for pagination).
-  // Max reasonable size: 200. If category grows past that, we'd add server-side
-  // pagination with a count query — not needed at current scale.
-  q = q.limit(200);
+    if (category === 'no_response') {
+      q = q.contains('manager_issues', ['no_response']);
+    } else if (category === 'no_followup') {
+      q = q.contains('manager_issues', ['no_followup']);
+    } else if (category === 'critical') {
+      // PostgREST can't filter "array non-empty" directly — fetch superset, JS-filter.
+      // Superset: sentiment=aggressive OR intent=complaint OR risk_flags not null.
+      // The OR uses PostgREST's .or() syntax which is safe here (no user-supplied values).
+      q = q.or('sentiment.eq.aggressive,intent.eq.complaint,risk_flags.not.is.null');
+    } else if (category === 'football') {
+      q = q.in('remote_jid', [...footballMeta.keys()]);
+    } else if (category === 'lost') {
+      q = q.eq('problem_dismissed_action', 'lost');
+    }
 
-  const { data: rawRows, error: qErr } = await q;
-  if (qErr) {
-    logger.error({ err: qErr, category }, 'getIssues: chat_ai query failed');
-    throw new Error('chat_ai query failed');
+    return q.order('analysis_date', { ascending: false }).order('id', { ascending: false });
+  };
+
+  if (rawRows === null) {
+    rawRows = [];
+    for (let from = 0; ; from += POSTGREST_PAGE_SIZE) {
+      const { data, error: qErr } = await buildChatAiQuery()
+        .range(from, from + POSTGREST_PAGE_SIZE - 1);
+      if (qErr) {
+        logger.error({ err: qErr, category }, 'getIssues: chat_ai query failed');
+        throw new Error('chat_ai query failed');
+      }
+      rawRows.push(...(data || []));
+      if (!data || data.length < POSTGREST_PAGE_SIZE) break;
+    }
   }
 
   const businessRows = await _filterRowsByPhoneTags(rawRows || [], db);
 
   // JS post-filter for 'critical' (array non-empty check)
-  const allRows = category === 'critical'
-    ? businessRows.filter((r) =>
+  let allRows = businessRows;
+  if (category === 'critical') {
+    allRows = businessRows.filter((r) =>
         r.sentiment === 'aggressive' ||
         r.intent === 'complaint' ||
         (Array.isArray(r.risk_flags) && r.risk_flags.length > 0)
-      )
-    : businessRows;
+      );
+  } else if (category === 'no_followup') {
+    allRows = businessRows.filter((r) => !(r.manager_issues || []).includes('no_response'));
+  }
 
   const rowsWithMessages = await _filterRowsWithMessages(allRows, db);
   const total = rowsWithMessages.length;
