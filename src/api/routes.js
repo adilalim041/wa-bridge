@@ -1237,7 +1237,7 @@ export function setupRoutes(app) {
     const page = Math.max(0, parseInt(req.query.page, 10) || 0);
     const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 20), 50);
 
-    const VALID = new Set(['slow', 'no_followup', 'critical', 'football', 'lost']);
+    const VALID = new Set(['slow', 'no_response', 'no_followup', 'critical', 'football', 'lost']);
     if (!category || !VALID.has(category)) {
       return res.status(400).json({
         error: `category is required and must be one of: ${[...VALID].join(', ')}`,
