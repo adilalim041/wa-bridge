@@ -21,6 +21,44 @@ import { supabase } from '../storage/supabase.js';
 import { sendTelegramMessage, isTelegramConfigured } from '../notifications/telegramBot.js';
 import { applyAutoTag } from '../ai/aiWorker.js';
 
+function isAnalyzablePersonalJid(jid) {
+  const raw = String(jid || '');
+  if (!raw) return false;
+  if (raw.includes('@g.us') || raw.includes('@newsletter') || raw.includes('120363')) return false;
+  return true;
+}
+
+function chunks(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+async function filterAnalyzableByTags(dialogs) {
+  const jids = [...new Set((dialogs || []).map((d) => d.remote_jid).filter(Boolean))];
+  if (!jids.length) return dialogs || [];
+
+  const tagsByJid = new Map();
+  for (let i = 0; i < jids.length; i += 500) {
+    const { data, error } = await supabase
+      .from('chat_tags')
+      .select('remote_jid, tags')
+      .in('remote_jid', jids.slice(i, i + 500));
+    if (error) {
+      return dialogs || [];
+    }
+    for (const row of data || []) {
+      tagsByJid.set(row.remote_jid, (row.tags || []).map((tag) => String(tag).toLowerCase()));
+    }
+  }
+
+  const skipTags = new Set(['сотрудник', 'спам', 'личное', 'коллега']);
+  return (dialogs || []).filter((d) => {
+    const tags = tagsByJid.get(d.remote_jid) || [];
+    return !tags.some((tag) => skipTags.has(tag));
+  });
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 1. autoDismissResolved
 // ───────────────────────────────────────────────────────────────────────────
@@ -139,6 +177,7 @@ export async function getPendingDialogs({
 
   for (const s of sessions) {
     // Только диалоги с активностью в окне
+    const queryLimit = Math.min(cap * 3, 1500);
     const { data: dialogs } = await supabase
       .from('dialog_sessions')
       .select('id, remote_jid, last_message_at, message_count, started_at')
@@ -146,18 +185,26 @@ export async function getPendingDialogs({
       .gte('message_count', 2)
       .gte('last_message_at', cutoff)
       .order('last_message_at', { ascending: false })
-      .limit(cap);
-    if (!dialogs || dialogs.length === 0) continue;
+      .limit(queryLimit);
+    const personalDialogs = await filterAnalyzableByTags(
+      (dialogs || []).filter((d) => isAnalyzablePersonalJid(d.remote_jid))
+    );
+    if (personalDialogs.length === 0) continue;
 
     // Какие из них уже в chat_ai (и когда последний анализ)
-    const dialogIds = dialogs.map((d) => d.id);
-    const { data: analyzed } = await supabase
-      .from('chat_ai')
-      .select('dialog_session_id, analyzed_at')
-      .in('dialog_session_id', dialogIds);
+    const dialogIds = personalDialogs.map((d) => d.id);
+    const analyzed = [];
+    for (const part of chunks(dialogIds, 100)) {
+      const { data: analyzedPart, error: analyzedErr } = await supabase
+        .from('chat_ai')
+        .select('dialog_session_id, analyzed_at')
+        .in('dialog_session_id', part);
+      if (analyzedErr) throw new Error(`getPendingDialogs analyzed: ${analyzedErr.message}`);
+      analyzed.push(...(analyzedPart || []));
+    }
     const analyzedMap = new Map((analyzed || []).map((a) => [a.dialog_session_id, a.analyzed_at]));
 
-    for (const d of dialogs) {
+    for (const d of personalDialogs) {
       const lastAnalyzedAt = analyzedMap.get(d.id);
       if (!lastAnalyzedAt) {
         out.push({ ...d, session_id: s.session_id, reason: 'new' });
@@ -312,10 +359,12 @@ export async function saveAnalysis(records, { markAsRead = false } = {}) {
         continue;
       }
       if (insErr?.code === '23505') {
-        const { data: upd, error: updErr } = await supabase
+        let updateQuery = supabase
           .from('chat_ai')
           .update(r)
-          .eq('dialog_session_id', r.dialog_session_id)
+          .eq('dialog_session_id', r.dialog_session_id);
+        if (r.analysis_date) updateQuery = updateQuery.eq('analysis_date', r.analysis_date);
+        const { data: upd, error: updErr } = await updateQuery
           .select('id, dialog_session_id')
           .maybeSingle();
         if (!updErr && upd) {
