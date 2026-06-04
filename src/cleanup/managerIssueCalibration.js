@@ -63,10 +63,17 @@ function isClosingAck(body) {
     || /(спасибо|рахмет|все хорошо|всё хорошо|благодарю)/i.test(s);
 }
 
+function isPassiveStatusUpdate(body) {
+  const s = String(body || '').trim().toLowerCase();
+  if (!s || /[?]/.test(s)) return false;
+  return /^(\u043f\u043e\u043a\u0430\s+\u043d\u0435\u0442\s+\u043e\u043f\u043b\u0430\u0442|\u043d\u0435\u0442\s+\u043e\u043f\u043b\u0430\u0442|\u043e\u0442\u0434\u0430\u043b\u0430?\s+\u043d\u0430\s+\u043e\u043f\u043b\u0430\u0442|\u043e\u043f\u043b\u0430\u0442\u0443\s+\u043e\u0442\u0434\u0430\u043b\u0430?|\u043f\u0435\u0440\u0435\u0434\u0430\u043b\u0430?\s+\u043d\u0430\s+\u043e\u043f\u043b\u0430\u0442|\u0441\u0430\u043c\u0430?\s+\u043e\u0442\u043f\u0440\u0430\u0432\u043b\u044e|\u0442\u043e\u0436\u0435\s+\u0441\u0430\u043c\u0430?\s+\u043e\u0442\u043f\u0440\u0430\u0432\u043b\u044e)/i.test(s);
+}
+
 function isOpenClientRequest(message) {
   const body = String(message?.body || '').trim().toLowerCase();
   const type = String(message?.message_type || '').toLowerCase();
   if (isClosingAck(body)) return false;
+  if (isPassiveStatusUpdate(body)) return false;
   if (['audio', 'image', 'video', 'document', 'contact'].includes(type) && (!body || /^\[(audio|image|video|document|contact)/.test(body))) return true;
   return /[?؟]|подскаж|можно|сколько|цена|стоим|что по|когда|где|адрес|фото|видео|каталог|прайс|кп|счет|счёт|оплат|достав|отправ|налич|размер|цвет|модель|какой|какая|какие|нужн|интерес|узнай|сейчас что делать|пришлите|скиньте/.test(body);
 }
@@ -129,13 +136,14 @@ function lastManagerAskedForCityOrName(messages) {
   return /вы с астаны|вы с алматы|с какого города|как могу к вам обращаться|как я могу к вам обращаться|как вас зовут/.test(body);
 }
 
-function shouldRemoveNoShowroom(messages, customerType) {
+function shouldRemoveNoShowroom(messages, customerType, leadSource) {
   const allText = textOf(messages);
   const outText = textOf(messages, true);
   const inText = textOf(messages, false);
   const clientProduct = detectProduct(inText);
   const product = clientProduct === 'other' ? detectProduct(allText) : clientProduct;
   if (!['sink', 'faucet', 'grinder'].includes(product)) return true;
+  if (leadSource === 'existing_customer') return true;
   if (customerType === 'partner') return true;
   if (isLateStageOrService(allText)) return true;
   if (lastManagerAskedForCityOrName(messages)) return true;
@@ -164,7 +172,7 @@ async function fetchRows() {
   const since = new Date(Date.now() - (DAYS - 1) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const { data, error } = await supabase
     .from('chat_ai')
-    .select('id, dialog_session_id, session_id, remote_jid, analysis_date, customer_type, manager_issues, followup_status, action_required, action_suggestion, summary_ru')
+    .select('id, dialog_session_id, session_id, remote_jid, analysis_date, customer_type, lead_source, manager_issues, followup_status, action_required, action_suggestion, summary_ru')
     .gte('analysis_date', since)
     .in('customer_type', ['end_client', 'partner'])
     .not('manager_issues', 'eq', '{}')
@@ -223,7 +231,7 @@ function calibrate(row, messages) {
     }
   }
 
-  if (issues.has('short_template_only') && (hasConcreteNextStep(outText) || /\[image\]|\[document|\[video\]/.test(outText) || isLateStageOrService(allText))) {
+  if (issues.has('short_template_only') && (!last?.from_me || hasConcreteNextStep(outText) || /\[image\]|\[document|\[video\]/.test(outText) || isLateStageOrService(allText))) {
     issues.delete('short_template_only');
     reasons.push('manager gave concrete next step/media/logistics');
   }
@@ -233,7 +241,7 @@ function calibrate(row, messages) {
     reasons.push('no unresolved visual request');
   }
 
-  if (issues.has('no_showroom_invite') && shouldRemoveNoShowroom(messages, row.customer_type)) {
+  if (issues.has('no_showroom_invite') && shouldRemoveNoShowroom(messages, row.customer_type, row.lead_source)) {
     issues.delete('no_showroom_invite');
     reasons.push('showroom invite exclusion applies');
   }
