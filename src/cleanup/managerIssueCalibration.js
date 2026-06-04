@@ -67,7 +67,7 @@ function isOpenClientRequest(message) {
   const body = String(message?.body || '').trim().toLowerCase();
   const type = String(message?.message_type || '').toLowerCase();
   if (isClosingAck(body)) return false;
-  if (['audio', 'image', 'video', 'document', 'contact'].includes(type) && !body) return true;
+  if (['audio', 'image', 'video', 'document', 'contact'].includes(type) && (!body || /^\[(audio|image|video|document|contact)/.test(body))) return true;
   return /[?؟]|подскаж|можно|сколько|цена|стоим|что по|когда|где|адрес|фото|видео|каталог|прайс|кп|счет|счёт|оплат|достав|отправ|налич|размер|цвет|модель|какой|какая|какие|нужн|интерес|узнай|сейчас что делать|пришлите|скиньте/.test(body);
 }
 
@@ -76,7 +76,7 @@ function isLateStageOrService(allText) {
 }
 
 function hasConcreteNextStep(outText) {
-  return /кп|коммерческ|прайс|каталог|счет|счёт|оплат|достав|отправ|привез|поступ|в наличии|забер|заед|подъед|шоурум|адрес|2gis|каспи|перевести|чек|накладн|сегодня|завтра|в течение|цена|стоим|₸|тг/.test(outText);
+  return /кп|коммерческ|прайс|каталог|счет|счёт|оплат|достав|отправ|привез|поступ|в наличии|забер|заед|подъед|шоурум|адрес|2gis|каспи|перевести|чек|накладн|сегодня|сег\b|точно будет|завтра|в течение|цена|стоим|₸|тг/.test(outText);
 }
 
 function isPassiveFollowupSignal(messages) {
@@ -88,7 +88,9 @@ function isPassiveFollowupSignal(messages) {
 }
 
 function asksForVisual(body) {
-  return /фото|видео|покаж|как выглядит|можно.*увидеть|снимите|скиньте.*вид/.test(String(body || '').toLowerCase());
+  const text = String(body || '').toLowerCase();
+  if (/(\bя\b|сейчас|щас|сами|сам|сама|наш[ауе]?|мо[йяёе])[^.!?\n]{0,40}(покажу|скину|отправлю|пришлю|сниму)/.test(text)) return false;
+  return /фото|видео|покажите|покажешь|покажете|как выглядит|можно.*увидеть|снимите|скиньте.*вид/.test(text);
 }
 
 function managerAnsweredWithVisual(message) {
