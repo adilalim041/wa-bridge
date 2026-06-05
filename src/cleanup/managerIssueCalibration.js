@@ -79,11 +79,26 @@ function isOpenClientRequest(message) {
 }
 
 function isLateStageOrService(allText) {
-  return /оплат|счет|счёт|чек|накладн|достав|отправ|получател|адрес доставки|курьер|забер|самовывоз|поступ|пришел|пришёл|остат|гарант|сервис|замен|кранбукс|картридж|протека|дефект|ремонт/.test(allText);
+  return /оплат|счет|счёт|чек|накладн|достав|отправ|получател|адрес доставки|курьер|забер|самовывоз|поступ|пришел|пришёл|остат|гарант|сервис|замен|кранбукс|картридж|протека|дефект|ремонт|бонус|бухгалтер|оферт|платформ|supplier|pintrillion|эквайринг|комисси/.test(allText);
 }
 
 function hasConcreteNextStep(outText) {
-  return /кп|коммерческ|прайс|каталог|счет|счёт|оплат|достав|отправ|привез|поступ|в наличии|забер|заед|подъед|шоурум|адрес|2gis|каспи|перевести|чек|накладн|сегодня|сег\b|точно будет|завтра|в течение|цена|стоим|₸|тг/.test(outText);
+  return /кп|коммерческ|прайс|каталог|счет|счёт|оплат|достав|отправ|привез|поступ|в наличии|забер|заед|подъед|шоурум|адрес|2gis|каспи|перевести|чек|накладн|сегодня|сег\b|точно будет|завтра|в течение|цена|стоим|₸|тг|жд[её]м|ожидаем|извин|задерж|границ|очеред|(?:\+7|8)\s*[\d\s().-]{9,}/.test(outText);
+}
+
+function isShortReplyToManagerQuestion(messages) {
+  const last = messages[messages.length - 1];
+  if (!last || last.from_me) return false;
+
+  const body = String(last.body || '').trim().toLowerCase();
+  if (!/^(да|нет|можно|ок|okay|хорошо|спасибо|рахмет)[.!?\s]*$/i.test(body)) return false;
+
+  const previous = [...messages.slice(0, -1)].reverse().find((m) => m.from_me);
+  return Boolean(previous && /[?؟]|можно|подскаж|бонус|каспи|оплат/.test(String(previous.body || '').toLowerCase()));
+}
+
+function isSupplierOrAdminFlow(allText) {
+  return /pintrillion|supplier|платформ|оферт|налогов|документн|эквайринг|комисси|ответ на платформе|дизайнер.*ждет.*ответ|дизайнер.*ждёт.*ответ/.test(allText);
 }
 
 function isPassiveFollowupSignal(messages) {
@@ -97,6 +112,7 @@ function isPassiveFollowupSignal(messages) {
 function asksForVisual(body) {
   const text = String(body || '').toLowerCase();
   if (/(\bя\b|сейчас|щас|сами|сам|сама|наш[ауе]?|мо[йяёе])[^.!?\n]{0,40}(покажу|скину|отправлю|пришлю|сниму)/.test(text)) return false;
+  if (/вы\s+просили[^.!?\n]{0,40}(фото|видео)|сейчас[^.!?\n]{0,40}(пришлю|скину|отправлю)[^.!?\n]{0,40}(фото|видео)|пришлю[^.!?\n]{0,40}(фото|видео)/.test(text)) return false;
   return /фото|видео|покажите|покажешь|покажете|как выглядит|можно.*увидеть|снимите|скиньте.*вид/.test(text);
 }
 
@@ -146,6 +162,7 @@ function shouldRemoveNoShowroom(messages, customerType, leadSource) {
   if (leadSource === 'existing_customer') return true;
   if (customerType === 'partner') return true;
   if (isLateStageOrService(allText)) return true;
+  if (/что это за мойк|что за модель|омск написан|оригинал|подделк|идентифиц/.test(inText)) return true;
   if (lastManagerAskedForCityOrName(messages)) return true;
   if (/передам.*(контакт|менеджер|коллег)|с вами.{0,60}свяж|нашему менеджеру|наш менеджер|менеджер из|по вашему региону/.test(outText)) return true;
   if (/шоурум|приезж|адрес|салон|подъехать|подьехать|2gis|акмешит|жибек жолы|выставоч|визит|посетили|приходили/.test(outText)) return true;
@@ -210,6 +227,8 @@ function calibrate(row, messages) {
   const clientWaiting = last
     && !last.from_me
     && isOpenClientRequest(last)
+    && !isShortReplyToManagerQuestion(messages)
+    && !isSupplierOrAdminFlow(allText)
     && businessMinutesBetween(last.timestamp, new Date()) > 60;
 
   if (clientWaiting && issues.has('no_followup')) {
@@ -231,7 +250,7 @@ function calibrate(row, messages) {
     }
   }
 
-  if (issues.has('short_template_only') && (!last?.from_me || hasConcreteNextStep(outText) || /\[image\]|\[document|\[video\]/.test(outText) || isLateStageOrService(allText))) {
+  if (issues.has('short_template_only') && (!last?.from_me || hasConcreteNextStep(outText) || /\[image\]|\[document|\[video\]/.test(outText) || isLateStageOrService(allText) || isSupplierOrAdminFlow(allText))) {
     issues.delete('short_template_only');
     reasons.push('manager gave concrete next step/media/logistics');
   }
