@@ -34,6 +34,11 @@ function chunks(items, size) {
   return out;
 }
 
+function isOpenIssue(issues) {
+  const set = new Set(Array.isArray(issues) ? issues : []);
+  return set.has('no_response') || set.has('no_followup');
+}
+
 async function filterAnalyzableByTags(dialogs) {
   const jids = [...new Set((dialogs || []).map((d) => d.remote_jid).filter(Boolean))];
   if (!jids.length) return dialogs || [];
@@ -165,6 +170,11 @@ export async function getPendingDialogs({
   const cap = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
   const hours = Math.min(Math.max(parseInt(sinceHours) || 24, 1), 24 * 30); // max 30 days
   const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const now = Date.now();
+  const staleAfter = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+  const staleRecheckAfter = new Date(now - 20 * 60 * 60 * 1000).toISOString();
+  const staleWindowHours = Math.max(hours, 24 * 7);
+  const staleWindowCutoff = new Date(now - staleWindowHours * 60 * 60 * 1000).toISOString();
 
   let sessQ = supabase.from('session_config').select('session_id').eq('is_active', true);
   if (sessionId) sessQ = sessQ.eq('session_id', sessionId);
@@ -174,6 +184,8 @@ export async function getPendingDialogs({
 
   const out = [];
   let newCount = 0, reCount = 0;
+  let staleFollowupCount = 0;
+  const seenDialogIds = new Set();
 
   for (const s of sessions) {
     // Только диалоги с активностью в окне
@@ -208,12 +220,86 @@ export async function getPendingDialogs({
       const lastAnalyzedAt = analyzedMap.get(d.id);
       if (!lastAnalyzedAt) {
         out.push({ ...d, session_id: s.session_id, reason: 'new' });
+        seenDialogIds.add(d.id);
         newCount++;
       } else if (new Date(d.last_message_at) > new Date(lastAnalyzedAt)) {
         // Новые сообщения пришли после прошлого анализа → re-analyze для свежих тегов
         out.push({ ...d, session_id: s.session_id, reason: 're_analyze', last_analyzed_at: lastAnalyzedAt });
+        seenDialogIds.add(d.id);
         reCount++;
       }
+      if (out.length >= cap) break;
+    }
+    if (out.length >= cap) break;
+
+    const remaining = cap - out.length;
+    if (remaining <= 0) break;
+
+    const { data: aiCandidates, error: aiCandidateErr } = await supabase
+      .from('chat_ai')
+      .select('dialog_session_id, analyzed_at, deal_stage, manager_issues, customer_type')
+      .eq('session_id', s.session_id)
+      .in('customer_type', ['end_client', 'partner'])
+      .gte('analysis_date', staleWindowCutoff.slice(0, 10))
+      .is('problem_dismissed_at', null)
+      .order('analyzed_at', { ascending: false })
+      .limit(Math.min(remaining * 6, 600));
+    if (aiCandidateErr) throw new Error(`getPendingDialogs stale candidates: ${aiCandidateErr.message}`);
+
+    const latestAiByDialog = new Map();
+    for (const row of aiCandidates || []) {
+      if (!row.dialog_session_id || latestAiByDialog.has(row.dialog_session_id)) continue;
+      latestAiByDialog.set(row.dialog_session_id, row);
+    }
+
+    const staleIds = [...latestAiByDialog.values()]
+      .filter((row) => !seenDialogIds.has(row.dialog_session_id))
+      .filter((row) => new Date(row.analyzed_at) < new Date(staleRecheckAfter))
+      .filter((row) => !isOpenIssue(row.manager_issues))
+      .filter((row) => !['payment', 'delivery', 'completed', 'refused', 'needs_review'].includes(row.deal_stage))
+      .map((row) => row.dialog_session_id);
+    if (staleIds.length === 0) continue;
+
+    const staleDialogs = [];
+    for (const part of chunks(staleIds, 100)) {
+      const { data: dialogPart, error: dialogErr } = await supabase
+        .from('dialog_sessions')
+        .select('id, remote_jid, last_message_at, message_count, started_at')
+        .eq('session_id', s.session_id)
+        .in('id', part)
+        .gte('message_count', 2)
+        .gte('last_message_at', staleWindowCutoff)
+        .lt('last_message_at', staleAfter);
+      if (dialogErr) throw new Error(`getPendingDialogs stale dialogs: ${dialogErr.message}`);
+      staleDialogs.push(...(dialogPart || []));
+    }
+
+    const personalStaleDialogs = await filterAnalyzableByTags(
+      staleDialogs.filter((d) => isAnalyzablePersonalJid(d.remote_jid))
+    );
+    if (personalStaleDialogs.length === 0) continue;
+
+    const lastMessages = new Map();
+    for (const part of chunks(personalStaleDialogs.map((d) => d.id), 80)) {
+      const { data: messagePart, error: msgErr } = await supabase
+        .from('messages')
+        .select('dialog_session_id, from_me, timestamp')
+        .in('dialog_session_id', part)
+        .order('timestamp', { ascending: false })
+        .limit(part.length * 8);
+      if (msgErr) throw new Error(`getPendingDialogs stale messages: ${msgErr.message}`);
+      for (const msg of messagePart || []) {
+        if (!lastMessages.has(msg.dialog_session_id)) lastMessages.set(msg.dialog_session_id, msg);
+      }
+    }
+
+    for (const d of personalStaleDialogs) {
+      const last = lastMessages.get(d.id);
+      if (!last?.from_me) continue;
+      if (new Date(last.timestamp) > new Date(staleAfter)) continue;
+      out.push({ ...d, session_id: s.session_id, reason: 'stale_followup' });
+      seenDialogIds.add(d.id);
+      staleFollowupCount++;
       if (out.length >= cap) break;
     }
     if (out.length >= cap) break;
@@ -299,6 +385,7 @@ export async function getPendingDialogs({
     count: out.length,
     new_count: newCount,
     re_analyze_count: reCount,
+    stale_followup_count: staleFollowupCount,
     since: cutoff,
     since_hours: hours,
     dialogs: out,

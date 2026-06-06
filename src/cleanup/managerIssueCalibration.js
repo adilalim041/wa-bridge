@@ -109,6 +109,51 @@ function isPassiveFollowupSignal(messages) {
   return /подума|посмотр|ознаком|решим|посовет|позже|напишу|дам знать|сравн|дорог|скидк|жду|отправлю заказчик|вернусь|свяжусь/.test(customerText);
 }
 
+function isManagerHandoff(outText) {
+  return /передам.{0,80}(контакт|менеджер|коллег)|с вами.{0,80}свяж|свяжется.{0,80}менеджер|менеджер.{0,80}свяж|по вашему региону/i.test(outText);
+}
+
+function isManagerOnlyQualifyingQuestion(text) {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s || !/[?？]/.test(s)) return false;
+  if (/(цена|стоим|от\s*\d|₸|тг|тенге|кп|коммерческ|прайс|каталог|\[document|\[image\]|\[video\])/i.test(s)) return false;
+  return /как.*обращаться|как.*зовут|вы с астаны|вы с алматы|с какого города|какой город|подскажите.*город/i.test(s);
+}
+
+function hasSalesMaterial(text) {
+  return /цена|стоим|от\s*\d|₸|тг|тенге|кп|коммерческ|прайс|каталог|модель|вариант|мощност|налич|шоурум|адрес|2gis|\[document|\[image\]|\[video\]/i.test(text);
+}
+
+function hasManagerFollowupAttempt(text) {
+  return /что выбрал|вопросы остал|как решение|подскажите.*решил|удалось.*посет|посетить.*шоурум|напомин|возвращаюсь|пишите\/звоните|пишите или звоните|в любое удобное/i.test(text);
+}
+
+function hasCustomerPassiveSignal(messages) {
+  return messages.some((m) => {
+    if (m.from_me) return false;
+    const body = String(m.body || '').toLowerCase();
+    if (/хочу сантехнику.*скидк|интересует.*скидк|по скидк/i.test(body)) return false;
+    return /подума|посмотр|ознаком|решим|посовет|позже|напишу|дам знать|сравн|дорог|жду|вернусь|свяжусь/i.test(body);
+  });
+}
+
+function shouldNeedFollowupStrict(messages, allText) {
+  const last = messages[messages.length - 1];
+  if (!last?.from_me) return false;
+  if (businessMinutesBetween(last.timestamp, new Date()) < 60 * 24) return false;
+  if (isLateStageOrService(allText)) return false;
+
+  const outgoing = messages.filter((m) => m.from_me);
+  const lastManagerText = String(last.body || '').toLowerCase();
+  const outText = textOf(messages, true);
+  if (isManagerHandoff(outText)) return false;
+  if (hasManagerFollowupAttempt(outText)) return false;
+  if (isManagerOnlyQualifyingQuestion(lastManagerText)) return false;
+
+  const gaveSalesMaterial = outgoing.some((m) => hasSalesMaterial(String(m.body || '').toLowerCase()));
+  return gaveSalesMaterial || hasCustomerPassiveSignal(messages);
+}
+
 function asksForVisual(body) {
   const text = String(body || '').toLowerCase();
   if (/(\bя\b|сейчас|щас|сами|сам|сама|наш[ауе]?|мо[йяёе])[^.!?\n]{0,40}(покажу|скину|отправлю|пришлю|сниму)/.test(text)) return false;
@@ -243,8 +288,7 @@ function calibrate(row, messages) {
   }
 
   if (issues.has('no_followup')) {
-    const passive = isPassiveFollowupSignal(messages) && businessMinutesBetween(last?.timestamp, new Date()) > 60 * 24;
-    if (!passive || isLateStageOrService(allText)) {
+    if (!shouldNeedFollowupStrict(messages, allText)) {
       issues.delete('no_followup');
       reasons.push('follow-up need not proven by strict rule');
     }
