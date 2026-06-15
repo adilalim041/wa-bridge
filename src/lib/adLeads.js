@@ -224,13 +224,19 @@ async function fetchAll(query, pageSize = 1000, maxRows = 50000) {
 
 function summarize(events) {
   const salesById = new Map();
+  const possibleSalesById = new Map();
   for (const event of events) {
     for (const sale of event.matchedSales || []) {
       if (!sale.id || salesById.has(sale.id)) continue;
       salesById.set(sale.id, sale);
     }
+    for (const sale of event.possibleSales || []) {
+      if (!sale.id || salesById.has(sale.id) || possibleSalesById.has(sale.id)) continue;
+      possibleSalesById.set(sale.id, sale);
+    }
   }
   const uniqueSales = [...salesById.values()];
+  const uniquePossibleSales = [...possibleSalesById.values()];
   const responseMinutes = events
     .map((e) => e.firstResponseWorkMinutes)
     .filter((v) => Number.isFinite(v));
@@ -258,7 +264,107 @@ function summarize(events) {
     customerSalesMatched: uniqueSales.filter((sale) => sale.matchRole === 'customer').length,
     partnerSalesMatched: uniqueSales.filter((sale) => sale.matchRole === 'partner').length,
     revenue: uniqueSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0),
+    possibleSalesMatched: uniquePossibleSales.length,
+    possibleRevenue: uniquePossibleSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0),
   };
+}
+
+const AD_ATTRIBUTION_STOP_WORDS = new Set([
+  'omoikiri',
+  'renat',
+  'design',
+  'studio',
+  'interior',
+  'designer',
+  'ip',
+  'too',
+  'омойкири',
+  'ренат',
+  'рабочий',
+  'реклама',
+  'дизайн',
+  'студия',
+  'ип',
+  'тоо',
+]);
+
+function normalizeAttributionName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[+\d()\-\s]{7,}/g, ' ')
+    .replace(/[^a-zа-яәғқңөұүһі\s]/gi, ' ')
+    .split(/\s+/)
+    .filter((token) => token && token.length >= 3 && !AD_ATTRIBUTION_STOP_WORDS.has(token))
+    .join(' ')
+    .trim();
+}
+
+function attributionTokens(value) {
+  return normalizeAttributionName(value).split(' ').filter(Boolean);
+}
+
+function tokenSimilarity(left, right) {
+  const a = new Set(attributionTokens(left));
+  const b = new Set(attributionTokens(right));
+  if (!a.size || !b.size) return 0;
+  let overlap = 0;
+  for (const token of a) if (b.has(token)) overlap += 1;
+  return overlap / new Set([...a, ...b]).size;
+}
+
+function hasExactNameToken(left, right) {
+  const a = new Set(attributionTokens(left));
+  const b = attributionTokens(right);
+  return b.some((token) => a.has(token));
+}
+
+function possibleSalesForLead({ event, triggerAt, sales = [], exactSaleIds = new Set() }) {
+  const triggerDate = almatyDateString(triggerAt);
+  const windowEnd = new Date(triggerAt);
+  windowEnd.setUTCDate(windowEnd.getUTCDate() + CONVERSION_WINDOW_DAYS);
+  const windowEndDate = almatyDateString(windowEnd);
+  const out = [];
+
+  for (const sale of sales) {
+    if (!sale.id || exactSaleIds.has(sale.id) || !sale.sale_date) continue;
+    if (sale.sale_date < triggerDate || sale.sale_date > windowEndDate) continue;
+
+    const candidates = [
+      ['customer', sale.customer_raw, event.displayName],
+      ['customer', sale.customer_raw, event.matchedContactName],
+    ].filter(([, saleName, leadName]) => saleName && leadName);
+
+    let best = null;
+    for (const [role, saleName, leadName] of candidates) {
+      const tokenMatch = hasExactNameToken(leadName, saleName);
+      const similarity = tokenMatch ? Math.max(tokenSimilarity(leadName, saleName), 0.86) : tokenSimilarity(leadName, saleName);
+      if (!best || similarity > best.similarity) {
+        best = { role, saleName, leadName, similarity, tokenMatch };
+      }
+    }
+    if (!best || !best.tokenMatch) continue;
+
+    const daysAfter = Math.round((new Date(`${sale.sale_date}T00:00:00Z`) - new Date(`${triggerDate}T00:00:00Z`)) / 86400000);
+    let score = best.similarity >= 0.86 ? 60 : 35;
+    if (daysAfter <= 2) score += 20;
+    else if (daysAfter <= 7) score += 12;
+    else if (daysAfter <= 14) score += 6;
+
+    if (score < 70) continue;
+    out.push({
+      ...sale,
+      matchRole: best.role,
+      matchMethod: 'name_date_candidate',
+      matchConfidence: score >= 80 ? 'high' : 'medium',
+      matchScore: score,
+      matchReason: `name/date candidate: ${best.saleName} matched ${best.leadName}; +${daysAfter}d`,
+      daysAfterLead: daysAfter,
+    });
+  }
+
+  out.sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0) || (a.daysAfterLead || 0) - (b.daysAfterLead || 0));
+  return out.slice(0, 5);
 }
 
 function buildContactIndexes(contacts = []) {
@@ -506,6 +612,32 @@ function dedupeSalesEvents(events) {
   return out;
 }
 
+function dedupePossibleSalesEvents(events) {
+  const exactSales = new Set();
+  for (const event of events) {
+    for (const sale of event.matchedSales || []) {
+      if (sale.id) exactSales.add(sale.id);
+    }
+  }
+
+  const seenSales = new Set();
+  const out = [];
+  for (const event of events) {
+    const freshSales = (event.possibleSales || []).filter((sale) => (
+      sale.id && !exactSales.has(sale.id) && !seenSales.has(sale.id)
+    ));
+    if (!freshSales.length) continue;
+    for (const sale of freshSales) seenSales.add(sale.id);
+    out.push({
+      ...event,
+      possibleSales: freshSales,
+      possibleSalesCount: freshSales.length,
+      possibleRevenue: freshSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0),
+    });
+  }
+  return out;
+}
+
 export async function getAdLeadAnalytics({
   db,
   sessionId,
@@ -599,6 +731,7 @@ export async function getAdLeadAnalytics({
       const primaryMatch = contactMatches.find((m) => m.method === 'linked_chat_jid') || contactMatches[0];
       const contact = primaryMatch?.contact || null;
       const matchedSales = salesForLead({ contactMatches, triggerAt, salesByContact });
+      const exactSaleIds = new Set(matchedSales.map((sale) => sale.id).filter(Boolean));
       const matchedRevenue = matchedSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0);
       const matchedSalesByRole = matchedSales.reduce((acc, sale) => {
         const role = sale.matchRole || 'unknown';
@@ -638,6 +771,9 @@ export async function getAdLeadAnalytics({
         matchedSalesByRole,
         matchedRevenue,
       };
+      event.possibleSales = possibleSalesForLead({ event, triggerAt, sales, exactSaleIds });
+      event.possibleSalesCount = event.possibleSales.length;
+      event.possibleRevenue = event.possibleSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0);
       event.status = deriveStatus(event);
       events.push(event);
     }
@@ -670,6 +806,7 @@ export async function getAdLeadAnalytics({
   const eventBuckets = {
     recent: events.slice(0, safeLimit),
     sales: dedupeSalesEvents(events).slice(0, EVENT_BUCKET_LIMIT),
+    possibleSales: dedupePossibleSalesEvents(events).slice(0, EVENT_BUCKET_LIMIT),
     slow: events.filter((event) => Number.isFinite(event.firstResponseWorkMinutes) && event.firstResponseWorkMinutes > SLOW_MINUTES).slice(0, EVENT_BUCKET_LIMIT),
     noFollowup: events.filter((event) => event.followupStatus === 'client_waiting').slice(0, EVENT_BUCKET_LIMIT),
     noResponse: events.filter((event) => !event.firstResponseAt).slice(0, EVENT_BUCKET_LIMIT),
