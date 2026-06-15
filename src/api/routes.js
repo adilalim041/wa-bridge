@@ -25,7 +25,7 @@ import * as salesCrm from '../lib/salesCrm.js';
 import * as salesCrmExtras from '../lib/salesCrmExtras.js';
 import * as dailyRun from '../lib/dailyRun.js';
 import { getIssues, dismissIssue, invalidateIssuesCache } from '../lib/issues.js';
-import { getAdLeadAnalytics, getSaleChatDrilldown, refreshPersistedAdLeadEvents, invalidateAdLeadsCache } from '../lib/adLeads.js';
+import { getAdLeadAnalytics, getSaleChatDrilldown, refreshPersistedAdLeadEvents, invalidateAdLeadsCache, saveAdSaleAttribution } from '../lib/adLeads.js';
 import { metaAdsRouter } from '../meta-ads/api.js';
 import { mountSettingsRoutes } from './routes/settings.js';
 import { MANAGER_ISSUES, resolveManagerIssue, normalizeManagerIssues } from '../ai/managerIssueConstants.js';
@@ -742,6 +742,41 @@ export function setupRoutes(app) {
     } catch (error) {
       logger.error({ err: error }, 'GET /analytics/ad-leads failed');
       return res.status(500).json({ error: 'Failed to load ad leads analytics' });
+    }
+  });
+
+  router.post('/analytics/ad-leads/attributions', async (req, res) => {
+    try {
+      const AttributionPayload = z.object({
+        session_id: z.string().min(1).max(120).optional(),
+        sessionId: z.string().min(1).max(120).optional(),
+        trigger_message_id: z.string().min(1).max(200).optional(),
+        triggerMessageId: z.string().min(1).max(200).optional(),
+        trigger_message_db_id: z.union([z.number(), z.string()]).optional(),
+        triggerMessageDbId: z.union([z.number(), z.string()]).optional(),
+        remote_jid: z.string().min(1).max(200).optional(),
+        remoteJid: z.string().min(1).max(200).optional(),
+        sale_id: z.uuid().optional(),
+        saleId: z.uuid().optional(),
+        status: z.enum(['confirmed', 'rejected']).default('confirmed'),
+        note: z.string().max(500).optional(),
+      }).refine((v) => v.session_id || v.sessionId, { message: 'session_id is required' })
+        .refine((v) => v.trigger_message_id || v.triggerMessageId || v.trigger_message_db_id || v.triggerMessageDbId, { message: 'trigger_message_id is required' })
+        .refine((v) => v.remote_jid || v.remoteJid, { message: 'remote_jid is required' })
+        .refine((v) => v.sale_id || v.saleId, { message: 'sale_id is required' });
+
+      const input = AttributionPayload.parse(req.body || {});
+      const payload = await saveAdSaleAttribution({
+        db: supabase,
+        input,
+        userId: req.user?.userId || null,
+      });
+      invalidateAdLeadsCache();
+      return res.json({ ok: true, attribution: payload });
+    } catch (error) {
+      const status = error.statusCode || (error.name === 'ZodError' ? 400 : 500);
+      logger.error({ err: error }, 'POST /analytics/ad-leads/attributions failed');
+      return res.status(status).json({ error: status === 500 ? 'Failed to save ad attribution' : error.message });
     }
   });
 

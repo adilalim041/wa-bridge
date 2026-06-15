@@ -222,6 +222,42 @@ async function fetchAll(query, pageSize = 1000, maxRows = 50000) {
   return out;
 }
 
+function isMissingAttributionTable(error) {
+  const text = `${error?.code || ''} ${error?.message || ''}`;
+  return text.includes('42P01') || text.includes('PGRST205') || text.includes('ad_sale_attributions');
+}
+
+async function fetchAttributions(db, adSessions) {
+  const { data, error } = await db
+    .from('ad_sale_attributions')
+    .select('id, session_id, trigger_message_id, trigger_message_db_id, remote_jid, sale_id, status, source, note, created_at, updated_at')
+    .in('session_id', adSessions);
+
+  if (error) {
+    if (isMissingAttributionTable(error)) {
+      logger.warn({ err: error.message }, 'ad_sale_attributions table is not available yet');
+      return { rows: [], ready: false };
+    }
+    throw error;
+  }
+  return { rows: data || [], ready: true };
+}
+
+function eventAttributionKey(sessionId, triggerMessageId) {
+  return `${sessionId}:::${triggerMessageId}`;
+}
+
+function buildAttributionIndex(rows = []) {
+  const byEvent = new Map();
+  for (const row of rows) {
+    if (!row.session_id || !row.trigger_message_id) continue;
+    const key = eventAttributionKey(row.session_id, row.trigger_message_id);
+    if (!byEvent.has(key)) byEvent.set(key, []);
+    byEvent.get(key).push(row);
+  }
+  return byEvent;
+}
+
 function summarize(events) {
   const salesById = new Map();
   const possibleSalesById = new Map();
@@ -668,7 +704,7 @@ export async function getAdLeadAnalytics({
     return empty;
   }
 
-  const [messages, tagRows, sessionRows, contacts, sales] = await Promise.all([
+  const [messages, tagRows, sessionRows, contacts, sales, attributionResult] = await Promise.all([
     fetchAll(
       db.from('messages')
         .select('id, message_id, session_id, remote_jid, from_me, body, push_name, timestamp')
@@ -681,12 +717,15 @@ export async function getAdLeadAnalytics({
     db.from('session_config').select('session_id, display_name').in('session_id', adSessions),
     fetchAll(db.from('partner_contacts').select('id, canonical_name, primary_phone, phones, roles, linked_chat_jids'), 1000, 30000),
     fetchAll(db.from('sales').select('id, customer_id, partner_id, sale_date, total_amount, order_num, city, customer_raw, partner_raw'), 1000, 40000),
+    fetchAttributions(db, adSessions),
   ]);
 
   const sessionNames = new Map((sessionRows.data || []).map((s) => [s.session_id, s.display_name || s.session_id]));
   const tagsByJid = new Map((tagRows.data || []).map((row) => [row.remote_jid, row.tags || []]));
   const { byPhone, byJid } = buildContactIndexes(contacts);
   const salesByContact = buildSalesIndex(sales);
+  const salesById = new Map((sales || []).map((sale) => [sale.id, sale]));
+  const attributionsByEvent = buildAttributionIndex(attributionResult.rows);
 
   const messagesByChat = new Map();
   for (const message of messages) {
@@ -730,7 +769,37 @@ export async function getAdLeadAnalytics({
       const contactMatches = contactsForLead({ remoteJid, phone, byPhone, byJid });
       const primaryMatch = contactMatches.find((m) => m.method === 'linked_chat_jid') || contactMatches[0];
       const contact = primaryMatch?.contact || null;
-      const matchedSales = salesForLead({ contactMatches, triggerAt, salesByContact });
+      const triggerMessageKey = String(message.message_id || message.id);
+      const manualAttributions = attributionsByEvent.get(eventAttributionKey(sid, triggerMessageKey)) || [];
+      const rejectedSaleIds = new Set(
+        manualAttributions
+          .filter((row) => row.status === 'rejected')
+          .map((row) => row.sale_id)
+          .filter(Boolean)
+      );
+      const confirmedSaleIds = new Set(
+        manualAttributions
+          .filter((row) => row.status === 'confirmed')
+          .map((row) => row.sale_id)
+          .filter(Boolean)
+      );
+
+      const matchedSales = salesForLead({ contactMatches, triggerAt, salesByContact })
+        .filter((sale) => !rejectedSaleIds.has(sale.id));
+      const matchedSaleIds = new Set(matchedSales.map((sale) => sale.id).filter(Boolean));
+      for (const saleId of confirmedSaleIds) {
+        if (matchedSaleIds.has(saleId) || rejectedSaleIds.has(saleId)) continue;
+        const sale = salesById.get(saleId);
+        if (!sale) continue;
+        matchedSales.push({
+          ...sale,
+          matchRole: 'manual',
+          matchMethod: 'manual_confirmed',
+          matchConfidence: 'confirmed',
+          matchScore: 100,
+        });
+        matchedSaleIds.add(saleId);
+      }
       const exactSaleIds = new Set(matchedSales.map((sale) => sale.id).filter(Boolean));
       const matchedRevenue = matchedSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0);
       const matchedSalesByRole = matchedSales.reduce((acc, sale) => {
@@ -748,6 +817,7 @@ export async function getAdLeadAnalytics({
         phone,
         displayName: message.push_name || contact?.canonical_name || phone || remoteJid,
         triggerMessageId: message.message_id,
+        triggerMessageDbId: message.id,
         triggerAt: triggerAt.toISOString(),
         triggerAtLabel: toAlmatyLabel(triggerAt),
         triggerBody: textPreview(message.body),
@@ -770,8 +840,10 @@ export async function getAdLeadAnalytics({
         matchedSalesCount: matchedSales.length,
         matchedSalesByRole,
         matchedRevenue,
+        manualAttributions,
       };
-      event.possibleSales = possibleSalesForLead({ event, triggerAt, sales, exactSaleIds });
+      event.possibleSales = possibleSalesForLead({ event, triggerAt, sales, exactSaleIds })
+        .filter((sale) => !rejectedSaleIds.has(sale.id));
       event.possibleSalesCount = event.possibleSales.length;
       event.possibleRevenue = event.possibleSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0);
       event.status = deriveStatus(event);
@@ -825,6 +897,9 @@ export async function getAdLeadAnalytics({
     events: eventBuckets.recent,
     eventBuckets,
     patterns: DEFAULT_PATTERNS.map(({ key: patternKey, label, campaignLabel }) => ({ key: patternKey, label, campaignLabel })),
+    capabilities: {
+      manualAttribution: Boolean(attributionResult.ready),
+    },
     notes: {
       definition: 'Ad lead event = inbound message matching a known ad template/pattern. Regular first inbound messages in ad WhatsApp accounts are not counted as ads.',
       businessHours: '10:00-20:00 UTC+5',
@@ -842,6 +917,72 @@ export async function refreshPersistedAdLeadEvents({ db }) {
     logger.warn({ err: error }, 'refresh_ad_lead_events RPC failed');
     throw error;
   }
+  invalidateAdLeadsCache();
+  return data;
+}
+
+export async function saveAdSaleAttribution({ db, input, userId = null }) {
+  const sessionId = String(input.session_id || input.sessionId || '').trim();
+  const triggerMessageId = String(input.trigger_message_id || input.triggerMessageId || input.trigger_message_db_id || input.triggerMessageDbId || '').trim();
+  const remoteJid = String(input.remote_jid || input.remoteJid || '').trim();
+  const saleId = String(input.sale_id || input.saleId || '').trim();
+  const status = String(input.status || 'confirmed').trim();
+  const note = input.note ? String(input.note).slice(0, 500) : null;
+  const triggerMessageDbId = input.trigger_message_db_id || input.triggerMessageDbId || null;
+
+  if (!AD_SESSION_IDS.has(sessionId)) {
+    const error = new Error('session_id is not an ad WhatsApp account');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!triggerMessageId || triggerMessageId.length > 200) {
+    const error = new Error('trigger_message_id is required');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!remoteJid || remoteJid.length > 200) {
+    const error = new Error('remote_jid is required');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(saleId)) {
+    const error = new Error('sale_id must be a uuid');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!['confirmed', 'rejected'].includes(status)) {
+    const error = new Error('status must be confirmed or rejected');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const saleCheck = await db.from('sales').select('id').eq('id', saleId).maybeSingle();
+  if (saleCheck.error) throw saleCheck.error;
+  if (!saleCheck.data) {
+    const error = new Error('sale not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const row = {
+    session_id: sessionId,
+    trigger_message_id: triggerMessageId,
+    trigger_message_db_id: triggerMessageDbId ? Number(triggerMessageDbId) : null,
+    remote_jid: remoteJid,
+    sale_id: saleId,
+    status,
+    source: 'manual',
+    note,
+    created_by: userId || null,
+  };
+
+  const { data, error } = await db
+    .from('ad_sale_attributions')
+    .upsert(row, { onConflict: 'session_id,trigger_message_id,sale_id' })
+    .select('*')
+    .single();
+  if (error) throw error;
+
   invalidateAdLeadsCache();
   return data;
 }
