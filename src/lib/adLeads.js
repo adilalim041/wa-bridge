@@ -39,6 +39,7 @@ const WORK_END_HOUR = 20;
 const SLOW_MINUTES = 30;
 const VERY_SLOW_MINUTES = 60;
 const CONVERSION_WINDOW_DAYS = 45;
+const DESIGNER_NAME_DATE_WINDOW_DAYS = 3;
 const EVENT_BUCKET_LIMIT = 100;
 const CACHE_TTL_MS = 2 * 60 * 1000;
 
@@ -355,46 +356,66 @@ function hasExactNameToken(left, right) {
   return b.some((token) => a.has(token));
 }
 
-function possibleSalesForLead({ event, triggerAt, sales = [], exactSaleIds = new Set() }) {
+function hasStrictCustomerNameMatch(left, right) {
+  const leftName = normalizeAttributionName(left);
+  const rightName = normalizeAttributionName(right);
+  if (!leftName || !rightName) return false;
+  if (leftName === rightName) return true;
+  return hasExactNameToken(leftName, rightName) && tokenSimilarity(leftName, rightName) >= 0.86;
+}
+
+function contactHasAttributionHandle(contact) {
+  return contactRemoteJidCandidates(contact).length > 0;
+}
+
+function possibleSalesForLead({ event, triggerAt, sales = [], exactSaleIds = new Set(), contactsById = new Map() }) {
   const triggerDate = almatyDateString(triggerAt);
   const windowEnd = new Date(triggerAt);
-  windowEnd.setUTCDate(windowEnd.getUTCDate() + CONVERSION_WINDOW_DAYS);
+  windowEnd.setUTCDate(windowEnd.getUTCDate() + DESIGNER_NAME_DATE_WINDOW_DAYS);
   const windowEndDate = almatyDateString(windowEnd);
   const out = [];
 
   for (const sale of sales) {
     if (!sale.id || exactSaleIds.has(sale.id) || !sale.sale_date) continue;
     if (sale.sale_date < triggerDate || sale.sale_date > windowEndDate) continue;
+    const isDesignerSale = Boolean(sale.partner_id || sale.partner_raw);
+    if (!isDesignerSale) continue;
+
+    const customerContact = sale.customer_id ? contactsById.get(sale.customer_id) : null;
+    if (customerContact && contactHasAttributionHandle(customerContact)) continue;
 
     const candidates = [
       ['customer', sale.customer_raw, event.displayName],
       ['customer', sale.customer_raw, event.matchedContactName],
-    ].filter(([, saleName, leadName]) => saleName && leadName);
+    ].filter(([, saleName, leadName]) => (
+      saleName
+      && leadName
+      && hasStrictCustomerNameMatch(leadName, saleName)
+    ));
 
     let best = null;
     for (const [role, saleName, leadName] of candidates) {
-      const tokenMatch = hasExactNameToken(leadName, saleName);
-      const similarity = tokenMatch ? Math.max(tokenSimilarity(leadName, saleName), 0.86) : tokenSimilarity(leadName, saleName);
+      const similarity = tokenSimilarity(leadName, saleName);
       if (!best || similarity > best.similarity) {
-        best = { role, saleName, leadName, similarity, tokenMatch };
+        best = { role, saleName, leadName, similarity };
       }
     }
-    if (!best || !best.tokenMatch) continue;
+    if (!best) continue;
 
     const daysAfter = Math.round((new Date(`${sale.sale_date}T00:00:00Z`) - new Date(`${triggerDate}T00:00:00Z`)) / 86400000);
-    let score = best.similarity >= 0.86 ? 60 : 35;
-    if (daysAfter <= 2) score += 20;
-    else if (daysAfter <= 7) score += 12;
-    else if (daysAfter <= 14) score += 6;
+    let score = 72;
+    if (daysAfter === 0) score += 18;
+    else if (daysAfter <= 1) score += 12;
+    else if (daysAfter <= DESIGNER_NAME_DATE_WINDOW_DAYS) score += 6;
 
     if (score < 70) continue;
     out.push({
       ...sale,
-      matchRole: best.role,
-      matchMethod: 'name_date_candidate',
-      matchConfidence: score >= 80 ? 'high' : 'medium',
+      matchRole: 'partner',
+      matchMethod: 'designer_customer_name_date_candidate',
+      matchConfidence: score >= 90 ? 'high' : 'medium',
       matchScore: score,
-      matchReason: `name/date candidate: ${best.saleName} matched ${best.leadName}; +${daysAfter}d`,
+      matchReason: `designer sale name/date candidate: customer "${best.saleName}" matched chat "${best.leadName}"; +${daysAfter}d; no customer phone/chat handle`,
       daysAfterLead: daysAfter,
     });
   }
@@ -500,7 +521,32 @@ export async function getSaleChatDrilldown({ db, saleId }) {
 
   const { data: sale, error: saleError } = await db
     .from('sales')
-    .select('id, customer_id, partner_id, sale_date, total_amount, order_num, city, customer_raw, partner_raw, manager')
+    .select([
+      'id',
+      'source_file',
+      'order_num',
+      'sale_date',
+      'total_amount',
+      'customer_id',
+      'partner_id',
+      'agency_id',
+      'customer_raw',
+      'partner_raw',
+      'manager',
+      'payment_method',
+      'status_text',
+      'inventory_text',
+      'city',
+      'address',
+      'comment',
+      'commission_text',
+      'lead_source',
+      'lead_source_detail',
+      'delivery_date',
+      'delivery_status',
+      'receipt_issued',
+      'imported_at',
+    ].join(', '))
     .eq('id', safeSaleId)
     .maybeSingle();
 
@@ -509,9 +555,17 @@ export async function getSaleChatDrilldown({ db, saleId }) {
     throw Object.assign(new Error('Sale not found'), { statusCode: 404 });
   }
 
+  const { data: saleItems, error: saleItemsError } = await db
+    .from('sale_items')
+    .select('id, position_idx, sku, raw_name, qty, price_per_unit, amount, matched_product_sku')
+    .eq('sale_id', sale.id)
+    .order('position_idx', { ascending: true });
+  if (saleItemsError) throw saleItemsError;
+  const saleWithItems = { ...sale, items: saleItems || [] };
+
   const contactIds = [...new Set([sale.customer_id, sale.partner_id].filter(Boolean))];
   if (!contactIds.length) {
-    return { sale, contacts: [], chats: [] };
+    return { sale: saleWithItems, contacts: [], chats: [] };
   }
 
   const { data: contacts, error: contactsError } = await db
@@ -533,7 +587,7 @@ export async function getSaleChatDrilldown({ db, saleId }) {
 
   const jids = [...jidSet];
   if (!jids.length) {
-    return { sale, contacts: contacts || [], chats: [] };
+    return { sale: saleWithItems, contacts: contacts || [], chats: [] };
   }
 
   const [chatsRes, messagesRes] = await Promise.all([
@@ -615,7 +669,7 @@ export async function getSaleChatDrilldown({ db, saleId }) {
     return new Date(b.last_message_at || 0) - new Date(a.last_message_at || 0);
   });
 
-  return { sale, contacts: contacts || [], chats };
+  return { sale: saleWithItems, contacts: contacts || [], chats };
 }
 
 function deriveStatus(event) {
@@ -722,6 +776,7 @@ export async function getAdLeadAnalytics({
 
   const sessionNames = new Map((sessionRows.data || []).map((s) => [s.session_id, s.display_name || s.session_id]));
   const tagsByJid = new Map((tagRows.data || []).map((row) => [row.remote_jid, row.tags || []]));
+  const contactsById = new Map((contacts || []).map((contact) => [contact.id, contact]));
   const { byPhone, byJid } = buildContactIndexes(contacts);
   const salesByContact = buildSalesIndex(sales);
   const salesById = new Map((sales || []).map((sale) => [sale.id, sale]));
@@ -842,7 +897,7 @@ export async function getAdLeadAnalytics({
         matchedRevenue,
         manualAttributions,
       };
-      event.possibleSales = possibleSalesForLead({ event, triggerAt, sales, exactSaleIds })
+      event.possibleSales = possibleSalesForLead({ event, triggerAt, sales, exactSaleIds, contactsById })
         .filter((sale) => !rejectedSaleIds.has(sale.id));
       event.possibleSalesCount = event.possibleSales.length;
       event.possibleRevenue = event.possibleSales.reduce((sum, sale) => sum + (Number(sale.total_amount) || 0), 0);
@@ -986,3 +1041,7 @@ export async function saveAdSaleAttribution({ db, input, userId = null }) {
   invalidateAdLeadsCache();
   return data;
 }
+
+export const __adLeadsTest = {
+  possibleSalesForLead,
+};
