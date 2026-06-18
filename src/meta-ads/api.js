@@ -783,7 +783,37 @@ metaAdsRouter.get('/tree', async (req, res) => {
       return res.status(404).json({ error: 'Ad account not found' });
     }
 
-    // --- Query 1: Campaigns ---
+    // --- Query 1: Campaigns with insights in selected period ---
+    let campaignObjectIds = null;
+    if (!singleCampaignId) {
+      const { data: campaignInsightRows, error: campaignInsightError } = await serviceClient
+        .from('meta_insights_daily')
+        .select('object_id')
+        .eq('ad_account_id', account.id)
+        .eq('level', 'campaign')
+        .gte('date_start', from)
+        .lte('date_start', to);
+
+      if (campaignInsightError) throw campaignInsightError;
+
+      campaignObjectIds = [...new Set((campaignInsightRows || []).map((row) => row.object_id).filter(Boolean))];
+      if (campaignObjectIds.length === 0) {
+        return res.json({
+          period: { from, to },
+          account: {
+            id:       account.meta_account_id,
+            name:     account.account_name,
+            currency: account.currency,
+            timezone: account.timezone_name,
+          },
+          total: 0,
+          hasMore: false,
+          campaigns: [],
+        });
+      }
+    }
+
+    // --- Query 2: Campaigns ---
     let campaignsQuery = serviceClient
       .from('meta_campaigns')
       .select('id, meta_campaign_id, name, status, effective_status, objective, daily_budget, lifetime_budget, created_time', { count: 'exact' })
@@ -791,6 +821,8 @@ metaAdsRouter.get('/tree', async (req, res) => {
 
     if (singleCampaignId) {
       campaignsQuery = campaignsQuery.eq('id', singleCampaignId);
+    } else {
+      campaignsQuery = campaignsQuery.in('meta_campaign_id', campaignObjectIds);
     }
 
     const { data: campaigns, error: campaignError, count: totalCampaigns } = await campaignsQuery
@@ -810,7 +842,7 @@ metaAdsRouter.get('/tree', async (req, res) => {
     const campaignIds = campaigns.map((c) => c.id);
     const metaCampaignIds = campaigns.map((c) => c.meta_campaign_id);
 
-    // --- Query 2: AdSets for these campaigns ---
+    // --- Query 3: AdSets for these campaigns ---
     const { data: adSets, error: adSetsError } = await serviceClient
       .from('meta_ad_sets')
       .select('id, meta_adset_id, name, status, campaign_id, daily_budget, lifetime_budget, optimization_goal, billing_event, bid_strategy, is_advantage_plus, schedule_start, schedule_end, targeting, placements')
@@ -823,7 +855,7 @@ metaAdsRouter.get('/tree', async (req, res) => {
     const adSetIds = (adSets || []).map((a) => a.id);
     const metaAdSetIds = (adSets || []).map((a) => a.meta_adset_id);
 
-    // --- Query 3: Ads + creatives for these adsets ---
+    // --- Query 4: Ads + creatives for these adsets ---
     const { data: ads, error: adsError } = await serviceClient
       .from('meta_ads')
       .select(`
@@ -855,7 +887,7 @@ metaAdsRouter.get('/tree', async (req, res) => {
 
     const metaAdIds = (ads || []).map((a) => a.meta_ad_id);
 
-    // --- Query 4: Insights for all three levels ---
+    // --- Query 5: Insights for all three levels ---
     const allInsights = await Promise.all([
       fetchInsightsMap({ accountId: account.id, level: 'campaign', objectIds: metaCampaignIds, from, to }),
       fetchInsightsMap({ accountId: account.id, level: 'adset',    objectIds: metaAdSetIds,    from, to }),
