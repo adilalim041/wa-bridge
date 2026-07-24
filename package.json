@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test:bot": "node --test test/bot/*.test.js"
+    "test:bot": "node --test test/bot/*.test.js",
+    "bot:export-corpus": "node scripts/export-bot-training-corpus.mjs"
   },
   "dependencies": {
     "@sentry/node": "^10.50.0",
