@@ -1,6 +1,7 @@
 import { logger } from '../config.js';
 import { getOrCreateDialogSession } from '../ai/dialogSessions.js';
 import { trackResponseTime } from '../ai/responseTracker.js';
+import { enqueueBotShadowEvaluation } from '../bot/shadowGate.js';
 import { getContactName, saveContact, saveMessage, upsertChat } from '../storage/queries.js';
 import { supabase } from '../storage/supabase.js';
 import { processMedia } from './mediaHandler.js';
@@ -587,6 +588,15 @@ export async function handleMessage(message, sock, sessionId) {
         }
       }
     }
+
+    enqueueBotShadowEvaluation({
+      sessionId,
+      messageId,
+      remoteJid,
+      fromMe,
+      chatType,
+      timestamp,
+    });
 
     return payload;
   } catch (error) {
