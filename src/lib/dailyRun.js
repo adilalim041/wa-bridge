@@ -168,7 +168,7 @@ export async function getPendingDialogs({
   sinceHours = 24,
 } = {}) {
   const cap = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
-  const hours = Math.min(Math.max(parseInt(sinceHours) || 24, 1), 24 * 30); // max 30 days
+  const hours = Math.min(Math.max(parseInt(sinceHours) || 24, 1), 24 * 45); // backfill up to 45 days
   const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
   const now = Date.now();
   const staleAfter = new Date(now - 24 * 60 * 60 * 1000).toISOString();

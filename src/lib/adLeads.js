@@ -196,10 +196,14 @@ function textPreview(value = '', max = 160) {
   return clean.length > max ? `${clean.slice(0, max)}...` : clean;
 }
 
-function matchPattern(body) {
+export function matchAdLeadPattern(body) {
   const text = String(body || '').toLowerCase();
   if (!text) return null;
   return DEFAULT_PATTERNS.find((pattern) => pattern.needles.some((needle) => text.includes(needle))) || null;
+}
+
+export function isAdLeadSession(sessionId) {
+  return AD_SESSION_IDS.has(String(sessionId || ''));
 }
 
 function productInterest(messages) {
@@ -810,7 +814,7 @@ export async function getAdLeadAnalytics({
       const triggerAt = new Date(message.timestamp);
       if (triggerAt < rangeStart || triggerAt > rangeEnd) continue;
 
-      const pattern = matchPattern(message.body);
+      const pattern = matchAdLeadPattern(message.body);
       if (!pattern) continue;
 
       const firstResponse = rows.find((m) => m.from_me && new Date(m.timestamp) > triggerAt);

@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { getPendingDialogs as getPendingDialogsFromDb } from '../src/lib/dailyRun.js';
 import { resolveTag } from '../src/ai/tagConstants.js';
 import { normalizeManagerIssues } from '../src/ai/managerIssueConstants.js';
+import { isAdLeadSession, matchAdLeadPattern } from '../src/lib/adLeads.js';
 
 const ROOT = process.cwd();
 const BRIDGE_URL = 'https://wa-bridge-production-7cd0.up.railway.app';
@@ -184,9 +185,8 @@ function isSupplierOrAdminFlow(allText) {
 
 function asksForVisual(body) {
   const text = String(body || '').toLowerCase();
-  if (/(\bя\b|сейчас|щас|сами|сам|сама|наш[ауе]?|мо[йяёе])[^.!?\n]{0,40}(покажу|скину|отправлю|пришлю|сниму)/.test(text)) return false;
-  if (/вы\s+просили[^.!?\n]{0,40}(фото|видео)|сейчас[^.!?\n]{0,40}(пришлю|скину|отправлю)[^.!?\n]{0,40}(фото|видео)|пришлю[^.!?\n]{0,40}(фото|видео)/.test(text)) return false;
-  return /фото|видео|покажите|покажешь|покажете|как выглядит|можно.*увидеть|снимите|скиньте.*вид/.test(text);
+  if (/(\bя\b|сейчас|щас|сами|сам|сама|наш[ауе]?|мо[йяёе])[^.!?\n]{0,40}(покажу|скину|отправлю|пришлю|сниму|попрошу)/.test(text)) return false;
+  return /(пришлите|скиньте|отправьте|покажите|снимите)[^.!?\n]{0,50}(фото|видео)|(можно|есть|покажете)[^.!?\n]{0,30}(фото|видео)|(фото|видео)[^.!?\n]{0,30}(пришлите|скиньте|отправьте|покажите|можно)/.test(text);
 }
 
 function managerAnsweredWithVisual(message) {
@@ -205,7 +205,7 @@ function hasTypedMessage(messages, { fromMe = null, types = [] } = {}) {
 }
 
 function hasOutgoingMediaOrProposal(messages, outText) {
-  return hasTypedMessage(messages, { fromMe: true, types: ['image', 'video', 'document', 'contact'] })
+  return hasTypedMessage(messages, { fromMe: true, types: ['audio', 'image', 'video', 'document', 'contact'] })
     || /\[image\]|\[video\]|\[document|\[contact|коммерческое предложение|кп|прайс/i.test(outText);
 }
 
@@ -243,7 +243,7 @@ function shouldFlagNoShowroomInvite({ messages, product, customerType, source, a
   const remoteCity = /караганда|шымкент|павлодар|костанай|актау|атырау|уральск|семей|тараз|туркестан|кызылорда|кызыл-орда|усть[-\s]?каменогорск|экибастуз|петропавл|кокшетау|актобе|талдыкорган/.test(allText);
   const partnerFlow = /дизайнер(?!ск)|дизайн[-\s]?студ|студия дизайна|архитектор|interior|партнер|партнёр|дилер|клиент.*(просит|хочет|выбрал|заказал)|для клиента/.test(inText);
   const contactMediaHandoff = hasContactMediaHandoff(messages);
-  const realSalesAnswer = /стоим|цена|от\s*\d|₸|тг|тенге|кп|коммерческ|ком\.?пр|прайс|каталог|модель|вариант|мощност|диаметр|евростандарт|подбер|подобрать|акцион|налич|установ|монтаж|\[document|\[image\]|\[video\]/.test(outText);
+  const realSalesAnswer = /стоим|цена|от\s*\d|₸|тг|тенге|кп|коммерческ|ком\.?пр|прайс|каталог|модель|вариант|мощност|диаметр|евростандарт|акцион|налич|установ|монтаж|\[document|\[image\]|\[video\]/.test(outText);
 
   return realSalesAnswer && !nonKitchenRequest && !productIdentification && !alreadyInvited && !customerWillVisit && !transferred && !remoteCity && !partnerFlow && !contactMediaHandoff;
 }
@@ -360,15 +360,18 @@ function detectProduct(allText) {
   return { topic: 'other', detail: 'general' };
 }
 
-function detectLeadSource(inText, allText, product) {
-  const adStrong = /реклам|инст|instagram|insta|скидк|акци|увидел|увидела|объявлен|хочу приобрести|omoikiri|омойкири|омоик|официальн/.test(inText);
-  const adTemplate = /здравствуйте.*(хочу|интересует|сколько|цена|стоимость)/s.test(inText);
-  const niche = ['grinder', 'sink', 'faucet'].includes(product.detail);
-  if (adStrong || (adTemplate && niche)) {
-    const suffix = product.detail === 'general' ? 'general' : product.detail;
-    const via = /инст|instagram|insta/.test(inText) ? '_via_instagram' : '';
-    const discount = /скидк|акци/.test(inText) ? '_discount' : '';
-    return { lead_source: 'omoikiri_ad', lead_source_detail: `omoikiri_ad_${suffix}${discount}${via}` };
+function detectLeadSource(messages, sessionId, inText, allText) {
+  const matchedPattern = isAdLeadSession(sessionId)
+    ? messages
+      .filter((message) => !message.from_me)
+      .map((message) => matchAdLeadPattern(message.body))
+      .find(Boolean)
+    : null;
+  if (matchedPattern) {
+    return {
+      lead_source: 'omoikiri_ad',
+      lead_source_detail: `omoikiri_ad_${matchedPattern.key}`,
+    };
   }
   if (/покупал|покупала|брали у вас|уже покуп/.test(allText)) {
     return { lead_source: 'existing_customer', lead_source_detail: 'returning_customer' };
@@ -387,21 +390,33 @@ function analyzeDialog(dialog, messages, chatRow) {
   const allText = textOf(messages, null);
   const clientProduct = detectProduct(inText);
   const product = clientProduct.detail === 'general' ? detectProduct(allText) : clientProduct;
-  const source = detectLeadSource(inText, allText, product);
+  const source = detectLeadSource(messages, dialog.session_id, inText, allText);
   const managerIssues = new Set();
   const riskFlags = new Set();
 
-  let customerType = 'end_client';
+  const phoneTags = new Set(
+    (chatRow?.phone_tags || []).map((tag) => String(tag || '').trim().toLowerCase())
+  );
+  const confirmedTags = chatRow?.phone_tag_confirmed ? phoneTags : new Set();
+  let customerType = confirmedTags.has('партнёр') || confirmedTags.has('партнер')
+    ? 'partner'
+    : 'end_client';
   const inboundPushNames = incoming.map((m) => String(m.push_name || '').toLowerCase()).join(' ');
   const remotePhone = phoneFromJid(dialog.remote_jid);
-  const looksInternalText = /коллег|накладн|счет\s*№|счёт\s*№|команда|склад.*отправ|отправ.*склад|контакт передаю клиенту|заявленн.*дефект|гаранти|протекает|созвонюсь|заменить кран|картридж|букс/.test(allText);
   const looksInternalName = /omoikiri|омойкири|омоик|менеджер|склад|админ/.test(inboundPushNames);
-  if (isGroup(dialog.remote_jid) || KNOWN_MANAGER_PHONES.has(remotePhone) || looksInternalName || looksInternalText) {
+  const looksPartnerName = /interior|designer|design studio|дизайнер|дизайн[-\s]?студ|архитектор/.test(inboundPushNames);
+  const statesPartnerRole = /(?:^|[\s.,!?])я\s+(?:дизайнер|архитектор)|мы\s+(?:дизайн[-\s]?студия|студия\s+дизайна)|я\s+не\s+клиент|(?:мой|наша?|у\s+меня)\s+клиент|для\s+(?:моего|нашего)\s+клиента|бонус(?:ы|ами)?\s+(?:дизайнер|партн)/.test(inText);
+  if (confirmedTags.has('сотрудник') || confirmedTags.has('коллега') || confirmedTags.has('личное')
+      || isGroup(dialog.remote_jid) || KNOWN_MANAGER_PHONES.has(remotePhone) || looksInternalName) {
     customerType = 'colleague';
-  } else if (/дизайнер(?!ск)|дизайн[-\s]?студ|студия дизайна|архитектор|interior|партнер|партнёр/.test(inText)) {
+  } else if (confirmedTags.has('спам')) {
+    customerType = 'spam';
+  } else if (!confirmedTags.has('клиент') && (looksPartnerName || statesPartnerRole)) {
     customerType = 'partner';
   }
-  if (/спам|казино|ставк|crypto|крипт|заработ/.test(allText)) customerType = 'spam';
+  if (/(?:^|[\s.,!?])(?:спам|казино|ставки?|букмекер|crypto|криптовалют|заработок в интернете)(?:$|[\s.,!?])|бесплатн(?:ый|ого)\s+(?:онлайн[-\s]?)?вебинар|приглашаю\s+вас\s+на\s+(?:бесплатн|вебинар)/i.test(allText)) {
+    customerType = 'spam';
+  }
 
   let firstResponseMin = null;
   if (incoming.length > 0 && outgoing.length > 0) {
@@ -444,7 +459,19 @@ function analyzeDialog(dialog, messages, chatRow) {
   const managerWords = outText.split(/\s+/).filter(Boolean).length;
   const hasQuestions = /\?/.test(outText) || /размер|бюджет|цвет|монтаж|город|когда|какую|какой|нужн|подскаж/.test(outText);
   const hasMediaOrProposal = hasOutgoingMediaOrProposal(messages, outText);
-  if (incoming.length > 0 && outgoing.length > 0 && managerWords < 25 && !hasQuestions && !hasMediaOrProposal && !hasConcreteNextStep(outText) && !isSupplierOrAdminFlow(allText)) {
+  const lastIncoming = [...incoming].reverse()[0];
+  const lastIncomingText = String(lastIncoming?.body || '').trim().toLowerCase();
+  const customerClosedPolitely = !/[?？]/.test(lastIncomingText)
+    && /спасибо|благодар|хорошо,?\s*принято|всё понятно|все понятно/.test(lastIncomingText);
+  if (incoming.length > 0 && outgoing.length > 0
+      && managerWords < 25
+      && !hasQuestions
+      && !hasMediaOrProposal
+      && !hasConcreteNextStep(outText)
+      && !isManagerHandoff(outText)
+      && !isClosingAck(lastIncoming?.body)
+      && !customerClosedPolitely
+      && !isSupplierOrAdminFlow(allText)) {
     managerIssues.add('short_template_only');
   }
   if (shouldFlagNoShowroomInvite({ messages, product, customerType, source, allText, outText })) {
@@ -590,13 +617,28 @@ async function getMessagesByDialog(dialogIds) {
 
 async function getChats(dialogs) {
   const map = new Map();
+  const allJids = [...new Set(dialogs.map((d) => d.remote_jid).filter(Boolean))];
+  const tagsByJid = new Map();
+  for (const part of chunks(allJids, 100)) {
+    const rows = await supa(
+      `chat_tags?select=remote_jid,tags,tag_confirmed&remote_jid=in.${encodeURIComponent(inList(part))}`
+    );
+    for (const row of rows) tagsByJid.set(row.remote_jid, row);
+  }
   for (const sessionId of SESSIONS) {
     const jids = [...new Set(dialogs.filter((d) => d.session_id === sessionId).map((d) => d.remote_jid))];
     for (const part of chunks(jids, 80)) {
       const rows = await supa(
         `chats?select=session_id,remote_jid,display_name,tags,tag_confirmed,phone_number&session_id=eq.${encodeURIComponent(sessionId)}&remote_jid=in.${encodeURIComponent(inList(part))}`
       );
-      for (const row of rows) map.set(`${row.session_id}:::${row.remote_jid}`, row);
+      for (const row of rows) {
+        const phoneTag = tagsByJid.get(row.remote_jid);
+        map.set(`${row.session_id}:::${row.remote_jid}`, {
+          ...row,
+          phone_tags: phoneTag?.tags || [],
+          phone_tag_confirmed: Boolean(phoneTag?.tag_confirmed),
+        });
+      }
     }
   }
   return map;
@@ -818,10 +860,27 @@ async function main() {
   fs.mkdirSync(path.join(ROOT, 'reports'), { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
   const summaryPath = path.join(ROOT, 'reports', `daily-analysis-summary-${stamp}.json`);
+  const auditPath = path.join(ROOT, 'reports', `daily-analysis-audit-${stamp}.json`);
   const adPath = path.join(ROOT, 'reports', `ad-leads-analysis-${stamp}.md`);
   fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf8');
+  fs.writeFileSync(auditPath, JSON.stringify(records.map((record) => {
+    const messages = messagesByDialog.get(record.dialog_session_id) || [];
+    const chat = chatsByKey.get(`${record.session_id}:::${record.remote_jid}`);
+    const firstIncoming = messages.find((message) => !message.from_me);
+    const lastMessage = messages[messages.length - 1];
+    return {
+      ...record,
+      display_name: chat?.display_name || null,
+      previous_tags: chat?.phone_tags || [],
+      tag_confirmed: Boolean(chat?.phone_tag_confirmed),
+      first_incoming: cleanSnippet(firstIncoming?.body || '', 220),
+      last_message_from: lastMessage?.from_me ? 'manager' : 'customer',
+      last_message: cleanSnippet(lastMessage?.body || '', 220),
+    };
+  }), null, 2), 'utf8');
   fs.writeFileSync(adPath, reportAdLeads(records, dialogsById, messagesByDialog), 'utf8');
   console.log(JSON.stringify(summary, null, 2));
+  console.log(`Audit written: ${auditPath}`);
   console.log(`Report written: ${adPath}`);
 
   if (SAVE) {
